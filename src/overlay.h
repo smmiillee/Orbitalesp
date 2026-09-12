@@ -4,14 +4,15 @@
 #include <functional>
 
 struct OverlayContext {
-    HWND hwnd = nullptr;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* deviceCtx = nullptr;
-    IDXGISwapChain* swapChain = nullptr;
-    ID3D11RenderTargetView* rtv = nullptr;
-    int width = 1920;
-    int height = 1080;
+    HWND hwnd           = nullptr;
+    ID3D11Device*            device    = nullptr;
+    ID3D11DeviceContext*     deviceCtx = nullptr;
+    IDXGISwapChain*          swapChain = nullptr;
+    ID3D11RenderTargetView*  rtv       = nullptr;
+    int  width   = 1920;
+    int  height  = 1080;
     bool running = true;
+    bool menuOpen = false;
 };
 
 bool OverlayCreate(OverlayContext& ctx);
