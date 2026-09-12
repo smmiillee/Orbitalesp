@@ -126,4 +126,85 @@ bool OverlayCreate(OverlayContext& ctx) {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding    = 6.0f;
     style.FrameRounding     = 3.0f;
-    style.Colors[ImGuiCol_WindowBg] =
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.08f, 0.08f, 0.90f);
+
+    ImGui_ImplWin32_Init(ctx.hwnd);
+    ImGui_ImplDX11_Init(ctx.device, ctx.deviceCtx);
+
+    printf("[*] ImGui initialized OK\n");
+    printf("[*] Overlay ready. INSERT = menu, F9 = exit.\n");
+    return true;
+}
+
+void OverlayRun(OverlayContext& ctx, std::function<void()> renderFn) {
+    MSG msg{};
+
+    while (ctx.running) {
+        // Pump messages
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+            if (msg.message == WM_QUIT) ctx.running = false;
+        }
+
+        // INSERT toggles menu
+        static bool insertLast = false;
+        bool insertNow = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+        if (insertNow && !insertLast) {
+            ctx.menuOpen = !ctx.menuOpen;
+
+            // When menu is open: accept mouse input, remove click-through
+            // When menu is closed: restore click-through
+            LONG exStyle = GetWindowLongA(ctx.hwnd, GWL_EXSTYLE);
+            if (ctx.menuOpen) {
+                exStyle &= ~WS_EX_TRANSPARENT;
+                exStyle &= ~WS_EX_NOACTIVATE;
+            } else {
+                exStyle |= WS_EX_TRANSPARENT;
+                exStyle |= WS_EX_NOACTIVATE;
+            }
+            SetWindowLongA(ctx.hwnd, GWL_EXSTYLE, exStyle);
+            if (ctx.menuOpen) SetForegroundWindow(ctx.hwnd);
+        }
+        insertLast = insertNow;
+
+        // F9 kills the process
+        if (GetAsyncKeyState(VK_F9) & 0x8000) {
+            ctx.running = false;
+            break;
+        }
+
+        // Keep overlay on top of CS2
+        HWND cs2 = FindWindowA("SDL_app", nullptr);
+        if (cs2) {
+            SetWindowPos(ctx.hwnd, HWND_TOPMOST,
+                0, 0, ctx.width, ctx.height,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        // Frame
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        renderFn();
+
+        ImGui::Render();
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        ctx.deviceCtx->OMSetRenderTargets(1, &ctx.rtv, nullptr);
+        ctx.deviceCtx->ClearRenderTargetView(ctx.rtv, clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        ctx.swapChain->Present(1, 0);
+    }
+}
+
+void OverlayDestroy(OverlayContext& ctx) {
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    if (ctx.rtv)       { ctx.rtv->Release();       ctx.rtv = nullptr; }
+    if (ctx.swapChain) { ctx.swapChain->Release();  ctx.swapChain = nullptr; }
+    if (ctx.deviceCtx) { ctx.deviceCtx->Release();  ctx.deviceCtx = nullptr; }
+    if (ctx.device)    { ctx.device->Release();     ctx.device = nullptr; }
+    if (ctx.hwnd)      { DestroyWindow(ctx.hwnd);   ctx.hwnd = nullptr; }
+}
