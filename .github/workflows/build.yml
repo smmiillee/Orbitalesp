@@ -3,7 +3,7 @@ name: Build cs2external
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:  # lets you trigger a build manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -13,23 +13,16 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          submodules: recursive  # pulls ImGui if you add it as a submodule
+          submodules: recursive
 
-      - name: Add MSVC to PATH
-        uses: microsoft/setup-msbuild@v2
+      - name: Configure and Build (MSVC dev shell)
+        uses: ilammy/msvc-dev-cmd@v1  # activates vcvars64 — cl.exe is now on PATH
 
-      - name: Configure CMake (MSVC + Ninja)
-        shell: cmd
+      - name: Configure CMake
         run: |
-          cmake -S . -B build ^
-            -G "Ninja" ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_C_COMPILER=cl ^
-            -DCMAKE_CXX_COMPILER=cl ^
-            -DCMAKE_SYSTEM_NAME=Windows
+          cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        shell: cmd
         run: cmake --build build --config Release
 
       - name: Upload artifact
