@@ -12,7 +12,8 @@ public:
     bool Attach(const std::string& procName) {
         DWORD pid = GetPID(procName);
         if (!pid) return false;
-        process = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, pid);
+        // PROCESS_VM_READ only — zero writes to game memory ever
+        process = OpenProcess(PROCESS_VM_READ, FALSE, pid);
         return process != nullptr;
     }
 
@@ -49,14 +50,10 @@ public:
         return val;
     }
 
-    template<typename T>
-    void Write(uintptr_t addr, T val) const {
-        WriteProcessMemory(process, (LPVOID)addr, &val, sizeof(T), nullptr);
-    }
-
     std::string ReadString(uintptr_t addr, size_t maxLen = 64) const {
         char buf[128]{};
-        ReadProcessMemory(process, (LPCVOID)addr, buf, min(maxLen, sizeof(buf) - 1), nullptr);
+        ReadProcessMemory(process, (LPCVOID)addr, buf,
+            min(maxLen, sizeof(buf) - 1), nullptr);
         return std::string(buf);
     }
 
