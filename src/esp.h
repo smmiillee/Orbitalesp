@@ -14,8 +14,8 @@ struct Matrix4x4 {
 
 struct PlayerESP {
     Vec3  origin;
-    Vec2  screen_pos;
-    Vec2  screen_feet;
+    Vec2  screen_head;  // top of head in screen space  (was screen_pos — renamed to match main.cpp)
+    Vec2  screen_feet;  // feet in screen space
     int   health;
     int   team;
     bool  visible;
