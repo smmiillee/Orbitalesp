@@ -14,16 +14,15 @@
 #include "imgui.h"
 
 static std::vector<Player> g_Players;
-static int  g_LocalTeam  = 0;
+static int  g_LocalTeam   = 0;
 static bool g_EspEnabled  = true;
 static bool g_BhopEnabled = true;
 static OverlayContext g_Overlay;
 
-// Debug values shown in menu
-static uintptr_t dbg_LocalPawn    = 0;
-static int       dbg_LocalHealth  = 0;
-static int       dbg_PlayerCount  = 0;
-static uintptr_t dbg_ClientBase   = 0;
+static uintptr_t dbg_LocalPawn   = 0;
+static int       dbg_LocalHealth = 0;
+static int       dbg_PlayerCount = 0;
+static uintptr_t dbg_ClientBase  = 0;
 
 void MemoryThread() {
     while (g_Overlay.running) {
@@ -57,19 +56,16 @@ void MemoryThread() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // Wait for CS2
     printf("[*] Waiting for CS2...\n");
     while (!FindWindowA("SDL_app", nullptr))
         Sleep(1000);
     printf("[*] CS2 found.\n");
 
-    // Attach memory
     printf("[*] Attaching to cs2.exe...\n");
     while (!g_Mem.Attach("cs2.exe"))
         Sleep(1000);
     printf("[*] Attached OK.\n");
 
-    // Get client.dll
     printf("[*] Finding client.dll...\n");
     while (!g_Mem.GetModule("client.dll"))
         Sleep(1000);
@@ -82,50 +78,52 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     memThread.detach();
 
     OverlayRun(g_Overlay, []() {
-    DrawESP(g_Players, g_LocalTeam);
+        DrawESP(g_Players, g_LocalTeam);
 
-    if (g_Overlay.menuOpen) {
-        ImGui::SetNextWindowSize(ImVec2(320, 320), ImGuiCond_Once);
-        ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
-        ImGui::Begin("cs2external", nullptr,
-            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+        if (g_Overlay.menuOpen) {
+            ImGui::SetNextWindowSize(ImVec2(320, 340), ImGuiCond_Once);
+            ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
+            ImGui::Begin("cs2external", nullptr,
+                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
 
-        ImGui::SeparatorText("Features");
-        ImGui::Checkbox("ESP",  &g_EspEnabled);
-        ImGui::Checkbox("Bhop", &g_BhopEnabled);
-
-        ImGui::Spacing();
-        ImGui::SeparatorText("Debug");
-        ImGui::Text("client.dll : 0x%llX", (unsigned long long)dbg_ClientBase);
-        ImGui::Text("LocalPawn  : 0x%llX", (unsigned long long)dbg_LocalPawn);
-        ImGui::Text("LocalHP    : %d",      dbg_LocalHealth);
-        ImGui::Text("Players    : %d",      dbg_PlayerCount);
-
-        // Bone array probe
-        if (dbg_LocalPawn) {
-            uintptr_t sceneNode  = g_Mem.Read<uintptr_t>(dbg_LocalPawn + cs2::m_pGameSceneNode);
-            uintptr_t modelState = sceneNode + cs2::m_modelState;
-
-            // Probe four candidate bone array offsets
-            uintptr_t b0x70 = g_Mem.Read<uintptr_t>(modelState + 0x70);
-            uintptr_t b0x80 = g_Mem.Read<uintptr_t>(modelState + 0x80);
-            uintptr_t b0x90 = g_Mem.Read<uintptr_t>(modelState + 0x90);
-            uintptr_t b0xA0 = g_Mem.Read<uintptr_t>(modelState + 0xA0);
+            ImGui::SeparatorText("Features");
+            ImGui::Checkbox("ESP",  &g_EspEnabled);
+            ImGui::Checkbox("Bhop", &g_BhopEnabled);
 
             ImGui::Spacing();
-            ImGui::SeparatorText("Bone Probe");
-            ImGui::Text("SceneNode  : 0x%llX", (unsigned long long)sceneNode);
-            ImGui::Text("ModelState : 0x%llX", (unsigned long long)modelState);
-            ImGui::Text("+0x70 : 0x%llX", (unsigned long long)b0x70);
-            ImGui::Text("+0x80 : 0x%llX", (unsigned long long)b0x80);
-            ImGui::Text("+0x90 : 0x%llX", (unsigned long long)b0x90);
-            ImGui::Text("+0xA0 : 0x%llX", (unsigned long long)b0xA0);
+            ImGui::SeparatorText("Debug");
+            ImGui::Text("client.dll : 0x%llX", (unsigned long long)dbg_ClientBase);
+            ImGui::Text("LocalPawn  : 0x%llX", (unsigned long long)dbg_LocalPawn);
+            ImGui::Text("LocalHP    : %d",      dbg_LocalHealth);
+            ImGui::Text("Players    : %d",      dbg_PlayerCount);
+
+            if (dbg_LocalPawn) {
+                uintptr_t sceneNode  = g_Mem.Read<uintptr_t>(dbg_LocalPawn + cs2::m_pGameSceneNode);
+                uintptr_t modelState = sceneNode + cs2::m_modelState;
+
+                uintptr_t b0x70 = g_Mem.Read<uintptr_t>(modelState + 0x70);
+                uintptr_t b0x80 = g_Mem.Read<uintptr_t>(modelState + 0x80);
+                uintptr_t b0x90 = g_Mem.Read<uintptr_t>(modelState + 0x90);
+                uintptr_t b0xA0 = g_Mem.Read<uintptr_t>(modelState + 0xA0);
+
+                ImGui::Spacing();
+                ImGui::SeparatorText("Bone Probe");
+                ImGui::Text("SceneNode  : 0x%llX", (unsigned long long)sceneNode);
+                ImGui::Text("ModelState : 0x%llX", (unsigned long long)modelState);
+                ImGui::Text("+0x70 : 0x%llX", (unsigned long long)b0x70);
+                ImGui::Text("+0x80 : 0x%llX", (unsigned long long)b0x80);
+                ImGui::Text("+0x90 : 0x%llX", (unsigned long long)b0x90);
+                ImGui::Text("+0xA0 : 0x%llX", (unsigned long long)b0xA0);
+            }
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("INSERT = toggle menu");
+            ImGui::TextDisabled("F9 = exit");
+
+            ImGui::End();
         }
+    });
 
-        ImGui::Spacing();
-        ImGui::TextDisabled("INSERT = toggle menu");
-        ImGui::TextDisabled("F9 = exit");
-
-        ImGui::End();
-    }
-});
+    OverlayDestroy(g_Overlay);
+    return 0;
+}
