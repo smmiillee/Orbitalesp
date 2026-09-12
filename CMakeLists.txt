@@ -32,16 +32,22 @@ target_link_libraries(cs2external PRIVATE
     dxgi
     d3dcompiler
     dwmapi
-    ntdll
 )
 
-target_compile_options(cs2external PRIVATE
-    -O2
-    -march=x86-64
-    -Wall
-)
-
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_definitions(cs2external PRIVATE NDEBUG)
-    set_target_properties(cs2external PROPERTIES LINK_FLAGS "-mwindows")
+# MSVC flags (what GitHub Actions windows-latest uses)
+if(MSVC)
+    target_compile_options(cs2external PRIVATE
+        /O2
+        /W3
+        /EHsc
+        /MP         # parallel compilation
+    )
+    target_compile_definitions(cs2external PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+else()
+    # Fallback for local MinGW/Clang builds
+    target_compile_options(cs2external PRIVATE -O2 -march=x86-64 -Wall)
 endif()
