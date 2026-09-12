@@ -1,7 +1,7 @@
 #pragma once
 #include "memory.h"
 #include "offsets.h"
-#include "math.h"
+#include "cs2math.h"
 #include <string>
 #include <vector>
 
