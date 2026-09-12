@@ -1,129 +1,151 @@
+// --- src/main.cpp ---
 #include <Windows.h>
 #include <thread>
 #include <chrono>
-#include <vector>
-#include <cstdio>
-
+#include <imgui.h>
 #include "memory.h"
-#include "offsets.h"
-#include "cs2math.h"
-#include "sdk.h"
 #include "esp.h"
-#include "bhop.h"
 #include "overlay.h"
-#include "imgui.h"
+#include "offsets.h"
 
-static std::vector<Player> g_Players;
-static int  g_LocalTeam   = 0;
-static bool g_EspEnabled  = true;
-static bool g_BhopEnabled = true;
-static OverlayContext g_Overlay;
+static Memory g_mem;
+static ESP    g_esp;
+static bool   g_running = true;
 
-static uintptr_t dbg_LocalPawn   = 0;
-static int       dbg_LocalHealth = 0;
-static int       dbg_PlayerCount = 0;
-static uintptr_t dbg_ClientBase  = 0;
+// Config — toggle at runtime via ImGui menu (INSERT key)
+struct Config {
+    bool  esp_boxes     = true;
+    bool  esp_health    = true;
+    bool  esp_distance  = true;
+    bool  enemy_only    = true;
+    float box_thickness = 1.5f;
+    ImVec4 color_enemy  = { 1.0f, 0.2f, 0.2f, 1.0f };
+    ImVec4 color_team   = { 0.2f, 1.0f, 0.4f, 1.0f };
+} g_cfg;
 
-void MemoryThread() {
-    while (g_Overlay.running) {
-        dbg_ClientBase = g_Mem.clientBase;
+bool g_menu_open = false;
 
-        uintptr_t localPawn = g_Mem.Read<uintptr_t>(
-            g_Mem.clientBase + offsets::dwLocalPlayerPawn);
-        dbg_LocalPawn = localPawn;
-
-        if (localPawn) {
-            dbg_LocalHealth = g_Mem.Read<int>(localPawn + cs2::m_iHealth);
-            g_LocalTeam     = g_Mem.Read<int>(localPawn + cs2::m_iTeamNum);
-
-            Matrix4x4 vm = g_Mem.Read<Matrix4x4>(
-                g_Mem.clientBase + offsets::dwViewMatrix);
-
-            if (g_EspEnabled) {
-                g_Players = GetPlayers(vm, g_Overlay.width, g_Overlay.height);
-                dbg_PlayerCount = (int)g_Players.size();
-            } else {
-                g_Players.clear();
-                dbg_PlayerCount = 0;
-            }
+void memory_thread() {
+    while (g_running) {
+        if (g_mem.is_valid()) {
+            g_esp.update(g_mem, g_mem.base_address);
         }
-
-        if (g_BhopEnabled)
-            BhopTick();
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2)); // ~500hz read rate
     }
 }
 
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    printf("[*] Waiting for CS2...\n");
-    while (!FindWindowA("SDL_app", nullptr))
-        Sleep(1000);
-    printf("[*] CS2 found.\n");
+void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
+    for (const auto& p : g_esp.players) {
+        if (g_cfg.enemy_only && p.team == 2) continue; // skip team 2 if enemy_only
 
-    printf("[*] Attaching to cs2.exe...\n");
-    while (!g_Mem.Attach("cs2.exe"))
-        Sleep(1000);
-    printf("[*] Attached OK.\n");
+        ImVec4 col4 = (p.team == 3) ? g_cfg.color_enemy : g_cfg.color_team;
+        ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
 
-    printf("[*] Finding client.dll...\n");
-    while (!g_Mem.GetModule("client.dll"))
-        Sleep(1000);
-    printf("[*] client.dll base: 0x%llX\n", (unsigned long long)g_Mem.clientBase);
+        float cx = p.screen_pos.x;
+        float top = p.screen_head.y;
+        float bot = p.screen_feet.y;
+        float bh  = bot - top;
+        float bw  = bh * 0.45f;
 
-    if (!OverlayCreate(g_Overlay))
-        return 1;
+        if (cx < 0 || cx > screen_w || top < 0 || bot > screen_h) continue;
 
-    std::thread memThread(MemoryThread);
-    memThread.detach();
-
-    OverlayRun(g_Overlay, []() {
-        DrawESP(g_Players, g_LocalTeam);
-
-        if (g_Overlay.menuOpen) {
-            ImGui::SetNextWindowSize(ImVec2(320, 340), ImGuiCond_Once);
-            ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
-            ImGui::Begin("cs2external", nullptr,
-                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
-
-            ImGui::SeparatorText("Features");
-            ImGui::Checkbox("ESP",  &g_EspEnabled);
-            ImGui::Checkbox("Bhop", &g_BhopEnabled);
-
-            ImGui::Spacing();
-            ImGui::SeparatorText("Debug");
-            ImGui::Text("client.dll : 0x%llX", (unsigned long long)dbg_ClientBase);
-            ImGui::Text("LocalPawn  : 0x%llX", (unsigned long long)dbg_LocalPawn);
-            ImGui::Text("LocalHP    : %d",      dbg_LocalHealth);
-            ImGui::Text("Players    : %d",      dbg_PlayerCount);
-
-            if (dbg_LocalPawn) {
-                uintptr_t sceneNode  = g_Mem.Read<uintptr_t>(dbg_LocalPawn + cs2::m_pGameSceneNode);
-                uintptr_t modelState = sceneNode + cs2::m_modelState;
-
-                uintptr_t b0x70 = g_Mem.Read<uintptr_t>(modelState + 0x70);
-                uintptr_t b0x80 = g_Mem.Read<uintptr_t>(modelState + 0x80);
-                uintptr_t b0x90 = g_Mem.Read<uintptr_t>(modelState + 0x90);
-                uintptr_t b0xA0 = g_Mem.Read<uintptr_t>(modelState + 0xA0);
-
-                ImGui::Spacing();
-                ImGui::SeparatorText("Bone Probe");
-                ImGui::Text("SceneNode  : 0x%llX", (unsigned long long)sceneNode);
-                ImGui::Text("ModelState : 0x%llX", (unsigned long long)modelState);
-                ImGui::Text("+0x70 : 0x%llX", (unsigned long long)b0x70);
-                ImGui::Text("+0x80 : 0x%llX", (unsigned long long)b0x80);
-                ImGui::Text("+0x90 : 0x%llX", (unsigned long long)b0x90);
-                ImGui::Text("+0xA0 : 0x%llX", (unsigned long long)b0xA0);
-            }
-
-            ImGui::Spacing();
-            ImGui::TextDisabled("INSERT = toggle menu");
-            ImGui::TextDisabled("F9 = exit");
-
-            ImGui::End();
+        // Box
+        if (g_cfg.esp_boxes) {
+            dl->AddRect(
+                { cx - bw / 2, top },
+                { cx + bw / 2, bot },
+                col, 0.0f, 0, g_cfg.box_thickness
+            );
         }
-    });
 
-    OverlayDestroy(g_Overlay);
+        float label_y = top - 14.0f;
+
+        // Health bar — left side
+        if (g_cfg.esp_health) {
+            float bar_h   = bh * (p.health / 100.0f);
+            float bar_x   = cx - bw / 2 - 6.0f;
+            ImU32 hp_col  = IM_COL32(
+                (int)(255 * (1.0f - p.health / 100.0f)),
+                (int)(255 * (p.health / 100.0f)),
+                0, 255
+            );
+            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
+            dl->AddRect({ bar_x, top }, { bar_x + 3.0f, bot }, IM_COL32(0, 0, 0, 180));
+        }
+
+        // Distance label
+        if (g_cfg.esp_distance) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.0fm", p.distance);
+            dl->AddText({ cx - 12.0f, label_y }, IM_COL32(255, 255, 255, 200), buf);
+        }
+    }
+}
+
+void render_menu() {
+    ImGui::SetNextWindowSize({ 280, 260 }, ImGuiCond_Once);
+    ImGui::SetNextWindowPos({ 30, 30 }, ImGuiCond_Once);
+    ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoResize);
+
+    ImGui::SeparatorText("ESP");
+    ImGui::Checkbox("Boxes",     &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health",    &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",  &g_cfg.esp_distance);
+    ImGui::Checkbox("Enemy Only",&g_cfg.enemy_only);
+
+    ImGui::SeparatorText("Colors");
+    ImGui::ColorEdit4("Enemy",   &g_cfg.color_enemy.x,  ImGuiColorEditFlags_NoInputs);
+    ImGui::ColorEdit4("Team",    &g_cfg.color_team.x,   ImGuiColorEditFlags_NoInputs);
+
+    ImGui::SeparatorText("Style");
+    ImGui::SliderFloat("Thickness", &g_cfg.box_thickness, 0.5f, 4.0f);
+
+    ImGui::Separator();
+    if (!g_mem.is_valid())
+        ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "CS2 not found");
+    else
+        ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f }, "Attached");
+
+    ImGui::End();
+}
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // Attach — retry until CS2 is running
+    while (!g_mem.attach(L"cs2.exe")) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+
+    constexpr int W = 1920, H = 1080;
+    Overlay overlay;
+    if (!overlay.create(W, H)) return 1;
+
+    std::thread mem_t(memory_thread);
+
+    MSG msg{};
+    while (g_running) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if (msg.message == WM_QUIT) g_running = false;
+        }
+
+        // INSERT to toggle menu
+        if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
+        // END to exit
+        if (GetAsyncKeyState(VK_END)    & 1) g_running = false;
+
+        overlay.begin_frame();
+
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        render_esp(dl, W, H);
+        if (g_menu_open) render_menu();
+
+        overlay.end_frame();
+    }
+
+    g_running = false;
+    mem_t.join();
+    overlay.cleanup();
+    g_mem.detach();
     return 0;
 }
