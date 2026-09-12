@@ -28,29 +28,28 @@ uintptr_t ESP::get_entity(const Memory& mem, uintptr_t entity_list, int index) c
 void ESP::update(const Memory& mem, uintptr_t client_base) {
     players.clear();
 
-    Matrix4x4 vm = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
+    Matrix4x4 vm         = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
     int local_team = mem.read<int>(local_pawn + offsets::m_iTeamNum);
 
-    // Screen dimensions — match your overlay window
     constexpr int W = 1920, H = 1080;
 
     for (int i = 1; i < offsets::max_entities; ++i) {
         uintptr_t controller = get_entity(mem, entity_list, i);
         if (!controller) continue;
 
-        uintptr_t pawn = mem.read<uintptr_t>(controller + 0x598); // m_hPlayerPawn -> resolved
+        uintptr_t pawn = mem.read<uintptr_t>(controller + 0x598);
         if (!pawn || pawn == local_pawn) continue;
 
         int health = mem.read<int>(pawn + offsets::m_iHealth);
         if (health <= 0 || health > 100) continue;
 
-        int team = mem.read<int>(pawn + offsets::m_iTeamNum);
+        int     team = mem.read<int>    (pawn + offsets::m_iTeamNum);
         uint8_t life = mem.read<uint8_t>(pawn + offsets::m_lifeState);
-        if (life != 0) continue; // 0 = alive
+        if (life != 0) continue;
 
         uintptr_t scene_node = mem.read<uintptr_t>(pawn + offsets::m_pGameSceneNode);
         if (!scene_node) continue;
@@ -63,13 +62,15 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
         if (!world_to_screen(origin, screen_feet, vm, W, H)) continue;
 
         float box_h = screen_feet.y - screen_head.y;
-        if (box_h < 5.0f) continue; // off-screen or clipped
+        if (box_h < 5.0f) continue;
 
         float box_w = box_h * 0.45f;
 
         float dx = origin.x, dy = origin.y, dz = origin.z;
-        float dist = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.0254f; // hammer units -> meters
+        float dist = std::sqrt(dx * dx + dy * dy + dz * dz) * 0.0254f;
 
+        // Initializer order must match PlayerESP field declaration order in esp.h:
+        // origin, screen_head, screen_feet, health, team, visible, distance, box_h, box_w
         players.push_back({
             origin,
             screen_head,
