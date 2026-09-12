@@ -1,81 +1,28 @@
+// --- src/memory.h ---
 #pragma once
 #include <Windows.h>
 #include <TlHelp32.h>
-#include <string>
 #include <cstdint>
+#include <string>
 
 class Memory {
 public:
-    HANDLE process = nullptr;
-    uintptr_t clientBase = 0;
+    HANDLE process_handle = nullptr;
+    uintptr_t base_address = 0;
 
-    bool Attach(const std::string& procName) {
-        DWORD pid = GetPID(procName);
-        if (!pid) return false;
-        // PROCESS_VM_READ only — zero writes to game memory ever
-        process = OpenProcess(PROCESS_VM_READ, FALSE, pid);
-        return process != nullptr;
-    }
-
-    bool GetModule(const std::string& modName) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(FindWindowA("SDL_app", nullptr), &pid);
-        if (!pid) return false;
-
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-
-        MODULEENTRY32 me32{};
-        me32.dwSize = sizeof(me32);
-        bool found = false;
-
-        if (Module32First(snap, &me32)) {
-            do {
-                if (modName == me32.szModule) {
-                    clientBase = (uintptr_t)me32.modBaseAddr;
-                    found = true;
-                    break;
-                }
-            } while (Module32Next(snap, &me32));
-        }
-
-        CloseHandle(snap);
-        return found;
-    }
+    bool attach(const std::wstring& process_name);
+    void detach();
 
     template<typename T>
-    T Read(uintptr_t addr) const {
-        T val{};
-        ReadProcessMemory(process, (LPCVOID)addr, &val, sizeof(T), nullptr);
-        return val;
+    T read(uintptr_t address) const {
+        T value{};
+        ReadProcessMemory(process_handle, reinterpret_cast<LPCVOID>(address), &value, sizeof(T), nullptr);
+        return value;
     }
 
-    std::string ReadString(uintptr_t addr, size_t maxLen = 64) const {
-    char buf[128]{};
-    size_t readLen = maxLen < (sizeof(buf) - 1) ? maxLen : (sizeof(buf) - 1);
-    ReadProcessMemory(process, (LPCVOID)addr, buf, readLen, nullptr);
-    return std::string(buf);
-}
+    bool is_valid() const { return process_handle != nullptr && base_address != 0; }
 
 private:
-    DWORD GetPID(const std::string& name) const {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        PROCESSENTRY32 pe{};
-        pe.dwSize = sizeof(pe);
-        DWORD pid = 0;
-
-        if (Process32First(snap, &pe)) {
-            do {
-                if (name == pe.szExeFile) {
-                    pid = pe.th32ProcessID;
-                    break;
-                }
-            } while (Process32Next(snap, &pe));
-        }
-
-        CloseHandle(snap);
-        return pid;
-    }
+    DWORD get_process_id(const std::wstring& process_name) const;
+    uintptr_t get_module_base(DWORD pid, const std::wstring& module_name) const;
 };
-
-inline Memory g_Mem;
