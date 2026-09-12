@@ -1,20 +1,28 @@
+// --- src/overlay.h ---
 #pragma once
 #include <d3d11.h>
-#include <Windows.h>
-#include <functional>
+#include <string>
 
-struct OverlayContext {
-    HWND hwnd           = nullptr;
-    ID3D11Device*            device    = nullptr;
-    ID3D11DeviceContext*     deviceCtx = nullptr;
-    IDXGISwapChain*          swapChain = nullptr;
-    ID3D11RenderTargetView*  rtv       = nullptr;
-    int  width   = 1920;
-    int  height  = 1080;
-    bool running = true;
-    bool menuOpen = false;
+class Overlay {
+public:
+    HWND        hwnd            = nullptr;
+    ID3D11Device*           device  = nullptr;
+    ID3D11DeviceContext*    context = nullptr;
+    IDXGISwapChain*         swapchain = nullptr;
+    ID3D11RenderTargetView* rtv     = nullptr;
+
+    bool create(int width, int height);
+    void begin_frame();
+    void end_frame();
+    void cleanup();
+
+    bool is_running() const { return hwnd != nullptr; }
+
+private:
+    bool create_device();
+    bool create_render_target();
+    void release_render_target();
+
+    static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
+    WNDCLASSEXW wc{};
 };
-
-bool OverlayCreate(OverlayContext& ctx);
-void OverlayDestroy(OverlayContext& ctx);
-void OverlayRun(OverlayContext& ctx, std::function<void()> renderFn);
