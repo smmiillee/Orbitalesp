@@ -2,32 +2,29 @@
 #include <cstdint>
 
 // ============================================================
-// Offsets sourced from https://github.com/a2x/cs2-dumper
-// UPDATE after every CS2 patch — run cs2-dumper.exe in-game.
+// Dumped fresh — update after every CS2 patch via cs2-dumper
 // ============================================================
 
 namespace offsets {
-    constexpr uintptr_t dwEntityList            = 0x18C6CA8;
-    constexpr uintptr_t dwLocalPlayerPawn       = 0x1880C60;
-    constexpr uintptr_t dwLocalPlayerController = 0x1908A60;
-    constexpr uintptr_t dwViewMatrix            = 0x19D2DC0;
-    // dwForceJump removed — read-only build, no WPM
+    constexpr uintptr_t dwEntityList            = 0x2577BE0;
+    constexpr uintptr_t dwLocalPlayerPawn       = 0x23CCC08;
+    constexpr uintptr_t dwLocalPlayerController = 0x23A78D0;
+    constexpr uintptr_t dwViewMatrix            = 0x23D21F0;
 }
 
 namespace cs2 {
-    constexpr uintptr_t m_iTeamNum        = 0x3CB;
-    constexpr uintptr_t m_iHealth         = 0x344;
-    constexpr uintptr_t m_lifeState       = 0x348;
-    constexpr uintptr_t m_vOldOrigin      = 0x127C;
-    constexpr uintptr_t m_pGameSceneNode  = 0x328;
-    constexpr uintptr_t m_hPlayerPawn     = 0x8FC;
-    constexpr uintptr_t m_vecViewOffset   = 0xC58;
-    constexpr uintptr_t m_modelState      = 0x170;
-    constexpr uintptr_t m_boneArray       = 0x80;
-    constexpr uintptr_t m_iszPlayerName   = 0x850;
-    constexpr uintptr_t m_pClippingWeapon = 0x12F8;
-    constexpr uintptr_t m_iItemDefinitionIndex = 0x1B7A;
-    constexpr uintptr_t m_flC4Blow        = 0x510;
+    constexpr uintptr_t m_iHealth            = 0x63C;   // int32 (m_iHealthMin)
+    constexpr uintptr_t m_iTeamNum           = 0x3E7;   // uint8
+    constexpr uintptr_t m_lifeState          = 0x354;   // uint8
+    constexpr uintptr_t m_vOldOrigin         = 0x13B8;  // Vector
+    constexpr uintptr_t m_pGameSceneNode     = 0x330;   // CGameSceneNode*
+    constexpr uintptr_t m_hPlayerPawn        = 0x914;   // CHandle<C_CSPlayerPawn>
+    constexpr uintptr_t m_vecViewOffset      = 0xE78;
+    constexpr uintptr_t m_modelState         = 0x140;   // CModelState (within scenenode)
+    constexpr uintptr_t m_boneArray          = 0x80;    // within m_modelState — verify below
+    constexpr uintptr_t m_iszPlayerName      = 0x6F4;   // char[128]
+    constexpr uintptr_t m_pClippingWeapon    = 0x12F8;  // not in your dump — needs verify
+    constexpr uintptr_t m_iItemDefinitionIndex = 0x1BA; // uint16
 }
 
 namespace bones {
