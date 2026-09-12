@@ -7,8 +7,8 @@
 
 class Memory {
 public:
-    HANDLE process_handle = nullptr;
-    uintptr_t base_address = 0;
+    HANDLE    process_handle = nullptr;
+    uintptr_t base_address   = 0;
 
     bool attach(const std::wstring& process_name);
     void detach();
@@ -16,13 +16,22 @@ public:
     template<typename T>
     T read(uintptr_t address) const {
         T value{};
-        ReadProcessMemory(process_handle, reinterpret_cast<LPCVOID>(address), &value, sizeof(T), nullptr);
+        ReadProcessMemory(
+            process_handle,
+            reinterpret_cast<LPCVOID>(address),
+            &value, sizeof(T), nullptr);
         return value;
     }
 
-    bool is_valid() const { return process_handle != nullptr && base_address != 0; }
+    bool is_valid() const {
+        return process_handle != nullptr && base_address != 0;
+    }
 
 private:
-    DWORD get_process_id(const std::wstring& process_name) const;
+    DWORD     get_process_id(const std::wstring& process_name) const;
     uintptr_t get_module_base(DWORD pid, const std::wstring& module_name) const;
 };
+
+// Defined in main.cpp — visible to every TU that includes this header.
+// bhop.cpp uses g_mem.read<>() and g_mem.base_address directly.
+extern Memory g_mem;
