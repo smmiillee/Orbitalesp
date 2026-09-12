@@ -51,11 +51,11 @@ public:
     }
 
     std::string ReadString(uintptr_t addr, size_t maxLen = 64) const {
-        char buf[128]{};
-        ReadProcessMemory(process, (LPCVOID)addr, buf,
-            min(maxLen, sizeof(buf) - 1), nullptr);
-        return std::string(buf);
-    }
+    char buf[128]{};
+    size_t readLen = maxLen < (sizeof(buf) - 1) ? maxLen : (sizeof(buf) - 1);
+    ReadProcessMemory(process, (LPCVOID)addr, buf, readLen, nullptr);
+    return std::string(buf);
+}
 
 private:
     DWORD GetPID(const std::string& name) const {
