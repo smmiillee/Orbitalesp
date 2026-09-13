@@ -48,15 +48,13 @@ static void calibrate(const Memory& mem, uintptr_t entity_list,
     }
 }
 
-void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int screen_h) {
-    std::vector<PlayerESP> new_players;
-
-    Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
+// Memory thread: read world positions only, no view matrix
+void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) {
-        std::lock_guard<std::mutex> lock(players_mutex);
-        players.clear();
+        std::lock_guard<std::mutex> lock(world_mutex);
+        world_players.clear();
         return;
     }
 
@@ -66,6 +64,8 @@ void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int scr
         calibrate(mem, entity_list, local_pawn, s_off, s_stride);
         s_done = true;
     }
+
+    std::vector<PlayerData> new_players;
 
     for (int chunk = 0; chunk < 4; chunk++) {
         uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + s_off + 8 * chunk);
@@ -87,28 +87,47 @@ void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int scr
             origin.z = mem.read<float>(entity + offsets::m_vOldOrigin + 8);
             if (origin.x == 0.0f && origin.y == 0.0f) continue;
 
-            Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
-            Vec2 screen_head, screen_feet;
-            if (!world_to_screen(head,   screen_head, vm, screen_w, screen_h)) continue;
-            if (!world_to_screen(origin, screen_feet, vm, screen_w, screen_h)) continue;
-
-            float box_h = screen_feet.y - screen_head.y;
-            if (box_h < 5.0f) continue;
-
             float dist = std::sqrt(
                 origin.x * origin.x +
                 origin.y * origin.y +
                 origin.z * origin.z) / 40.0f;
 
-            new_players.push_back({
-                origin, screen_head, screen_feet,
-                health, team, true, dist,
-                box_h, box_h * 0.45f
-            });
+            new_players.push_back({ origin, health, team, dist });
         }
     }
 
-    // Swap under lock — render thread never sees a partial write
-    std::lock_guard<std::mutex> lock(players_mutex);
-    players = std::move(new_players);
+    std::lock_guard<std::mutex> lock(world_mutex);
+    world_players = std::move(new_players);
+}
+
+// Render thread: read fresh view matrix THIS frame, project all world positions
+std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
+                                     int screen_w, int screen_h) {
+    // Fresh view matrix every single render frame — eliminates mouse shake lag
+    Matrix4x4 vm = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
+
+    std::vector<PlayerData> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(world_mutex);
+        snapshot = world_players;
+    }
+
+    std::vector<PlayerESP> result;
+    for (const auto& p : snapshot) {
+        Vec3 head = { p.origin.x, p.origin.y, p.origin.z + 70.0f };
+
+        Vec2 screen_head, screen_feet;
+        if (!world_to_screen(head,     screen_head, vm, screen_w, screen_h)) continue;
+        if (!world_to_screen(p.origin, screen_feet, vm, screen_w, screen_h)) continue;
+
+        float box_h = screen_feet.y - screen_head.y;
+        if (box_h < 5.0f) continue;
+
+        result.push_back({
+            screen_head, screen_feet,
+            p.health, p.team, p.distance,
+            box_h, box_h * 0.45f
+        });
+    }
+    return result;
 }
