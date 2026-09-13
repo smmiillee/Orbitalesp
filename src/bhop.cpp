@@ -1,6 +1,7 @@
 // --- src/bhop.cpp ---
-// Bhop on HOLD-SPACE, with input mode as the default so nothing is written to
-// cs2.exe.
+// Bhop on HOLD-SPACE. The held key is a GATE; the jump itself is commanded by
+// us, either through the jump button in memory (precise) or through synthetic
+// keystrokes (no writes, but jittery).
 //
 //   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
 //
@@ -8,6 +9,14 @@
 //   sprint -0x630  reload -0x5A0  attack -0x510  attack2 -0x480
 //   turnleft -0x3F0 turnright -0x360 forward -0x2D0 back -0x240
 //   left -0x1B0     right -0x120     use -0x090      JUMP   duck +0x090
+//
+// ── THE THREE THINGS THAT MAKE THIS NOT MISS ─────────────────────────────
+// 1. Deterministic output. A memory write is microseconds; SendInput is not.
+// 2. The physical spacebar is swallowed while we drive, so the engine's own
+//    input poll cannot re-assert your held key and erase the press edge.
+// 3. A guaranteed press window: once grounded we hold the press for ~2 ticks,
+//    which survives the race where the engine's own button write lands just
+//    after ours.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -36,6 +45,10 @@ constexpr intptr_t kRel[] = {
 constexpr int kSlotCount = static_cast<int>(sizeof(kRel) / sizeof(kRel[0]));
 constexpr int kJumpSlot  = 11;
 
+// How long a press is held once we are grounded. Two ticks at 64 Hz. This is
+// what covers the race against the engine rewriting the button from input.
+constexpr double kPressHoldMs = 30.0;
+
 // Memory-mode hints only. A lock still has to be confirmed by held input.
 constexpr uintptr_t kCandidates[] = {
     0x2095490, 0x2096490, 0x2094490, 0x2093490, 0x205BAF0,
@@ -43,18 +56,19 @@ constexpr uintptr_t kCandidates[] = {
 
 std::atomic<bool>      g_stop{false}, g_started{false};
 std::atomic<bool>      g_locked{false}, g_scanning{false};
-std::atomic<bool>      g_input_mode{true};      // default: no cs2 writes
+std::atomic<int>       g_mode{BHOP_MEMORY};
 std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
 
 // Diagnostics.
-std::atomic<bool> g_dbg_ground{false}, g_dbg_focused{false};
-std::atomic<bool> g_dbg_space{false},  g_dbg_driving{false};
-std::atomic<int>  g_dbg_signals{0},    g_dbg_presses{0};
+std::atomic<bool> g_dbg_ground{false},  g_dbg_focused{false};
+std::atomic<bool> g_dbg_space{false},   g_dbg_driving{false};
+std::atomic<bool> g_dbg_suppress{false};
+std::atomic<int>  g_dbg_signals{0},     g_dbg_presses{0};
 
 // Keyboard hook.
 std::atomic<bool>  g_phys_space{false};   // physical (non-injected) spacebar
 std::atomic<bool>  g_hook_ok{false};
-std::atomic<bool>  g_suppress{false};     // hide physical space from the game
+std::atomic<bool>  g_suppress{false};     // swallow the physical spacebar
 std::atomic<DWORD> g_hook_tid{0};
 HHOOK g_hook = nullptr;
 
@@ -94,10 +108,9 @@ bool cs2_focused() {
 //      are injecting.
 //   2. while bhop is driving, SWALLOW the physical spacebar so the game's jump
 //      input comes only from us. Without this, auto-repeat re-asserts your DOWN
-//      against our UP and the landing press edge never forms.
+//      against our release and the landing press edge never forms.
 //
-// Scoped to input mode + CS2 foreground, so space behaves normally everywhere
-// else.
+// Scoped to "bhop is driving", so space behaves normally everywhere else.
 LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
@@ -115,7 +128,7 @@ LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
                     break;
             }
             if (g_suppress.load())
-                return 1;   // swallow: the game must only see our events
+                return 1;   // swallow: the game must only see our own input
         }
     }
     return CallNextHookEx(nullptr, code, wparam, lparam);
@@ -146,11 +159,10 @@ bool space_held() {
     return (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
 }
 
-// ── held-input mask ──────────────────────────────────────────────────────
-// Space MUST be included here. While you hold it the jump slot legitimately
-// reads 0x10001, and the previous version excluded it -- so every candidate
-// block failed validation and memory mode could never lock at all. That is why
-// unticking Input mode made bhop "fail entirely".
+// ── held-input mask (memory-mode address proof) ──────────────────────────
+// Space MUST be included: while you hold it the jump slot legitimately reads
+// 0x10001. Excluding it made every candidate fail validation, which is why
+// memory mode could never lock.
 int held_mask() {
     auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     int m = 0;
@@ -195,8 +207,8 @@ bool block_valid(uintptr_t j, int mask, bool require_evidence) {
 }
 
 // Decisive path: find a dword with its down bit set, then work out where the
-// block's jump slot would have to be to explain it. With space in the mask this
-// now also catches jump itself, so holding space alone is enough to lock.
+// block's jump slot would have to be to explain it. Uses YOUR held keys as
+// proof, so it cannot lock onto a coincidence.
 uintptr_t scan_pressed(int mask) {
     const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
     const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
@@ -310,9 +322,10 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     return ground;
 }
 
-// ── synthetic jump ───────────────────────────────────────────────────────
-// Send only on a state CHANGE, so we produce clean edges rather than a stream
-// of redundant keystrokes.
+// ── output: one place where the two modes diverge ────────────────────────
+
+// Send only on a state CHANGE, so injection produces clean edges rather than a
+// stream of redundant keystrokes.
 void inject_space(bool down) {
     static bool s_down = false;
     if (down == s_down) return;
@@ -326,84 +339,57 @@ void inject_space(bool down) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// ── input-mode edge generator ────────────────────────────────────────────
-// Press on each landing, then ALWAYS release again a tick later.
-//
-// The old code held the key for the whole grounded period, which meant a missed
-// landing left it stuck DOWN and the next landing had no fresh edge -- so a
-// chain that missed once could never recover. Releasing restores the edge, and
-// it also makes the generator immune to a flickering ground flag: a spurious
-// press in mid-air is ignored by the game, and the key is released again before
-// you actually land.
-struct EdgeGen {
-    bool   down = false;
-    double down_at = 0.0;
-};
-constexpr double kHoldMs = 12.0;   // ~1 tick
-
-void edge_step(EdgeGen& e, bool active, bool grounded) {
-    const double now = now_ms();
-
-    if (!active) {
-        if (e.down) { inject_space(false); e.down = false; }
-        return;
-    }
-
-    if (grounded) {
-        if (!e.down) {
-            inject_space(true);            // fresh press edge on the landing
-            e.down = true;
-            e.down_at = now;
-            g_dbg_presses.fetch_add(1);
-        } else if (now - e.down_at >= kHoldMs) {
-            inject_space(false);           // release so the next landing is new
-            e.down = false;
-        }
-    } else if (e.down) {
-        inject_space(false);
-        e.down = false;
-    }
+void write_button(bool down) {
+    if (!g_locked.load() || !g_mem.is_valid()) return;
+    g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
+                         down ? kJumpPress : kJumpRelease);
 }
 
 void bhop_thread_main() {
     // Memory mode only: park the button released so a stale value can't wedge
-    // the jump. Input mode performs no writes at all.
-    if (!g_input_mode.load() && g_mem.is_valid())
+    // the jump. Injection mode performs no writes at all.
+    if (g_mode.load() == BHOP_MEMORY && g_mem.is_valid())
         g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
                              kJumpRelease);
 
     uintptr_t pawn = 0;
     double    pawn_at = 0.0, last_sample = 0.0;
-    bool      ground = false;
-    EdgeGen   edge;
+    bool      ground = false, prev_ground = false;
+    bool      out_down = false;
+    double    press_until = 0.0;
 
     while (!g_stop.load()) {
         wait_ms(1);
         if (!g_mem.is_valid()) continue;
 
+        const int  mode    = g_mode.load();
         const bool focused = cs2_focused();
-        const bool input   = g_input_mode.load();
+        const bool space   = space_held();
 
-        // Suppress your physical spacebar whenever we are driving the jump, in
-        // BOTH modes: in memory mode the game would otherwise keep rewriting the
-        // button from your held key and erase ours between ticks.
-        g_suppress.store(focused && (input || g_locked.load()));
-
-        const bool space = space_held();
         g_dbg_focused.store(focused);
         g_dbg_space.store(space);
 
-        // ── HOLD-SPACE GATE ──────────────────────────────────────────────
-        // Nothing happens unless you are physically holding space, so there is
-        // no auto-jump and no surprise input.
-        const bool active = focused && space;
+        const bool active = (mode != BHOP_OFF) && focused && space;
 
-        if (!active) {
+        // In memory mode we can only act once the address is confirmed, so we
+        // must not swallow the key before then -- otherwise your normal jump
+        // would stop working while we waited.
+        const bool can_drive =
+            (mode == BHOP_INJECT) ||
+            (mode == BHOP_MEMORY && g_locked.load());
+
+        const bool suppress = active && can_drive;
+        g_suppress.store(suppress);
+        g_dbg_suppress.store(suppress);
+
+        // ── idle: always leave the world in a released state ─────────────
+        if (!active || !can_drive) {
+            if (out_down && mode == BHOP_INJECT) inject_space(false);
+            if (mode == BHOP_MEMORY) write_button(false);
+            out_down = false;
+            press_until = 0.0;
+            prev_ground = false;
             g_dbg_driving.store(false);
-            edge_step(edge, false, false);
-            if (!input && g_mem.is_valid() && g_locked.load())
-                g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
-                                     kJumpRelease);
             continue;
         }
 
@@ -414,7 +400,9 @@ void bhop_thread_main() {
             pawn_at = now;
         }
         if (!pawn) {
-            edge_step(edge, false, false);
+            if (out_down && mode == BHOP_INJECT) inject_space(false);
+            if (mode == BHOP_MEMORY) write_button(false);
+            out_down = false;
             continue;
         }
 
@@ -425,19 +413,35 @@ void bhop_thread_main() {
             ground = sample_ground(g_mem, pawn);
         }
 
-        if (input) {
-            edge_step(edge, true, ground);
-            g_dbg_driving.store(true);
-        } else {
-            if (!g_locked.load()) { g_dbg_driving.store(false); continue; }
-            const uintptr_t jump_addr =
-                g_mem.client_dll + g_jump_offset.load();
-            g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
-            g_dbg_driving.store(true);
+        // ── THE JUMP PATTERN ─────────────────────────────────────────────
+        // On the rising edge of "grounded", open a guaranteed press window.
+        // While airborne the button stays released, which is what makes the
+        // next press a fresh edge. Both are height- and surface-independent:
+        // a landing off a roof reads exactly like a landing on flat ground.
+        if (ground && !prev_ground) {
+            press_until = now + kPressHoldMs;
+            g_dbg_presses.fetch_add(1);
         }
+        prev_ground = ground;
+
+        const bool want = ground || (now < press_until);
+
+        if (mode == BHOP_MEMORY) {
+            // Re-assert EVERY iteration: the engine rewrites the button from
+            // input each tick, so a single write would be overwritten. This is
+            // also what makes the press window meaningful.
+            write_button(want);
+        } else if (want != out_down) {
+            inject_space(want);
+        }
+        out_down = want;
+        g_dbg_driving.store(true);
     }
 
-    inject_space(false);
+    // Never strand a held key or a stuck button on shutdown.
+    g_suppress.store(false);
+    if (g_mode.load() == BHOP_INJECT) inject_space(false);
+    if (g_mode.load() == BHOP_MEMORY) write_button(false);
 }
 
 } // namespace
@@ -449,7 +453,7 @@ void Bhop_Init() {
 
     g_stop.store(false);
 
-    // The hook is required for input mode to behave, so start it first.
+    // The hook is required for hold-space to behave, so start it first.
     g_hook_thread = std::thread(hook_thread_main);
     g_bhop_thread = std::thread(bhop_thread_main);
     g_scan_thread = std::thread(scan_thread_main);
@@ -459,6 +463,7 @@ void Bhop_Shutdown() {
     g_stop.store(true);
     g_suppress.store(false);
     inject_space(false);
+    if (g_mode.load() == BHOP_MEMORY) write_button(false);
 
     if (g_hook_tid.load())
         PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
@@ -471,16 +476,18 @@ void Bhop_Shutdown() {
 
 BhopDebug Bhop_GetDebug() {
     BhopDebug d;
-    d.offset     = g_jump_offset.load();
-    d.on_ground  = g_dbg_ground.load();
-    d.focused    = g_dbg_focused.load();
-    d.space_held = g_dbg_space.load();
-    d.hook_ok    = g_hook_ok.load();
-    d.driving    = g_dbg_driving.load();
-    d.signals    = g_dbg_signals.load();
-    d.presses    = g_dbg_presses.load();
-    d.locked     = g_locked.load();
-    d.scanning   = g_scanning.load();
+    d.mode        = g_mode.load();
+    d.offset      = g_jump_offset.load();
+    d.on_ground   = g_dbg_ground.load();
+    d.focused     = g_dbg_focused.load();
+    d.space_held  = g_dbg_space.load();
+    d.hook_ok     = g_hook_ok.load();
+    d.driving     = g_dbg_driving.load();
+    d.suppressing = g_dbg_suppress.load();
+    d.signals     = g_dbg_signals.load();
+    d.presses     = g_dbg_presses.load();
+    d.locked      = g_locked.load();
+    d.scanning    = g_scanning.load();
     return d;
 }
 
@@ -491,9 +498,11 @@ void Bhop_Rescan() {
     g_scan_thread = std::thread(scan_thread_main);
 }
 
-bool Bhop_InputMode() { return g_input_mode.load(); }
-void Bhop_SetInputMode(bool enabled) {
-    g_input_mode.store(enabled);
-    // Leaving input mode must not strand the game with a held synthetic key.
-    if (!enabled) { g_suppress.store(false); inject_space(false); }
+int  Bhop_Mode() { return g_mode.load(); }
+
+void Bhop_SetMode(int mode) {
+    g_mode.store(mode);
+    // Leaving a driving mode must not strand the game with a held key.
+    if (mode != BHOP_INJECT) inject_space(false);
+    g_suppress.store(false);
 }
