@@ -1,84 +1,51 @@
+// --- src/esp.h ---
 #pragma once
-#include <vector>
-#include <mutex>
 #include <cstdint>
-#include "memory.h"
-#include "offsets.h"
+#include <mutex>
+#include <vector>
+#include <imgui.h>
 
-// Vector types
-struct Vec3 {
-    float x, y, z;
-    Vec3() : x(0), y(0), z(0) {}
-    Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
-};
+#include "cs2math.h"
+#include "sdk.h"
 
-struct Vec2 {
-    float x, y;
-    Vec2() : x(0), y(0) {}
-    Vec2(float x, float y) : x(x), y(y) {}
-};
-
-struct Matrix4x4 {
-    float m[4][4];
-    Matrix4x4() { for(int i=0; i<4; i++) for(int j=0; j<4; j++) m[i][j] = 0.0f; }
-};
-
-// Player data stored in world thread
+// Written by the memory thread: world-space snapshot of one player.
 struct PlayerData {
-    Vec3 origin;
-    Vec3 head;
-    int health;
-    int team;
-    float distance;
-    bool valid = true;
+    Vec3  origin;                  // feet position
+    float distance = 0.0f;         // metres from local pawn
+    int   health   = 0;
+    int   team     = 0;
+    bool  bones_ok = false;        // bone data read + sanity-checked
+    Vec3  bone_pos[bones::count];  // world space, indexed by bone id
 };
 
-// ESP rendering data per player
+// Produced on the render thread: projected, ready to draw.
 struct PlayerESP {
-    Vec2 head, feet;
-    int health;
-    int team;
-    float distance;
-    float box_h, box_w;
-    std::vector<std::pair<int, Vec2>> bones; // bone index -> screen pos
-    bool draw_skeleton = true;
-    bool draw_head_dots = true;
-    bool draw_corners = true;
-};
-
-// ESP filtering flags
-struct ESPFlags {
-    bool bhop = false;
+    Vec2  head;                    // screen pos of head (real bone 6, or origin+70 fallback)
+    Vec2  feet;                    // screen pos of origin
+    float box_h = 0.0f;
+    float box_w = 0.0f;
+    int   health = 0;
+    int   team   = 0;
+    float distance = 0.0f;
+    bool  bones_ok = false;
+    Vec2  bone_screen[bones::count];
+    bool  bone_ok[bones::count] = {};
 };
 
 class ESP {
-private:
-    std::vector<PlayerData> world_players;
-    std::vector<std::vector<PlayerESP>> player_snapshots;
-    std::mutex world_mutex;
-    std::mutex render_mutex;
-    ESPFlags flags;
-
-    // Core projection
-    static bool WorldToScreen(const Vec3& world, Vec2& screen, const Matrix4x4& vm, int w, int h);
-    
-    // Drawing helpers
-    static void DrawSkeleton(ImDrawList* dl, const PlayerESP& p, int sw, int sh, const ImVec4& color);
-    static void DrawHeadDots(ImDrawList* dl, const PlayerESP& p, int sw, int sh, const ImVec4& alpha);
-    static void DrawCornerBox(ImDrawList* dl, const PlayerESP& p, const ImVec4& color);
-    static float CalcDistanceScaled(float dist);
-
 public:
-    ESP() = default;
+    // Memory thread: reads controllers -> pawns -> origin + all bones (world space).
+    void update_world(const Memory& mem, uintptr_t client_base);
 
-    // Thread functions
-    void Thread_Render();
+    // Render thread: fresh view matrix every frame, projects the snapshot.
+    std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
+                                   int screen_w, int screen_h);
 
-    // Public API
-    void UpdateWorld(const Memory& mem, uintptr_t client_base);
-    std::vector<PlayerESP> GetProjected(const Memory& mem, uintptr_t client_base, int screen_w, int screen_h, float fov);
-    
-    // Feature toggles
-    void SetBhop(bool enable) { flags.bhop = enable; }
-    bool IsBhopEnabled() const { return flags.bhop; }
+    // Extra draw helpers (render thread only).
+    static void draw_head_dot(ImDrawList* dl, const PlayerESP& p, ImU32 col);
+    static void draw_skeleton(ImDrawList* dl, const PlayerESP& p, ImU32 col, float thickness);
+
+private:
+    std::mutex              world_mutex_;
+    std::vector<PlayerData> world_players_;
 };
