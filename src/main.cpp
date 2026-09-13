@@ -270,6 +270,10 @@ void render_menu() {
         ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
             "[ attached  %dx%d  %d Hz  %d players ]",
             g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
+        // Temporary: pins down where enumeration stops if the list is empty.
+        ImGui::TextDisabled("slots %d  read %s",
+                            g_esp.slots_found,
+                            g_esp.enum_bulk ? "bulk" : "per-slot");
     }
 
     ImGui::Separator();
@@ -316,11 +320,12 @@ void render_menu() {
     const bool sig_z    = (bd.signals & 1) != 0;
     const bool sig_flag = (bd.signals & 2) != 0;
     const bool sig_hge  = (bd.signals & 4) != 0;
-    ImGui::Text("ground: %s", bd.on_ground ? "YES" : "no");
+    ImGui::Text("ground: %s    game focused: %s",
+        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
     ImGui::TextDisabled("signals: %s%s%s",
         sig_z ? "z " : "", sig_flag ? "flag " : "", sig_hge ? "hge" : "");
-    if (!sig_flag && !sig_hge)
-        ImGui::TextDisabled("jump around a bit to calibrate");
+    if (!bd.focused && !bd.on_ground)
+        ImGui::TextDisabled("click back into the game");
 
     ImGui::Spacing();
     ImGui::TextDisabled("[ Frame rate ]");
