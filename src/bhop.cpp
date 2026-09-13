@@ -279,9 +279,17 @@ GroundWatch g_gw;
 bool sample_ground(const Memory& mem, uintptr_t pawn) {
     const double now = now_ms();
 
+    // Z comes from m_vOldOrigin, which is VERIFIED (the ESP aligns), so it is
+    // the reference the other two signals are graded against.
+    //
+    // m_fFlags and m_hGroundEntity are NOT verified for this build, which is
+    // exactly why they are graded rather than trusted: each one has to be seen
+    // set while Z is static AND clear while Z is moving before it is allowed
+    // to influence the verdict. A wrong offset therefore degrades the result
+    // instead of breaking it.
     const float    z   = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
-    const uint32_t fl  = mem.read<uint32_t>(pawn + offsets::m_pGameSceneNode);
-    const uint32_t hge = mem.read<uint32_t>(pawn + offsets::m_hController);
+    const uint32_t fl  = mem.read<uint32_t>(pawn + offsets::m_fFlags);
+    const uint32_t hge = mem.read<uint32_t>(pawn + offsets::m_hGroundEntity);
 
     if (!g_gw.have_z) { g_gw.have_z = true; g_gw.z = z; g_gw.z_changed = now; }
     if (std::fabs(z - g_gw.z) >= 0.5f) { g_gw.z = z; g_gw.z_changed = now; }
@@ -298,11 +306,13 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     if (!g_gw.flag_ok && g_gw.flag_g >= 6 && g_gw.flag_a >= 6) g_gw.flag_ok = true;
     if (!g_gw.hge_ok  && g_gw.hge_g  >= 6 && g_gw.hge_a  >= 6) g_gw.hge_ok  = true;
 
-    int sig = 1;
+    int sig = 1;                       // z is always available
     if (g_gw.flag_ok) sig |= 2;
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
 
+    // Grounded if Z is static, or if a signal that has actually proven itself
+    // agrees. Height- and surface-independent either way.
     const bool ground = g_gw.z_ground
                      || (g_gw.flag_ok && (fl & 1u))
                      || (g_gw.hge_ok  && hge != 0xFFFFFFFFu);
