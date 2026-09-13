@@ -27,7 +27,7 @@ struct Config {
     bool  esp_show_team    = true;
     bool  esp_skeleton     = true;
     bool  esp_head_dot     = true;
-    float box_thickness    = 1.5f;
+    float box_thickness    = 0.5f;
     ImVec4 color_enemy     = { 1.00f, 0.10f, 0.10f, 1.00f };
     ImVec4 color_team      = { 0.10f, 1.00f, 0.20f, 1.00f };
     ImVec4 color_skeleton  = { 1.00f, 1.00f, 1.00f, 0.90f };
@@ -230,8 +230,8 @@ void render_menu() {
         // Skeleton chain diagnostic -- if bones stays 0, these two numbers are
         // the whole story.
         if (g_esp.dbg_state)
-            ImGui::Text("[ Skeleton: bone %d | chain 0x%llX/0x%llX ]",
-                g_esp.last_skeleton_count,
+            ImGui::Text("[ Skeleton: bone %d | pts %d | chain 0x%llX/0x%llX ]",
+                g_esp.last_skeleton_count, g_esp.dbg_pts,
                 (unsigned long long)g_esp.dbg_node_off,
                 (unsigned long long)g_esp.dbg_array_off);
         else
