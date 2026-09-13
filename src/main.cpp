@@ -39,6 +39,45 @@ static int g_screen_w   = 1920;
 static int g_screen_h   = 1080;
 static int g_local_team = 0;
 
+// ── frame cap ─────────────────────────────────────────────────────────────
+// Hard-coding 240 Hz was wrong for everyone whose panel isn't 240 Hz. In
+// fullscreen CS2 switches the display mode, so ENUM_CURRENT_SETTINGS reports
+// the refresh rate the user actually picked in CS2's video settings.
+static int  g_detected_hz  = 0;
+static bool g_limit_fps    = true;
+static int  g_fps_override = 0;   // 0 = use the detected refresh rate
+
+static int query_refresh_rate(HWND game) {
+    if (!game) return 0;
+    HMONITOR mon = MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return 0;
+
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0;
+
+    const int hz = static_cast<int>(dm.dmDisplayFrequency);
+    if (hz < 30 || hz > 1000) return 0;   // 0/1 means "hardware default"
+    return hz;
+}
+
+// sleep_for() on Windows goes through Sleep(), which quantises to the default
+// ~15.6 ms timer -- so sleep_for(4ms) actually sleeps ~15.6 ms and the overlay
+// silently ran at ~64 Hz instead of 240. Sleep the bulk, spin the last stretch.
+static void wait_until(std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        const auto left = deadline - now;
+        if (left > std::chrono::milliseconds(2))
+            std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
+        else
+            std::this_thread::yield();
+    }
+}
+
 // Skeleton bone connections (indices from BoneId in esp.h).
 static constexpr int kSkeleton[][2] = {
     { BONE_HEAD,       BONE_NECK       },
@@ -71,10 +110,10 @@ static bool find_cs2_window() {
     return true;
 }
 
-// Reader thread: world positions, bones and bhop. No view matrix here.
+// Reader thread: world positions + bones. No view matrix, no bhop.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
     Bhop_Init();
 
@@ -87,17 +126,14 @@ void memory_thread() {
                     g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
             g_esp.update_world(g_mem, g_mem.client_dll);
-
-            if (g_cfg.bhop_enabled) BhopTick();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(4));
     }
 }
 
 void render_esp(ImDrawList* dl) {
     if (!g_mem.is_valid()) return;
 
-    // Fresh view matrix read this frame; world positions interpolated.
     std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
@@ -116,7 +152,7 @@ void render_esp(ImDrawList* dl) {
             ImGui::ColorConvertFloat4ToU32(g_cfg.color_skeleton);
 
         const float cx  = p.screen_head.x;
-        const float top = p.screen_head.y;
+        const float top = p.screen_top.y;   // head bone + headroom
         const float bot = p.screen_feet.y;
         const float bh  = p.box_h;
         const float bw  = p.box_w;
@@ -126,12 +162,11 @@ void render_esp(ImDrawList* dl) {
 
         if (g_cfg.esp_boxes) {
             dl->AddRect(
-                { cx - bw / 2.0f, bot },
-                { cx + bw / 2.0f, top },
+                { cx - bw / 2.0f, top },
+                { cx + bw / 2.0f, bot },
                 col, 0.0f, 0, g_cfg.box_thickness);
         }
 
-        // ── skeleton ──
         if (g_cfg.esp_skeleton && p.has_bones) {
             for (const auto& link : kSkeleton) {
                 const int a = link[0];
@@ -145,9 +180,7 @@ void render_esp(ImDrawList* dl) {
             ++skel_drawn;
         }
 
-        // ── head dot ──
-        // p.screen_head IS the head bone when the chain resolved, and the
-        // origin+70 fallback when it didn't.
+        // Head dot sits on the actual head BONE, not on the box top.
         if (g_cfg.esp_head_dot) {
             float r = bh * 0.035f;
             if (r < 2.5f) r = 2.5f;
@@ -155,7 +188,6 @@ void render_esp(ImDrawList* dl) {
             dl->AddCircleFilled({ p.screen_head.x, p.screen_head.y }, r, col, 16);
         }
 
-        // ── health bar ──
         if (g_cfg.esp_health) {
             const float bar_h = bh * (p.health / 100.0f);
             const float bar_x = cx - bw / 2.0f - 6.0f;
@@ -178,26 +210,34 @@ void render_esp(ImDrawList* dl) {
         }
     }
 
-    // Not in the loop: this is a once-per-frame diagnostic.
     g_esp.last_skeleton_count = skel_drawn;
 }
 
-static const char* g_detect_msg = "";
-
 void render_menu() {
-    ImGui::SetNextWindowSize({ 560.0f, 520.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 380.0f, 300.0f }, { 1000.0f, 900.0f });
+    ImGui::SetNextWindowSize({ 600.0f, 560.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 420.0f, 320.0f }, { 1100.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
     const float win_w = ImGui::GetContentRegionAvail().x;
 
-    if (!g_mem.is_valid())
+    if (!g_mem.is_valid()) {
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ Waiting for CS2... ]");
-    else
+    } else {
         ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
-            "[ Attached | %dx%d | Team:%d | bones:%d ]",
-            g_screen_w, g_screen_h, g_local_team, g_esp.last_skeleton_count);
+            "[ Attached | %dx%d | Team:%d ]", g_screen_w, g_screen_h, g_local_team);
+
+        // Skeleton chain diagnostic -- if bones stays 0, these two numbers are
+        // the whole story.
+        if (g_esp.dbg_state)
+            ImGui::Text("[ Skeleton: bone %d | chain 0x%llX/0x%llX ]",
+                g_esp.last_skeleton_count,
+                (unsigned long long)g_esp.dbg_node_off,
+                (unsigned long long)g_esp.dbg_array_off);
+        else
+            ImGui::Text("[ Skeleton: bone %d | chain scanning... ]",
+                g_esp.last_skeleton_count);
+    }
 
     ImGui::Separator();
 
@@ -224,11 +264,11 @@ void render_menu() {
     ImGui::SameLine(); ImGui::Text("Enemy");
 
     ImGui::ColorEdit4("##tc", &g_cfg.color_team.x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+        ImGui::ColorEditFlags_NoInputs | ImGui::ColorEditFlags_NoLabel);
     ImGui::SameLine(); ImGui::Text("Team");
 
     ImGui::ColorEdit4("##sc", &g_cfg.color_skeleton.x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+        ImGui::ColorEdit4Flags_NoInputs | ImGuiColorEditFlags_NoLabel);
     ImGui::SameLine(); ImGui::Text("Skeleton");
 
     ImGui::Spacing();
@@ -236,46 +276,35 @@ void render_menu() {
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "thick %.1f px");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##smooth", &g_esp.smoothing_ms, 0.0f, 60.0f, "smooth %.0f ms");
+    ImGui::SliderFloat("##smooth", &g_esp.smoothing_ms, 0.0f, 80.0f,
+                       "smooth %.0f ms (player motion)");
 
     ImGui::NextColumn();
 
-    ImGui::TextDisabled("[ Misc ]");
+    ImGui::TextDisabled("[ Bhop ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
     ImGui::Checkbox("V-Sync (off = less lag)", &g_vsync);
 
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ Bhop Button ]");
-
-    if (g_cfg.bhop_input_mode) {
-        ImGui::Text("mode: input (no offsets)");
-    } else {
-        ImGui::Text("off : 0x%06llX",
-                    (unsigned long long)Bhop_JumpOffset());
-        ImGui::Text("live: %u  %s", Bhop_LiveJumpValue(),
-                    (GetAsyncKeyState(VK_SPACE) & 0x8000) ? "<- SPACE" : "");
-
-        if (ImGui::Button("[Detect Jump]  hold W")) {
-            const int r = Bhop_DetectJump();
-            if (r == 1)      g_detect_msg = "found (held key) - verify with SPACE";
-            else if (r == 0) g_detect_msg = "found (structural) - verify with SPACE";
-            else             g_detect_msg = "NOT FOUND - hold W or SPACE, retry";
-        }
-        if (g_detect_msg[0]) ImGui::TextWrapped("%s", g_detect_msg);
-        ImGui::TextDisabled("press SPACE: live value must hit 65537");
-    }
-
-    if (ImGui::Checkbox("Input mode (no offsets needed)", &g_cfg.bhop_input_mode))
+    if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
         Bhop_SetInputMode(g_cfg.bhop_input_mode);
 
+    const BhopDebug bd = Bhop_GetDebug();
+    ImGui::Text("button: 0x%06llX  %s",
+        (unsigned long long)bd.offset,
+        bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[estimate]"));
+    ImGui::Text("live  : %u", bd.live_value);
+    ImGui::Text("ground: %s   flags=0x%X  ge=0x%X",
+        bd.on_ground ? "YES" : "no", bd.flags, bd.ground_entity);
+    ImGui::TextDisabled("auto-detects while you play");
+    if (ImGui::Button("[Rescan]")) Bhop_Rescan();
+
     ImGui::Spacing();
-    ImGui::TextDisabled("[ Align ]  (only if boxes are still off)");
+    ImGui::TextDisabled("[ Frame Rate ]");
+    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
+    ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##ascale", &g_esp.align_scale, 0.90f, 1.10f, "scale %.3f");
-    ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##ax", &g_esp.align_offset_x, -100.0f, 100.0f, "offX %.0f");
-    ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##ay", &g_esp.align_offset_y, -100.0f, 100.0f, "offY %.0f");
+    ImGui::SliderInt("##cap", &g_fps_override, 0, 600,
+        g_fps_override ? "manual cap %d fps" : "cap auto (refresh)");
 
     ImGui::Columns(1);
     ImGui::Separator();
@@ -299,19 +328,18 @@ void render_menu() {
     ImGui::Spacing();
     ImGui::TextDisabled("INSERT - menu    F9 - exit");
     ImGui::TextDisabled("If ESP still stutters: engine_no_focus_sleep 0");
-    ImGui::TextDisabled("Also try disabling G-Sync / FreeSync.");
 
     ImGui::End();
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // MUST be first: before any window exists in this process. Without it,
-    // GetClientRect on the CS2 window returns DPI-virtualised numbers, and
-    // every ESP coordinate is scaled wrong.
+    // MUST be first: before any window exists in this process.
     Overlay::enable_dpi_awareness();
 
     while (!find_cs2_window())
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    g_detected_hz = query_refresh_rate(g_cs2_hwnd);
 
     Overlay overlay;
     if (!overlay.create(g_screen_w, g_screen_h)) return 1;
@@ -330,7 +358,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
         if (GetAsyncKeyState(VK_END) & 1)    g_running   = false;
 
-        // Keep the overlay glued to the game window and in sync with its size.
+        // Re-read the game's client area every frame, then glue the overlay to
+        // it. This is the auto-resolution detection: no manual alignment needed
+        // and it survives a resolution change or the game being moved.
         if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
             RECT r{};
             if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
@@ -346,19 +376,34 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (g_menu_open) render_menu();
         overlay.end_frame();
 
-        // With vsync off the overlay would spin at thousands of fps. Cap it
-        // at ~240 so it stays fast and low-latency without pegging the GPU.
+        // Re-check the panel's refresh rate occasionally (it changes when CS2
+        // switches display mode on a fullscreen transition).
+        static auto next_hz_check = std::chrono::steady_clock::now();
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (now_tp >= next_hz_check) {
+            const int hz = query_refresh_rate(g_cs2_hwnd);
+            if (hz) g_detected_hz = hz;
+            next_hz_check = now_tp + std::chrono::seconds(2);
+        }
+
         if (!g_vsync) {
-            static auto next = std::chrono::steady_clock::now();
-            next += std::chrono::microseconds(4167); // 240 Hz
-            const auto now = std::chrono::steady_clock::now();
-            if (next > now) std::this_thread::sleep_for(next - now);
-            else            next = now;
+            int cap = 0;
+            if (g_limit_fps)
+                cap = (g_fps_override > 0) ? g_fps_override : g_detected_hz;
+
+            if (cap > 0) {
+                static auto next = std::chrono::steady_clock::now();
+                next += std::chrono::microseconds(1000000 / cap);
+                const auto now = std::chrono::steady_clock::now();
+                if (next < now) next = now;
+                wait_until(next);
+            }
         }
     }
 
     g_running = false;
     mem_t.join();
+    Bhop_Shutdown();
     overlay.cleanup();
     g_mem.detach();
     return 0;
