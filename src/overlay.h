@@ -5,16 +5,17 @@
 
 class Overlay {
 public:
-    HWND        hwnd            = nullptr;
-    ID3D11Device*           device  = nullptr;
-    ID3D11DeviceContext*    context = nullptr;
+    HWND                    hwnd      = nullptr;
+    ID3D11Device*           device    = nullptr;
+    ID3D11DeviceContext*    context   = nullptr;
     IDXGISwapChain*         swapchain = nullptr;
-    ID3D11RenderTargetView* rtv     = nullptr;
+    ID3D11RenderTargetView* rtv       = nullptr;
 
     bool create(int width, int height);
-    void begin_frame();
+    void begin_frame();   // calls update_input_mode() internally
     void end_frame();
     void cleanup();
+    void update_input_mode(); // toggle click-through based on g_menu_open
 
     bool is_running() const { return hwnd != nullptr; }
 
