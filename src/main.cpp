@@ -9,7 +9,7 @@
 #include "offsets.h"
 #include "bhop.h"
 
-Memory      g_mem;
+// g_mem defined in memory.cpp
 static ESP  g_esp;
 static bool g_running   = true;
 bool        g_menu_open = false;
@@ -48,12 +48,15 @@ void memory_thread() {
 
     while (g_running) {
         if (g_mem.is_valid()) {
+            // Read local team from client.dll base
             uintptr_t local_pawn = g_mem.read<uintptr_t>(
-                g_mem.base_address + offsets::dwLocalPlayerPawn);
+                g_mem.client_dll + offsets::dwLocalPlayerPawn);
             if (local_pawn)
-                g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum);
+                g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            g_esp.update(g_mem, g_mem.base_address);
+            // Pass client_dll as the base — all offsets are relative to it
+            g_esp.update(g_mem, g_mem.client_dll);
+
             if (g_cfg.bhop_enabled) BhopTick();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -128,7 +131,6 @@ void render_menu() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, 200.0f);
 
-    // LEFT — ESP
     ImGui::TextDisabled("[ ESP ]");
     ImGui::Checkbox("Boxes",         &g_cfg.esp_boxes);
     ImGui::Checkbox("Health Bar",    &g_cfg.esp_health);
@@ -147,11 +149,9 @@ void render_menu() {
     ImGui::SetNextItemWidth(170.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
 
-    // RIGHT — Misc + Debug
     ImGui::NextColumn();
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
-
     ImGui::Spacing();
     ImGui::TextDisabled("[ Debug ]");
     ImGui::Text("Controllers: %d", g_esp.debug_total_controllers);
