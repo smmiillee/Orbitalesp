@@ -27,19 +27,13 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     debug_positioned        = 0;
     debug_on_screen         = 0;
 
-    // All offsets are into client.dll — use client_base (client_dll), not cs2.exe base
     Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
-    int local_team = mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
-
     constexpr int W = 1920, H = 1080;
 
-    // Traversal matching orbitalweb memory_reader.cpp:
-    // entity_list + 0x10 + 8*chunk -> chunk_ptr
-    // chunk_ptr + 120*i -> entity (direct pawn pointer)
     for (int chunk = 0; chunk < 4; chunk++) {
         uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + 0x10 + 8 * chunk);
         if (!chunk_ptr || chunk_ptr < 0x10000) continue;
@@ -50,14 +44,17 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
             if (entity == local_pawn) continue;
             debug_total_controllers++;
 
-            int health = mem.read<int>(entity + offsets::m_iHealth);
-            if (health <= 0 || health > 100) continue;
-            debug_valid_pawns++;
-
+            // Filter to player pawns: team must be CT(2) or T(3)
             int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
             if (team != 2 && team != 3) continue;
+            debug_valid_pawns++;
+
+            // Health check
+            int health = mem.read<int>(entity + offsets::m_iHealth);
+            if (health <= 0 || health > 100) continue;
             debug_alive++;
 
+            // Position
             Vec3 origin;
             origin.x = mem.read<float>(entity + offsets::m_vOldOrigin);
             origin.y = mem.read<float>(entity + offsets::m_vOldOrigin + 4);
