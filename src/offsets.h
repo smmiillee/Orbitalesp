@@ -30,6 +30,12 @@ namespace offsets {
     constexpr uintptr_t m_hGroundEntity = 0x530; // inferred from field order
     constexpr uintptr_t m_vOldOrigin = 0x13B8;
 
+    // ── C_BaseEntity -> CGameSceneNode (needed for the planted C4) ────────
+    // Schema-confirmed. This is also the entry point of the skeleton chain,
+    // but the skeleton re-derives its own chain at runtime, so the two are
+    // independent -- a wrong value here only affects the bomb.
+    constexpr uintptr_t m_pGameSceneNode = 0x330;
+
     // ── C_BasePlayerPawn ──────────────────────────────────────────────────
     constexpr uintptr_t m_pWeaponServices = 0x11E0;  // candidate, validated
     constexpr uintptr_t m_hActiveWeapon   = 0x60;
