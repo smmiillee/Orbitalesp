@@ -52,7 +52,9 @@ void memory_thread() {
             if (local_pawn)
                 g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            g_esp.update(g_mem, g_mem.client_dll);
+            // Pass actual screen resolution so projection is correct
+            g_esp.update(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+
             if (g_cfg.bhop_enabled) BhopTick();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -109,7 +111,6 @@ void render_esp(ImDrawList* dl) {
 }
 
 void render_menu() {
-    // Resizable — user can drag to fit their resolution
     ImGui::SetNextWindowSize({ 420.0f, 340.0f }, ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints({ 340.0f, 260.0f }, { 800.0f, 600.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
@@ -117,7 +118,6 @@ void render_menu() {
 
     float win_w = ImGui::GetContentRegionAvail().x;
 
-    // Status
     if (!g_mem.is_valid())
         ImGui::TextColored({ 1.0f,0.5f,0.0f,1.0f }, "[ Waiting for CS2... ]");
     else
@@ -130,7 +130,6 @@ void render_menu() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
-    // LEFT — ESP
     ImGui::TextDisabled("[ ESP ]");
     ImGui::Checkbox("Boxes",        &g_cfg.esp_boxes);
     ImGui::Checkbox("Health Bar",   &g_cfg.esp_health);
@@ -150,23 +149,22 @@ void render_menu() {
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
 
-    // RIGHT — Misc + Debug
     ImGui::NextColumn();
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
     ImGui::Spacing();
     ImGui::TextDisabled("[ Debug ]");
     ImGui::Text("Controllers: %d", g_esp.debug_total_controllers);
-    ImGui::Text("Valid pawns: %d off=0x%X str=%d", g_esp.debug_valid_pawns, g_esp.debug_sample_health, g_esp.debug_sample_team);
-    ImGui::Text("Alive:       %d", g_esp.debug_alive);
-    ImGui::Text("Positioned:  %d", g_esp.debug_positioned);
-    ImGui::Text("On screen:   %d", g_esp.debug_on_screen);
-    ImGui::Text("Drawing:     %d", (int)g_esp.players.size());
+    ImGui::Text("Valid: %d off=0x%X str=%d", g_esp.debug_valid_pawns,
+        g_esp.debug_sample_health, g_esp.debug_sample_team);
+    ImGui::Text("Alive:      %d", g_esp.debug_alive);
+    ImGui::Text("Positioned: %d", g_esp.debug_positioned);
+    ImGui::Text("On screen:  %d", g_esp.debug_on_screen);
+    ImGui::Text("Drawing:    %d", (int)g_esp.players.size());
 
     ImGui::Columns(1);
     ImGui::Separator();
 
-    // Buttons — scale to window width
     float btn_w = (win_w - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
     if (ImGui::Button("[Apply]", { btn_w, 0 })) {}
     ImGui::SameLine();
