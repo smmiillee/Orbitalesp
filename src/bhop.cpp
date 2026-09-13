@@ -1,12 +1,13 @@
 // --- src/bhop.cpp ---
+// Bhop via dwForceJump memory write — most reliable external method.
+// Reads m_hGroundEntity to detect landing, writes jump flag on landing frame.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 #include <Windows.h>
-#include <thread>
-#include <chrono>
 
 constexpr uintptr_t m_hGroundEntity = 0x50C;
+constexpr uintptr_t dwForceJump     = 0x173E8E0; // client.dll offset
 
 void BhopTick() {
     static bool wasInAir = false;
@@ -23,11 +24,9 @@ void BhopTick() {
     uint32_t ground = g_mem.read<uint32_t>(local_pawn + m_hGroundEntity);
     bool inAir = (ground == 0xFFFFFFFF);
 
-    if (wasInAir && !inAir) {
-        // Landed — fire scroll down (requires mwheeldown bound to +jump in CS2)
-        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(-WHEEL_DELTA), 0);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(-WHEEL_DELTA), 0);
+    if (!inAir) {
+        // On ground while holding space — write jump
+        g_mem.write<int>(g_mem.client_dll + dwForceJump, 65537);
     }
 
     wasInAir = inAir;
