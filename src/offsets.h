@@ -27,6 +27,13 @@ namespace offsets {
     constexpr uintptr_t m_iTeamNum       = 0x3E7;   // uint8
     constexpr uintptr_t m_vOldOrigin     = 0x13B8;  // Vec3
     constexpr uintptr_t m_pGameSceneNode = 0x338;   // VERIFIED (0x330 was wrong)
+
+    // Ground signals for bhop. Neither is verified for this build, so both are
+    // GRADED against Z before being trusted -- see sample_ground() in bhop.cpp.
+    // A wrong value here cannot make bhop press while airborne; it just drops
+    // to the Z-only verdict.
+    constexpr uintptr_t m_fFlags        = 0x3F4;
+    constexpr uintptr_t m_hGroundEntity = 0x530;
     constexpr uintptr_t m_angEyeAngles   = 0x3350;
 
     // ── C_BasePlayerPawn (VERIFIED) ───────────────────────────────────────
