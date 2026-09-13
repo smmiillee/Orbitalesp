@@ -2,7 +2,6 @@
 #include <Windows.h>
 #include <thread>
 #include <chrono>
-#include <mutex>
 #include <imgui.h>
 #include "memory.h"
 #include "esp.h"
@@ -42,6 +41,7 @@ static bool find_cs2_window() {
     return true;
 }
 
+// Memory thread: only reads world positions and bhop
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -53,23 +53,23 @@ void memory_thread() {
             if (local_pawn)
                 g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            g_esp.update(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+            // Only world positions — no view matrix here
+            g_esp.update_world(g_mem, g_mem.client_dll);
 
             if (g_cfg.bhop_enabled) BhopTick();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 }
 
 void render_esp(ImDrawList* dl) {
-    // Lock while copying — prevents flicker from partial writes
-    std::vector<PlayerESP> snapshot;
-    {
-        std::lock_guard<std::mutex> lock(g_esp.players_mutex);
-        snapshot = g_esp.players;
-    }
+    if (!g_mem.is_valid()) return;
 
-    for (const auto& p : snapshot) {
+    // Project with fresh view matrix read THIS frame — no mouse lag
+    std::vector<PlayerESP> players = g_esp.project(
+        g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+
+    for (const auto& p : players) {
         bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
         bool is_enemy    = !is_teammate;
 
@@ -82,10 +82,9 @@ void render_esp(ImDrawList* dl) {
         float cx  = p.screen_head.x;
         float top = p.screen_head.y;
         float bot = p.screen_feet.y;
-        float bh  = bot - top;
-        float bw  = bh * 0.45f;
+        float bh  = p.box_h;
+        float bw  = p.box_w;
 
-        if (bh < 5.0f) continue;
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
 
@@ -137,7 +136,6 @@ void render_menu() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
-    // LEFT — ESP
     ImGui::TextDisabled("[ ESP ]");
     ImGui::Checkbox("Boxes",        &g_cfg.esp_boxes);
     ImGui::Checkbox("Health Bar",   &g_cfg.esp_health);
@@ -157,7 +155,6 @@ void render_menu() {
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
 
-    // RIGHT — Misc
     ImGui::NextColumn();
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
