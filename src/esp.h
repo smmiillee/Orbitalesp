@@ -52,7 +52,8 @@ struct PlayerData {
 
 // Screen-space result, recomputed fresh every render frame.
 struct PlayerESP {
-    Vec2  screen_head{};
+    Vec2  screen_head{};   // the head BONE (head dot goes here)
+    Vec2  screen_top{};    // box top = head bone + a little headroom
     Vec2  screen_feet{};
     std::array<Vec2, BONE_COUNT> bones{};
     std::array<bool, BONE_COUNT> bone_ok{};
@@ -66,19 +67,17 @@ struct PlayerESP {
 
 class ESP {
 public:
-    // ── tunables (set from the menu) ──────────────────────────────────────
-    // Smoothing window in ms. CS2 writes entity positions at ~64 Hz, so a raw
-    // read rendered at 240 Hz is a visible staircase; this interpolates it.
-    // 0 disables it (boxes then step at 64 Hz).
+    // Iterpolation window in ms. Only affects PLAYER motion -- the camera is
+    // always exact, because the view matrix is read fresh every frame. Set to
+    // 0 to disable. This only does anything if the overlay is actually running
+    // faster than the game's 64 Hz entity updates.
     float smoothing_ms = 20.0f;
 
-    // Manual alignment, applied last. Only needed if something is still off.
+    // Manual alignment. Left in as a last resort, but the resolution is now
+    // auto-detected every frame, so these should stay at the defaults.
     float align_scale    = 1.0f;
     float align_offset_x = 0.0f;
     float align_offset_y = 0.0f;
-
-    // Diagnostic: how many players had a skeleton drawn last frame.
-    int last_skeleton_count = 0;
 
     // World-space data updated by the reader thread.
     std::vector<PlayerData> world_players;
@@ -91,6 +90,12 @@ public:
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
+
+    // ── diagnostics (read by the menu) ────────────────────────────────────
+    int       last_skeleton_count = 0;  // players with a skeleton drawn
+    uintptr_t dbg_node_off  = 0;        // detected C_BaseEntity -> scene node
+    uintptr_t dbg_array_off = 0;        // detected scene node -> bone array
+    int       dbg_state     = 0;        // 0 = scanning, 1 = locked
 
 private:
     void align(Vec2& s, int screen_w, int screen_h) const;
