@@ -1,49 +1,41 @@
 // --- src/bhop.cpp ---
 // Bhop via CS2 button system write - 2026 Optimized
-// JUMP BUTTON: 0xB3E00 (Do NOT change - verified working for current build)
+// JUMP BUTTON: 0xB3E00 (DO NOT change - verified working for current build)
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 #include <Windows.h>
 
-constexpr uintptr_t dwJumpButton = 0xB3E00; // client.dll buttons::jump
-constexpr uintptr_t m_hGroundEntity = 0x50C;
+constexpr uintptr_t dwJumpButton    = 0xB3E00; // client.dll buttons::jump
+constexpr uintptr_t m_hGroundEntity = 0x50C;   // C_BaseEntity::m_hGroundEntity
 
 void Bhop_Init() {
-    BhopTick(); // Initialize thread
+    // Nothing to set up; BhopTick() runs from the memory thread at 4 ms.
 }
 
 void BhopTick() {
-    static bool wasInAir = false;
-
+    // Space released -> make sure jump is clear and do nothing else.
     if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-        // Space released — clear button when space released
-        if (g_mem.is_valid()) {
+        if (g_mem.is_valid())
             g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
-        }
-        wasInAir = false;
         return;
     }
 
-    uintptr_t local_pawn = g_mem.read<uintptr_t>(
-        g_mem.client_dll + offsets::dwLocalPlayerPawn);
+    if (!g_mem.is_valid()) return;
+
+    const uintptr_t local_pawn =
+        g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
     if (!local_pawn) return;
 
-    uint32_t ground = g_mem.read<uint32_t>(
-        local_pawn + m_hGroundEntity);
-    bool inAir = (ground == 0xFFFFFFFF);
+    // 0xFFFFFFFF = no ground entity -> in the air.
+    const bool in_air =
+        g_mem.read<uint32_t>(local_pawn + m_hGroundEntity) == 0xFFFFFFFFu;
 
-    if (!inAir) {
-        // On ground — write jump
-        if (g_mem.is_valid()) {
-            g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 65537ULL);
-        }
+    if (in_air) {
+        // Airborne -> release so jump isn't held through the landing tick.
+        g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
     } else {
-        // In air — clear so we don't hold jump
-        if (g_mem.is_valid()) {
-            g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
-        }
+        // On the ground -> press jump: re-jump on every landing.
+        g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 65537ULL);
     }
-
-    wasInAir = inAir;
 }
