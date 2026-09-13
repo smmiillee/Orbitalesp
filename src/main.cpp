@@ -78,20 +78,28 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
-// Skeleton bone connections (indices from BoneId in esp.h).
+// Skeleton bone connections, using the CURRENT (post animgraph_2_beta) map
+// from esp.h. Neck is the hub for both arms; spine runs pelvis -> chest -> neck.
 static constexpr int kSkeleton[][2] = {
-    { BONE_HEAD,       BONE_NECK       },
-    { BONE_NECK,       BONE_SPINE      },
-    { BONE_SPINE,      BONE_PELVIS     },
-    { BONE_SPINE,      BONE_L_SHOULDER },
-    { BONE_L_SHOULDER, BONE_L_ARM      },
-    { BONE_L_ARM,      BONE_L_HAND     },
-    { BONE_SPINE,      BONE_R_SHOULDER },
-    { BONE_R_SHOULDER, BONE_R_ARM      },
-    { BONE_R_ARM,      BONE_R_HAND     },
+    // spine
+    { BONE_PELVIS,     BONE_SPINE_1    },
+    { BONE_SPINE_1,    BONE_SPINE_2    },
+    { BONE_SPINE_2,    BONE_CHEST      },
+    { BONE_CHEST,      BONE_NECK       },
+    { BONE_NECK,       BONE_HEAD       },
+    // left arm
+    { BONE_NECK,       BONE_L_SHOULDER },
+    { BONE_L_SHOULDER, BONE_L_ELBOW    },
+    { BONE_L_ELBOW,    BONE_L_HAND     },
+    // right arm
+    { BONE_NECK,       BONE_R_SHOULDER },
+    { BONE_R_SHOULDER, BONE_R_ELBOW    },
+    { BONE_R_ELBOW,    BONE_R_HAND     },
+    // left leg
     { BONE_PELVIS,     BONE_L_HIP      },
     { BONE_L_HIP,      BONE_L_KNEE     },
     { BONE_L_KNEE,     BONE_L_FOOT     },
+    // right leg
     { BONE_PELVIS,     BONE_R_HIP      },
     { BONE_R_HIP,      BONE_R_KNEE     },
     { BONE_R_KNEE,     BONE_R_FOOT     },
