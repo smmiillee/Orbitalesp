@@ -47,8 +47,11 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop mode: BHOP_OFF / BHOP_INJECT (no CS2 writes) / BHOP_MEMORY (writes)
-    int  bhop_mode = BHOP_MEMORY;
+    // Bhop -- keystroke injection only, so nothing here writes to cs2.exe.
+    bool  bhop_enabled      = true;
+    bool  bhop_predict      = false;
+    bool  bhop_separate_key = false;
+    float bhop_lead_ms      = 16.0f;
 } g_cfg;
 
 static int  g_screen_w = 1920;
