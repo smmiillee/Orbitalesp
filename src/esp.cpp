@@ -1,5 +1,4 @@
 // --- src/esp.cpp ---
-// Entity traversal copied from working orbitalweb/src/memory_reader.cpp
 #include "esp.h"
 #include <cmath>
 
@@ -28,6 +27,7 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     debug_positioned        = 0;
     debug_on_screen         = 0;
 
+    // All offsets are into client.dll — use client_base (client_dll), not cs2.exe base
     Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
@@ -37,9 +37,9 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
 
     constexpr int W = 1920, H = 1080;
 
-    // Traversal from orbitalweb: chunkArrOff=0x10, stride=120 (0x78)
-    // Loop: entityList + 0x10 + 8*chunk -> chunkPtr
-    //       chunkPtr + 120*i -> entity (pawn directly)
+    // Traversal matching orbitalweb memory_reader.cpp:
+    // entity_list + 0x10 + 8*chunk -> chunk_ptr
+    // chunk_ptr + 120*i -> entity (direct pawn pointer)
     for (int chunk = 0; chunk < 4; chunk++) {
         uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + 0x10 + 8 * chunk);
         if (!chunk_ptr || chunk_ptr < 0x10000) continue;
