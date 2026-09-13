@@ -1,13 +1,20 @@
 // --- src/bhop.cpp ---
-// Bhop via dwForceJump memory write — most reliable external method.
-// Reads m_hGroundEntity to detect landing, writes jump flag on landing frame.
+// Bhop via CS2 button system write.
+// The jump button is a CCSGOInputButton struct in client.dll.
+// Writing buttonState = 3 (held) triggers the jump on landing.
+// Offset from your September 11 build — re-dump if CS2 updates.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 #include <Windows.h>
 
+// CCSGOInputButton layout:
+//   +0x00: uint64 buttonFlags  (current held state)
+//   +0x08: uint64 buttonState  (write 3 = pressed this tick)
+//   +0x10: uint64 buttonState2
+// Writing 65537 (0x10001) to buttonFlags triggers jump in CS2's input system
+constexpr uintptr_t dwJumpButton    = 0x1813610; // client.dll buttons::jump (Sept 2026 build)
 constexpr uintptr_t m_hGroundEntity = 0x50C;
-constexpr uintptr_t dwForceJump     = 0x173E8E0; // client.dll offset
 
 void BhopTick() {
     static bool wasInAir = false;
@@ -25,8 +32,11 @@ void BhopTick() {
     bool inAir = (ground == 0xFFFFFFFF);
 
     if (!inAir) {
-        // On ground while holding space — write jump
-        g_mem.write<int>(g_mem.client_dll + dwForceJump, 65537);
+        // On ground holding space — force jump button state
+        g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 65537ULL);
+    } else {
+        // In air — clear it so we don't double-jump
+        g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
     }
 
     wasInAir = inAir;
