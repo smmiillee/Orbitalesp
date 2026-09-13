@@ -1,22 +1,4 @@
 // --- src/overlay.cpp ---
-//
-// DWM per-pixel alpha overlay — topmost layered popup.
-//
-// Why not WS_CHILD parented to CS2:
-//   CreateWindowExW with a cross-process parent HWND silently returns NULL
-//   on Windows Vista+. The DX11 init then crashes on OutputWindow=nullptr.
-//
-// Correct approach:
-//   1. WS_POPUP | WS_EX_TOPMOST | WS_EX_LAYERED — our own top-level window.
-//   2. SetLayeredWindowAttributes LWA_ALPHA 255 — Win32 treats the window as
-//      fully opaque. Actual transparency comes from DX11 alpha + DWM.
-//   3. DwmExtendFrameIntoClientArea MARGINS{-1} — extends the DWM glass frame
-//      over the entire client area. This activates per-pixel alpha compositing
-//      so DX11 clear color alpha=0.0 is truly transparent, not black.
-//   4. Visibility tied to CS2 foreground state: we call ShowWindow(SW_HIDE)
-//      the moment CS2 is not the foreground window, SW_SHOW when it is.
-//      Checked once per frame in begin_frame — zero overhead.
-//
 #include "overlay.h"
 #include <dwmapi.h>
 #include <imgui.h>
@@ -24,12 +6,14 @@
 #include <imgui_impl_dx11.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
-extern bool g_menu_open;  // defined in main.cpp
-extern HWND g_cs2_hwnd;   // defined in main.cpp — used to check foreground
+extern bool g_menu_open;
+extern HWND g_cs2_hwnd;
 
 LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    // Eat WM_SETCURSOR so Windows never changes it to the loading arrow
+    if (msg == WM_SETCURSOR) { SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -38,11 +22,13 @@ bool Overlay::create(int width, int height) {
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW); // arrow, never hourglass
     wc.lpszClassName = L"OrbitalESP_Overlay";
     if (!RegisterClassExW(&wc)) return false;
 
     hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+        | WS_EX_TOOLWINDOW,  // <-- hides from taskbar and alt-tab list
         wc.lpszClassName, L"OrbitalESP",
         WS_POPUP,
         0, 0, width, height,
@@ -50,12 +36,8 @@ bool Overlay::create(int width, int height) {
     );
     if (!hwnd) return false;
 
-    // LWA_ALPHA 255: fully opaque at Win32 level.
-    // Per-pixel transparency comes from DX11 clear alpha + DWM composition below.
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
-    // MARGINS{-1}: extend DWM glass over the entire client area.
-    // This is the call that makes alpha=0 pixels transparent instead of black.
     MARGINS m{ -1, -1, -1, -1 };
     DwmExtendFrameIntoClientArea(hwnd, &m);
 
@@ -69,11 +51,65 @@ bool Overlay::create(int width, int height) {
     ImGui::CreateContext();
 
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange; // we manage cursor
 
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().Alpha          = 0.95f;
-    ImGui::GetStyle().WindowRounding = 4.0f;
+    // ── BramptonHook-style theme ──────────────────────────────────────────────
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding    = 0.0f;
+    s.ChildRounding     = 0.0f;
+    s.FrameRounding     = 0.0f;
+    s.GrabRounding      = 0.0f;
+    s.PopupRounding     = 0.0f;
+    s.ScrollbarRounding = 0.0f;
+    s.TabRounding       = 0.0f;
+    s.WindowBorderSize  = 1.0f;
+    s.FrameBorderSize   = 1.0f;
+    s.WindowPadding     = { 8.0f, 6.0f };
+    s.FramePadding      = { 4.0f, 3.0f };
+    s.ItemSpacing       = { 6.0f, 4.0f };
+    s.ItemInnerSpacing  = { 4.0f, 4.0f };
+    s.IndentSpacing     = 14.0f;
+    s.ScrollbarSize     = 12.0f;
+    s.GrabMinSize       = 8.0f;
+
+    // Classic Win95/early-2000s cheat panel palette
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]           = { 0.78f, 0.78f, 0.78f, 0.97f }; // light grey bg
+    c[ImGuiCol_ChildBg]            = { 0.82f, 0.82f, 0.82f, 1.00f };
+    c[ImGuiCol_PopupBg]            = { 0.80f, 0.80f, 0.80f, 1.00f };
+    c[ImGuiCol_Border]             = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_BorderShadow]       = { 0.00f, 0.00f, 0.00f, 0.00f };
+    c[ImGuiCol_FrameBg]            = { 1.00f, 1.00f, 1.00f, 1.00f }; // white input boxes
+    c[ImGuiCol_FrameBgHovered]     = { 0.90f, 0.90f, 0.90f, 1.00f };
+    c[ImGuiCol_FrameBgActive]      = { 0.85f, 0.85f, 0.85f, 1.00f };
+    c[ImGuiCol_TitleBg]            = { 0.00f, 0.00f, 0.50f, 1.00f }; // dark blue title
+    c[ImGuiCol_TitleBgActive]      = { 0.00f, 0.00f, 0.70f, 1.00f };
+    c[ImGuiCol_TitleBgCollapsed]   = { 0.00f, 0.00f, 0.40f, 1.00f };
+    c[ImGuiCol_MenuBarBg]          = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_ScrollbarBg]        = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_ScrollbarGrab]      = { 0.50f, 0.50f, 0.50f, 1.00f };
+    c[ImGuiCol_ScrollbarGrabHov]   = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_ScrollbarGrabAct]   = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_CheckMark]          = { 0.00f, 0.00f, 0.00f, 1.00f }; // black checkmark
+    c[ImGuiCol_SliderGrab]         = { 0.55f, 0.55f, 0.55f, 1.00f };
+    c[ImGuiCol_SliderGrabActive]   = { 0.35f, 0.35f, 0.35f, 1.00f };
+    c[ImGuiCol_Button]             = { 0.88f, 0.80f, 0.55f, 1.00f }; // tan/gold buttons
+    c[ImGuiCol_ButtonHovered]      = { 0.95f, 0.88f, 0.65f, 1.00f };
+    c[ImGuiCol_ButtonActive]       = { 0.75f, 0.68f, 0.45f, 1.00f };
+    c[ImGuiCol_Header]             = { 0.70f, 0.70f, 0.70f, 1.00f };
+    c[ImGuiCol_HeaderHovered]      = { 0.65f, 0.65f, 0.65f, 1.00f };
+    c[ImGuiCol_HeaderActive]       = { 0.60f, 0.60f, 0.60f, 1.00f };
+    c[ImGuiCol_Separator]          = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_SeparatorHovered]   = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_SeparatorActive]    = { 0.20f, 0.20f, 0.20f, 1.00f };
+    c[ImGuiCol_ResizeGrip]         = { 0.60f, 0.60f, 0.60f, 1.00f };
+    c[ImGuiCol_ResizeGripHovered]  = { 0.50f, 0.50f, 0.50f, 1.00f };
+    c[ImGuiCol_ResizeGripActive]   = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_Tab]                = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_TabHovered]         = { 0.85f, 0.85f, 0.85f, 1.00f };
+    c[ImGuiCol_TabActive]          = { 0.90f, 0.90f, 0.90f, 1.00f };
+    c[ImGuiCol_Text]               = { 0.00f, 0.00f, 0.00f, 1.00f }; // black text
+    c[ImGuiCol_TextDisabled]       = { 0.45f, 0.45f, 0.45f, 1.00f };
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(device, context);
@@ -82,27 +118,21 @@ bool Overlay::create(int width, int height) {
 }
 
 void Overlay::update_visibility_and_input() {
-    // Hide overlay when user alt-tabs away from CS2.
-    // g_cs2_hwnd is CS2's SDL_app window — checked against GetForegroundWindow.
     HWND fg = GetForegroundWindow();
     bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
 
     if (!cs2_focused) {
-        // Not in CS2 — hide entirely, no flicker on other apps
-        if (IsWindowVisible(hwnd))
-            ShowWindow(hwnd, SW_HIDE);
+        if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
         return;
     }
+    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
 
-    if (!IsWindowVisible(hwnd))
-        ShowWindow(hwnd, SW_SHOW);
-
-    // Toggle click-through based on menu state
     LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if (g_menu_open) {
         ex &= ~WS_EX_TRANSPARENT;
         ex &= ~WS_EX_NOACTIVATE;
         SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         SetForegroundWindow(hwnd);
     } else {
         ex |= WS_EX_TRANSPARENT;
@@ -116,7 +146,7 @@ bool Overlay::init_dx11(int width, int height) {
     sd.BufferCount                        = 2;
     sd.BufferDesc.Width                   = (UINT)width;
     sd.BufferDesc.Height                  = (UINT)height;
-    sd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM; // BGRA — required for DWM alpha
+    sd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator   = 0;
     sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.Flags                              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
@@ -158,8 +188,6 @@ void Overlay::begin_frame() {
 
 void Overlay::end_frame() {
     ImGui::Render();
-
-    // Clear to fully transparent — DWM composites only the ImGui pixels.
     constexpr float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     context->OMSetRenderTargets(1, &rtv, nullptr);
     context->ClearRenderTargetView(rtv, clear);
