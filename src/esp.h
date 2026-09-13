@@ -14,8 +14,8 @@ struct Vec2 { float x, y; };
 struct Matrix4x4 { float m[4][4]; };
 
 // ── CS2 skeleton bone ids ────────────────────────────────────────────────
-// Indices match the current a2x dumps. The two hand bones are the only ones
-// that drift between dumps -- if the hands look off by one, try 10 and 15.
+// The two hand bones are the only ones that drift between dumps -- if the
+// hands look off by one, try 10 and 15.
 enum BoneId : int {
     BONE_PELVIS     = 0,
     BONE_SPINE_1    = 2,
@@ -66,14 +66,23 @@ struct PlayerESP {
 
 class ESP {
 public:
+    // ── tunables (set from the menu) ──────────────────────────────────────
+    // Smoothing window in ms. CS2 writes entity positions at ~64 Hz, so a raw
+    // read rendered at 240 Hz is a visible staircase; this interpolates it.
+    // 0 disables it (boxes then step at 64 Hz).
+    float smoothing_ms = 20.0f;
+
+    // Manual alignment, applied last. Only needed if something is still off.
+    float align_scale    = 1.0f;
+    float align_offset_x = 0.0f;
+    float align_offset_y = 0.0f;
+
     // World-space data updated by the reader thread.
     std::vector<PlayerData> world_players;
     std::mutex world_mutex;
 
     void update_world(const Memory& mem, uintptr_t client_base);
 
-    // Fresh view matrix read for THIS frame, plus interpolation of the
-    // 64 Hz game positions up to the current render rate.
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
                                    int screen_w, int screen_h);
 
@@ -81,8 +90,9 @@ public:
                                 const Matrix4x4& vm, int screen_w, int screen_h);
 
 private:
-    // Render-thread-only interpolation state. This is what removes the
-    // "boxes jitter while moving the mouse" stepping.
+    void align(Vec2& s, int screen_w, int screen_h) const;
+
+    // Render-thread-only interpolation state.
     struct Smooth {
         Vec3  origin{};
         Vec3  head{};
