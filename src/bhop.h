@@ -5,34 +5,31 @@
 // Bhop writes the CS2 jump button:
 //   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
 //
-// The ADDRESS is found at runtime, so it never needs editing:
+// THE ADDRESS is found at runtime and validated against your real key presses,
+// because the button block moves independently of the client.dll globals and
+// therefore cannot be derived from a dump of anything else.
 //
-//  * method 1 (no keys needed) - sweep for the 13-slot button block: 13 dwords
-//    on the 0x90 stride that are ALL exactly 0 or 256. That combination is
-//    essentially unique, and it works while you are standing still.
-//  * method 2 - while SPACE is held, find the dword holding 0x10001 and check
-//    the same block structure. Unambiguous, and it can't lock onto `forward`.
-//
-// GROUND DETECTION is graded against the local player's Z position
-// (m_vOldOrigin, verified working), because the client-side predicted pawn does
-// NOT set FL_ONGROUND in bit 0 -- it reads 0x10000 while standing still, which
-// is why a flag-only test could never fire.
-//
-//   z     - Z unchanged for ~22 ms -> standing. Works on any surface at any
-//           height: a landing off a roof reads exactly like a landing on flat.
-//   flag  - used only after it has been seen set while Z is static AND clear
-//           while Z is moving.
+// GROUND STATE comes from the signals that PROVE THEMSELVES against the local
+// player's Z position (m_vOldOrigin, a verified offset):
+//   z     - Z unchanged for ~22 ms -> standing. Always available, and
+//           height-/surface-independent: a landing off a roof reads exactly
+//           like a landing on the flat.
+//   flag  - only used after it is seen set while Z is static AND clear while
+//           Z moves.
 //   hge   - same rule.
 //
-// A signal that never proves itself is ignored, so a wrong offset degrades the
-// result instead of breaking it.
+// INPUT MODE needs no offsets at all: it synthesises the spacebar, holding it
+// down on the ground and releasing it in the air -- which is precisely what a
+// bhop macro does. If memory mode ever stops working after an update, this
+// still works.
 struct BhopDebug {
-    uintptr_t offset      = 0;
-    bool      on_ground   = false;
-    bool      focused     = false;
-    int       signals     = 0;      // bit0 z, bit1 flag, bit2 hge
-    bool      locked      = false;
-    bool      scanning    = false;
+    uintptr_t offset    = 0;
+    bool  on_ground     = false;
+    bool  focused       = false;
+    int   signals       = 0;   // bit0 z, bit1 flag, bit2 hge
+    bool  locked        = false;
+    bool  scanning      = false;
+    int   candidates    = 0;   // blocks that passed validation this sweep
 };
 
 void Bhop_Init();
