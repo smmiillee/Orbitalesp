@@ -49,14 +49,15 @@ bool sane_pos(const Vec3& v) {
            !(v.x == 0.0f && v.y == 0.0f && v.z == 0.0f);
 }
 
-// ── the actual detector ───────────────────────────────────────────────────
+// ── the detector ──────────────────────────────────────────────────────────
 // Deliberately INDEX-AGNOSTIC. It does not care which bone is the head or
 // whether the ordering is what we expect -- it only asks "is this a dense
 // cloud of sane points sitting inside one player's bounding box?".
 //
-// The previous version validated with pelvis/neck/head indices, so if any of
-// those assumptions was wrong for this build it rejected the CORRECT chain and
-// reported nothing at all. This cannot do that.
+// The index map itself is NOT checked here, and cannot be: a correct array
+// with stale bone numbers passes this test perfectly, which is exactly how a
+// garbled skeleton got drawn while the chain read "0x330/0x240". The numbering
+// lives in esp.h instead.
 int skeleton_point_count(const Memory& mem, uintptr_t arr, const Vec3& origin) {
     BoneEntry b[BONE_COUNT];
     if (!mem.read_bytes(arr, b, sizeof(b))) return 0;
@@ -92,7 +93,7 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
     int best_score = 0;
     int best_pts   = 0;
     const int need = (test.size() >= 2) ? 2 : 1;
-    if (pt_pts_placeholder_unused(test)) return best;
+    if (test.empty()) return best;
 
     uint8_t node_buf[kNodeScanBytes];
 
@@ -112,7 +113,7 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
             if (!valid_ptr(arr)) continue;
 
             const int pts = skeleton_point_count(mem, arr, test[0].origin);
-            if (pts < 16) continue;   // most of the skeleton has to be there
+            if (pts < 20) continue;   // most of the skeleton has to be there
 
             // Confirm on the other players before believing it.
             int score = 1;
@@ -124,7 +125,7 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
                 const uintptr_t a = mem.read<uintptr_t>(n + array_off);
                 if (!valid_ptr(a)) break;
 
-                if (skeleton_point_count(mem, a, test[t].origin) < 16) break;
+                if (skeleton_point_count(mem, a, test[t].origin) < 20) break;
                 ++score;
             }
 
@@ -142,7 +143,7 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
     return best;
 }
 
-// One bulk read for all 28 bones: one syscall per player, and a snapshot that
+// One bulk read for all bones: one syscall per player, and a snapshot that
 // can't be torn mid-update.
 bool read_bones(const Memory& mem, uintptr_t pawn, const Vec3& origin,
                 const BoneChain& chain,
@@ -359,7 +360,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         pd.distance = r.distance;
 
         if (s_chain.valid)
-                        pd.has_bones = read_bones(mem, r.pawn, r.origin, s_chain,
+            pd.has_bones = read_bones(mem, r.pawn, r.origin, s_chain,
                                       pd.bones, pd.bone_ok);
         if (pd.has_bones) ++bone_hits;
 
