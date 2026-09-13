@@ -1,7 +1,4 @@
 // --- src/bhop.cpp ---
-// Bhop via SendInput keyboard jump — no bind required.
-// Detects landing frame via m_hGroundEntity, sends a SPACE keydown+keyup
-// through the Win32 input stack on the landing tick.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -11,26 +8,9 @@
 
 constexpr uintptr_t m_hGroundEntity = 0x50C;
 
-static void send_jump() {
-    INPUT inputs[2]{};
-
-    // SPACE down
-    inputs[0].type       = INPUT_KEYBOARD;
-    inputs[0].ki.wVk     = VK_SPACE;
-    inputs[0].ki.dwFlags = 0;
-
-    // SPACE up
-    inputs[1].type       = INPUT_KEYBOARD;
-    inputs[1].ki.wVk     = VK_SPACE;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    SendInput(2, inputs, sizeof(INPUT));
-}
-
 void BhopTick() {
     static bool wasInAir = false;
 
-    // Only run when player is holding space
     if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
         wasInAir = false;
         return;
@@ -44,8 +24,10 @@ void BhopTick() {
     bool inAir = (ground == 0xFFFFFFFF);
 
     if (wasInAir && !inAir) {
-        // Just landed — send jump immediately
-        send_jump();
+        // Landed — fire scroll down (requires mwheeldown bound to +jump in CS2)
+        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(-WHEEL_DELTA), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (DWORD)(-WHEEL_DELTA), 0);
     }
 
     wasInAir = inAir;
