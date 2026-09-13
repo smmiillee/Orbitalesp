@@ -6,6 +6,7 @@
 #include <imgui.h>
 
 #include "cs2math.h"
+#include "memory.h"
 #include "sdk.h"
 
 // Written by the memory thread: world-space snapshot of one player.
