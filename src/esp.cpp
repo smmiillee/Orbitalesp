@@ -441,10 +441,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         s.t = now;
         s.origin = origin;
 
-        BoneChain bc{ c_.bone_node, c_.bone_arr, c_.bones_ok };
-        while (false) {}
-        s.has_bones = read_bones(mem, p, origin, BoneChain{ c_.bone_node,
-                                    c_.bone_arr, c_.bones_ok },
+                s.has_bones = read_bones(mem, p, origin,
+                                 BoneChain{ c_.bone_node, c_.bone_arr, c_.bones_ok },
                                  s.bones, s.bone_ok);
         if (s.has_bones) ++bone_hits;
         s.head = (s.has_bones && s.bone_ok[BONE_HEAD])
