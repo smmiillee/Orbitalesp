@@ -35,16 +35,16 @@ struct Config {
     float box_thickness = 0.5f;
 
     // Colours -- one per visual.
-    bool   team_colors  = false;
-    ImVec4 color_enemy  = { 1.00f, 0.15f, 0.15f, 1.00f };
-    ImVec4 color_team   = { 0.20f, 0.90f, 0.35f, 1.00f };
-    ImVec4 color_box    = { 1.00f, 0.15f, 0.15f, 1.00f };
-    ImVec4 color_skel   = { 0.95f, 0.95f, 0.95f, 0.90f };
-    ImVec4 color_head   = { 1.00f, 1.00f, 1.00f, 1.00f };
-    ImVec4 color_name   = { 1.00f, 1.00f, 1.00f, 1.00f };
-    ImVec4 color_weapon = { 1.00f, 0.85f, 0.30f, 1.00f };
-    ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
-    ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
+    bool   team_colors   = false;
+    ImVec4 color_enemy   = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_team    = { 0.20f, 0.90f, 0.35f, 1.00f };
+    ImVec4 color_box     = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_skel    = { 0.95f, 0.95f, 0.95f, 0.90f };
+    ImVec4 color_head    = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_name    = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_weapon  = { 1.00f, 0.85f, 0.30f, 1.00f };
+    ImVec4 color_dist    = { 0.85f, 0.85f, 0.85f, 0.90f };
+    ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
     bool bhop_enabled    = true;
@@ -153,6 +153,8 @@ void render_esp(ImDrawList* dl) {
     const std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
+    const float lh = ImGui::GetTextLineHeight();
+
     for (const auto& p : players) {
         const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
         const bool is_enemy    = !is_teammate;
@@ -173,6 +175,14 @@ void render_esp(ImDrawList* dl) {
 
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
+
+        // Text spacing scales with the box and is CLAMPED, so labels stay just
+        // outside the box at every distance. A fixed pixel offset put the name
+        // a whole body-height above distant players, because at range the box
+        // is only a few pixels tall while the offset stayed 30 px.
+        float gap = bh * 0.06f;
+        if (gap < 2.0f) gap = 2.0f;
+        if (gap > 8.0f) gap = 8.0f;
 
         if (g_cfg.esp_boxes) {
             dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
@@ -208,24 +218,27 @@ void render_esp(ImDrawList* dl) {
                         IM_COL32(0, 0, 0, 180));
         }
 
+        // Name: bottom edge sits `gap` above the box top.
         if (g_cfg.esp_name && p.name[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.name);
-            dl->AddText({ cx - sz.x * 0.5f, top - 30.0f },
+            dl->AddText({ cx - sz.x * 0.5f, top - gap - lh },
                         pick(g_cfg.color_name), p.name);
         }
 
+        // Weapon: directly under the box.
         if (g_cfg.esp_weapon && p.weapon[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
-            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
+            dl->AddText({ cx - sz.x * 0.5f, bot + gap },
                         pick(g_cfg.color_weapon), p.weapon);
         }
 
-        // Bomb carrier: shown right below the feet so it can never be confused
-        // with the weapon line.
+        // Bomb carrier: its own line, so it is never confused with the weapon.
         if (g_cfg.esp_bomb && p.has_bomb) {
-            const char* tag = "C4";
+            const char* tag = "C4 CARRIER";
             const ImVec2 sz = ImGui::CalcTextSize(tag);
-            dl->AddText({ cx - sz.x * 0.5f, bot + 4.0f },
+            const float y = bot + gap + (g_cfg.esp_weapon && p.weapon[0]
+                                             ? lh + gap : 0.0f);
+            dl->AddText({ cx - sz.x * 0.5f, y },
                         col_of(g_cfg.color_carrier), tag);
         }
 
@@ -314,21 +327,22 @@ static void tab_misc() {
 
     if (g_cfg.bhop_input_mode) {
         ImGui::Text("mode: synthesised spacebar");
-        ImGui::TextDisabled("auto-jumps while grounded");
+        ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
     } else {
         ImGui::Text("button: 0x%06llX  %s",
             (unsigned long long)bd.offset,
             bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
         if (!bd.locked)
-            ImGui::TextDisabled("hold WASD or SPACE to confirm the address");
+            ImGui::TextDisabled("hold W or SPACE to confirm the address");
+        ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
     }
 
-    ImGui::Text("ground: %s   focused: %s",
-        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
-    ImGui::TextDisabled("signals: %s%s%s",
-        (bd.signals & 1) ? "z " : "",
-        (bd.signals & 2) ? "flag " : "",
-        (bd.signals & 4) ? "hge" : "");
+    ImGui::Text("ground: %s   focused: %s   space: %s",
+        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
+        bd.space_held ? "held" : "-");
+    if (!bd.hook_ok)
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
+                           "key hook failed - space gate may misbehave");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -340,7 +354,15 @@ static void tab_misc() {
     ImGui::Checkbox("V-Sync", &g_vsync);
 
     ImGui::Separator();
-    ImGui::TextDisabled("entities: %d", g_esp.diag_slots);
+    ImGui::TextDisabled("entities: %d slots", g_esp.diag_slots);
+    ImGui::TextDisabled("weapon defIdx chain: %s (mine=%d)",
+                        g_esp.diag_defidx ? "ok" : "not detected",
+                        g_esp.diag_defidx);
+    if (g_esp.diag_carrier)
+        ImGui::TextDisabled("C4 owner: 0x%llX",
+                            (unsigned long long)g_esp.diag_carrier);
+    else
+        ImGui::TextDisabled("C4 owner: not found");
 }
 
 static void tab_colors() {
@@ -369,7 +391,7 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 560.0f, 420.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({ 580.0f, 460.0f }, ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
