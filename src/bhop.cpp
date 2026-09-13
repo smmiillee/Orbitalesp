@@ -4,20 +4,28 @@
 //   +jump = 65537 (0x10001)
 //   -jump = 256   (0x00000100)
 //
-// Both values have been stable for the whole life of CS2; only the ADDRESS
-// moves, and it moves on essentially every update. So it is not hard-coded:
-// Bhop_DetectJump() finds the button block at runtime and Bhop_Init() uses
-// whatever it resolved.
+// Both have been stable for the whole life of CS2. Only the ADDRESS moves, and
+// it moves on every update -- so this file never trusts a hard-coded offset.
+// Instead the jump button is discovered at runtime by watching the button block
+// while the user plays normally (strafing or holding SPACE).
 //
 // The button address is a VALUE, not a pointer, and the write is 4 bytes --
 // writing 8 smears into the neighbouring button state.
+//
+// Timing note: this runs on its own ~1 ms thread with a spin-wait. Sleeping
+// with sleep_for(1ms) on Windows actually sleeps ~15.6 ms because of the
+// default timer granularity, which is why the jump kept missing the landing
+// tick when it shared the 4 ms reader thread.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 
 #include <Windows.h>
-#include <cstdint>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <thread>
 
 extern HWND g_cs2_hwnd;
 extern bool g_menu_open;
@@ -28,30 +36,56 @@ constexpr int32_t kJumpPress   = 65537; // +jump
 constexpr int32_t kJumpRelease = 256;   // -jump
 
 // The 13 CS2 buttons sit on a fixed 0x90 stride in a fixed order. These are
-// the distances from `jump` to each of them (a2x's buttons dump). Because the
-// LAYOUT is stable even though the base address isn't, the block can be found
-// by looking for this signature rather than by guessing an address.
+// the distances from `jump` to each of them (a2x's buttons dump). The LAYOUT
+// is stable even though the base address isn't, which is what makes the block
+// findable without knowing any offset.
 constexpr intptr_t kButtonRel[] = {
-    -0x630, // sprint
-    -0x5A0, // reload
-    -0x510, // attack
-    -0x480, // attack2
-    -0x3F0, // turnleft
-    -0x360, // turnright
-    -0x2D0, // forward    <- hold W for a strong signal
-    -0x240, // back
-    -0x1B0, // left
-    -0x120, // right
-    -0x090, // use
-     0x000, // jump       <- hold SPACE
-     0x090, // duck
+    -0x630, // 0  sprint
+    -0x5A0, // 1  reload
+    -0x510, // 2  attack
+    -0x480, // 3  attack2
+    -0x3F0, // 4  turnleft
+    -0x360, // 5  turnright
+    -0x2D0, // 6  forward   W
+    -0x240, // 7  back      S
+    -0x1B0, // 8  left      A
+    -0x120, // 9  right     D
+    -0x090, // 10 use
+     0x000, // 11 jump      SPACE
+     0x090, // 12 duck      CTRL
 };
-constexpr size_t  kButtonCount  = sizeof(kButtonRel) / sizeof(kButtonRel[0]);
-constexpr int     kJumpSlot     = 11;   // index of kButtonRel[] == 0
-constexpr int     kForwardSlot  = 6;    // index of kButtonRel[] == -0x2D0
+constexpr size_t kButtonCount = sizeof(kButtonRel) / sizeof(kButtonRel[0]);
+constexpr int    kJumpSlot    = 11;
 
-uintptr_t g_jump_offset = offsets::dwForceJump; // resolved at runtime
-bool      g_input_mode  = false;
+std::atomic<bool>      g_stop{false};
+std::atomic<bool>      g_started{false};
+std::atomic<bool>      g_locked{false};
+std::atomic<bool>      g_scanning{false};
+std::atomic<bool>      g_input_mode{false};
+std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
+
+// Diagnostics for the menu.
+std::atomic<uint32_t> g_dbg_flags{0};
+std::atomic<uint32_t> g_dbg_hge{0};
+std::atomic<bool>     g_dbg_ground{false};
+
+std::thread g_bhop_thread;
+std::thread g_scan_thread;
+
+// ~1 ms sleep that actually works: sleep the bulk, spin the last stretch.
+void wait_ms(int ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(ms);
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        const auto left = deadline - now;
+        if (left > std::chrono::milliseconds(2))
+            std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
+        else
+            std::this_thread::yield();
+    }
+}
 
 bool cs2_focused() {
     if (!g_cs2_hwnd) return false;
@@ -65,154 +99,184 @@ bool plausible_button(uint32_t v) {
         || v == 0x101u || v == 0x10000u || v == 0x10001u;
 }
 
-// Does the 13-slot block anchored at `jump_addr` look like the button block?
-// When `pressed_slot` >= 0, that slot must currently have its down-bit set.
-bool looks_like_button_block(const Memory& mem, uintptr_t jump_addr,
-                             int pressed_slot, int* zeros_out) {
-    int zeros = 0;
+// Which slots should be lit, given the keys the user is physically holding?
+// Returned as a bitmask over kButtonRel indices. 0 means "nothing held", in
+// which case there isn't enough evidence to identify the block.
+int held_slot_mask() {
+    int mask = 0;
+    if (GetAsyncKeyState('W') & 0x8000)     mask |= 1 << 6;
+    if (GetAsyncKeyState('S') & 0x8000)     mask |= 1 << 7;
+    if (GetAsyncKeyState('A') & 0x8000)     mask |= 1 << 8;
+    if (GetAsyncKeyState('D') & 0x8000)     mask |= 1 << 9;
+    if (GetAsyncKeyState(VK_SPACE) & 0x8000) mask |= 1 << kJumpSlot;
+    return mask;
+}
+
+bool block_ok(const Memory& mem, uintptr_t jump_addr, int mask) {
     for (size_t i = 0; i < kButtonCount; ++i) {
-        const uintptr_t a =
-            jump_addr + static_cast<uintptr_t>(kButtonRel[i]);
-        const uint32_t v = mem.read<uint32_t>(a);
+        const uint32_t v = mem.read<uint32_t>(
+            jump_addr + static_cast<uintptr_t>(kButtonRel[i]));
 
         if (!plausible_button(v)) return false;
-        if (v == 0u) ++zeros;
-        if (static_cast<int>(i) == pressed_slot && (v & 1u) == 0u) return false;
+
+        // Every key the user is actually holding must light its own slot.
+        if ((mask & (1 << i)) && (v & 1u) == 0u) return false;
     }
-    if (zeros_out) *zeros_out = zeros;
+
+    // If SPACE isn't held, the jump slot can't be reading as pressed.
+    if (!(mask & (1 << kJumpSlot))) {
+        if (mem.read<uint32_t>(jump_addr) & 1u) return false;
+    }
     return true;
 }
 
-// ── input-mode fallback ───────────────────────────────────────────────────
-// Toggle a synthetic spacebar so the game sees a fresh press every few ms.
-// No offsets, so nothing here can go stale.
-void inject_space(bool down) {
-    INPUT in{};
-    in.type = INPUT_KEYBOARD;
-    in.ki.wVk = VK_SPACE;
-    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
-    in.ki.dwFlags = down ? 0u : KEYEVENTF_KEYUP;
-    SendInput(1, &in, sizeof(INPUT));
+// Sweep the window around the estimate. Cheap to abort: it just stops when the
+// user releases every key.
+bool sweep(int mask) {
+    const uintptr_t center = g_mem.client_dll + offsets::dwForceJump;
+    const uintptr_t lo = center - offsets::kJumpScanRadius;
+    const uintptr_t hi = center + offsets::kJumpScanRadius;
+
+    for (uintptr_t a = lo; a <= hi; a += offsets::kScanStep) {
+        if (g_stop.load()) return false;
+        if (held_slot_mask() == 0) return false;  // evidence gone, retry later
+        if (mask != held_slot_mask()) return false;
+
+        if (!block_ok(g_mem, a, mask)) continue;
+
+        // Confirmed twice, ~25 ms apart, so a transient coincidence can't lock
+        // us onto the wrong block.
+        const uintptr_t candidate = a;
+        wait_ms(25);
+        if (!block_ok(g_mem, candidate, held_slot_mask())) continue;
+
+        g_jump_offset.store(candidate - g_mem.client_dll);
+        return true;
+    }
+    return false;
 }
 
-void input_mode_tick() {
-    static bool phase = false;
-    static ULONGLONG next_toggle = 0;
+void scan_thread_main() {
+    // Give the game time to finish loading.
+    for (int i = 0; i < 200 && !g_stop.load(); ++i) wait_ms(10);
 
-    if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-        if (phase) { inject_space(false); phase = false; }
-        next_toggle = 0;
-        return;
+    while (!g_stop.load()) {
+        if (g_locked.load()) { wait_ms(500); continue; }
+
+        const int mask = held_slot_mask();
+        if (mask == 0) { wait_ms(50); continue; }
+
+        g_scanning.store(true);
+        if (sweep(mask)) g_locked.store(true);
+        g_scanning.store(false);
+
+        if (!g_locked.load()) wait_ms(200);
     }
+}
 
-    const ULONGLONG now = GetTickCount64();
-    if (now < next_toggle) return;
-    next_toggle = now + 8; // 8 ms half-period -> the game tick always samples it
+// ── ground detection ──────────────────────────────────────────────────────
+// Two independent signals, so it still works on any surface and at any height
+// (a landing from a big drop looks exactly like a landing on the flat):
+//   m_fFlags          FL_ONGROUND bit
+//   m_hGroundEntity   0x8000 while standing on something, 0xFFFFFFFF in air
+bool read_ground(uintptr_t pawn, uint32_t& flags_out, uint32_t& hge_out) {
+    flags_out = g_mem.read<uint32_t>(pawn + offsets::m_fFlags);
+    hge_out   = g_mem.read<uint32_t>(pawn + offsets::m_hGroundEntity);
 
-    phase = !phase;
-    inject_space(phase);
+    const bool by_flags = (flags_out & 1u) != 0u;
+
+    // Only trust m_hGroundEntity if it reads as one of its real values, so a
+    // stale offset can't fake a ground contact.
+    const bool hge_trusted = (hge_out == 0x8000u || hge_out == 0xFFFFFFFFu ||
+                              hge_out == 0u);
+    const bool by_ent = hge_trusted && (hge_out == 0x8000u);
+
+    return by_flags || by_ent;
+}
+
+void bhop_thread_main() {
+    // Park the button released so a stale pressed value can't wedge the jump.
+    if (g_mem.is_valid())
+        g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(), kJumpRelease);
+
+    while (!g_stop.load()) {
+        wait_ms(1);
+
+        if (g_input_mode.load()) continue;
+        if (!g_mem.is_valid()) continue;
+
+        const uintptr_t jump_addr = g_mem.client_dll + g_jump_offset.load();
+
+        if (g_menu_open || !cs2_focused()) {
+            g_mem.write<int32_t>(jump_addr, kJumpRelease);
+            continue;
+        }
+
+        if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
+            g_mem.write<int32_t>(jump_addr, kJumpRelease);
+            continue;
+        }
+
+        const uintptr_t pawn =
+            g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
+        if (!pawn) {
+            g_mem.write<int32_t>(jump_addr, kJumpRelease);
+            continue;
+        }
+
+        uint32_t flags = 0, hge = 0;
+        const bool ground = read_ground(pawn, flags, hge);
+        g_dbg_flags.store(flags);
+        g_dbg_hge.store(hge);
+        g_dbg_ground.store(ground);
+
+        // On the ground -> press, which re-jumps on every landing. In the air
+        // -> release, so the next landing is always a fresh press edge.
+        g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
+    }
 }
 
 } // namespace
 
-// ── public API ────────────────────────────────────────────────────────────
-
-uintptr_t Bhop_JumpOffset()   { return g_jump_offset; }
-void      Bhop_SetJumpOffset(uintptr_t off) { g_jump_offset = off; }
-
-uint32_t Bhop_LiveJumpValue() {
-    if (!g_mem.is_valid()) return 0;
-    return g_mem.read<uint32_t>(g_mem.client_dll + g_jump_offset);
-}
-
-bool Bhop_InputMode() { return g_input_mode; }
-void Bhop_SetInputMode(bool enabled) {
-    g_input_mode = enabled;
-    if (!enabled) inject_space(false);
-}
-
-bool Bhop_IsOnGround() {
-    if (!g_mem.is_valid()) return false;
-    const uintptr_t pawn =
-        g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
-    if (!pawn) return false;
-
-    // FL_ONGROUND = (1 << 0).
-    // (Alternative if this ever reads wrong: m_hGroundEntity != 0xFFFFFFFF.)
-    const uint32_t flags = g_mem.read<uint32_t>(pawn + offsets::m_fFlags);
-    return (flags & 1u) != 0u;
-}
-
-int Bhop_DetectJump() {
-    if (!g_mem.is_valid()) return -1;
-
-    const uintptr_t base = g_mem.client_dll + offsets::dwForceJump;
-    const uintptr_t lo = base - offsets::kJumpScanRadius;
-    const uintptr_t hi = base + offsets::kJumpScanRadius;
-
-    // A physically held key lights exactly one slot, which is by far the
-    // strongest signal we can get -- and it removes the ambiguity of an idle
-    // block of zeros.
-    int want_slot = -1;
-    if (GetAsyncKeyState(VK_SPACE) & 0x8000) want_slot = kJumpSlot;
-    else if (GetAsyncKeyState('W') & 0x8000) want_slot = kForwardSlot;
-
-    if (want_slot >= 0) {
-        for (uintptr_t a = lo; a <= hi; a += offsets::kScanStep) {
-            if (looks_like_button_block(g_mem, a, want_slot, nullptr)) {
-                g_jump_offset = a - g_mem.client_dll;
-                return 1;
-            }
-        }
-        return -1;
-    }
-
-    // Nothing held: structural only. Require at least one non-zero slot so we
-    // can't lock onto a run of zeros, and require the jump slot itself to be
-    // idle (it can never read as "pressed" while nobody is holding anything).
-    uintptr_t best = 0;
-    int best_zeros = -1;
-    for (uintptr_t a = lo; a <= hi; a += offsets::kScanStep) {
-        const uint32_t jump_val = g_mem.read<uint32_t>(a);
-        if (jump_val != 0u && jump_val != 0x100u && jump_val != 0x101u) continue;
-
-        int zeros = 0;
-        if (!looks_like_button_block(g_mem, a, -1, &zeros)) continue;
-        if (zeros == static_cast<int>(kButtonCount)) continue;
-
-        if (zeros > best_zeros) { best_zeros = zeros; best = a; }
-    }
-
-    if (best) { g_jump_offset = best - g_mem.client_dll; return 0; }
-    return -1;
-}
-
 void Bhop_Init() {
-    // Park the button in a known released state so a stale pressed value from
-    // a previous run can't wedge the jump.
     if (!g_mem.is_valid()) return;
-    g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset, kJumpRelease);
+    bool expected = false;
+    if (!g_started.compare_exchange_strong(expected, true)) return;
+
+    g_stop.store(false);
+    g_bhop_thread = std::thread(bhop_thread_main);
+    g_scan_thread = std::thread(scan_thread_main);
 }
 
-void BhopTick() {
-    if (g_input_mode) { input_mode_tick(); return; }
-    if (!g_mem.is_valid()) return;
+void Bhop_Shutdown() {
+    g_stop.store(true);
+    if (g_bhop_thread.joinable()) g_bhop_thread.join();
+    if (g_scan_thread.joinable()) g_scan_thread.join();
+    g_started.store(false);
+}
 
-    const uintptr_t jump_addr = g_mem.client_dll + g_jump_offset;
+BhopDebug Bhop_GetDebug() {
+    BhopDebug d;
+    d.offset        = g_jump_offset.load();
+    d.flags         = g_dbg_flags.load();
+    d.ground_entity = g_dbg_hge.load();
+    d.on_ground     = g_dbg_ground.load();
+    d.locked        = g_locked.load();
+    d.scanning      = g_scanning.load();
+    if (g_mem.is_valid())
+        d.live_value = g_mem.read<uint32_t>(g_mem.client_dll + d.offset);
+    return d;
+}
 
-    // Never touch the button while the menu is open (the user may be typing)
-    // or while CS2 is not the foreground window.
-    if (g_menu_open || !cs2_focused()) {
-        g_mem.write<int32_t>(jump_addr, kJumpRelease);
-        return;
-    }
+void Bhop_Rescan() {
+    g_locked.store(false);
+    if (g_scan_thread.joinable()) g_scan_thread.join();
+    if (!g_started.load()) return;
+    g_scan_thread = std::thread(scan_thread_main);
+}
 
-    if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-        g_mem.write<int32_t>(jump_addr, kJumpRelease);
-        return;
-    }
+bool Bhop_InputMode() { return g_input_mode.load(); }
 
-    // On the ground -> press, which re-jumps on every landing. In the air ->
-    // release, so the next landing is always a fresh press.
-    g_mem.write<int32_t>(jump_addr, Bhop_IsOnGround() ? kJumpPress : kJumpRelease);
+void Bhop_SetInputMode(bool enabled) {
+    g_input_mode.store(enabled);
 }
