@@ -19,6 +19,42 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
+// Try all 4 combos of (chunkOff, stride) and pick the one that finds most live players
+// Mirrors orbitalweb CalibrateEntityList exactly
+static void calibrate(const Memory& mem, uintptr_t entity_list,
+                      uintptr_t local_pawn,
+                      uintptr_t& best_off, uintptr_t& best_stride) {
+    struct Combo { uintptr_t off; uintptr_t stride; };
+    constexpr Combo combos[] = {
+        {0x10, 112}, {0x10, 120}, {0x08, 112}, {0x08, 120}
+    };
+
+    int best_score = -1;
+    best_off    = 0x10;
+    best_stride = 120;
+
+    for (const auto& c : combos) {
+        int score = 0;
+        for (int chunk = 0; chunk < 4; chunk++) {
+            uintptr_t cp = mem.read<uintptr_t>(entity_list + c.off + 8 * chunk);
+            if (!cp || cp < 0x10000) continue;
+            for (int i = 0; i < 512; i++) {
+                uintptr_t ent = mem.read<uintptr_t>(cp + c.stride * i);
+                if (!ent || ent < 0x10000 || ent == local_pawn) continue;
+                int hp = mem.read<int>(ent + offsets::m_iHealth);
+                if (hp <= 0 || hp > 100) continue;
+                int tm = mem.read<int>(ent + offsets::m_iTeamNum) & 0xFF;
+                if (tm == 2 || tm == 3) score++;
+            }
+        }
+        if (score > best_score) {
+            best_score  = score;
+            best_off    = c.off;
+            best_stride = c.stride;
+        }
+    }
+}
+
 void ESP::update(const Memory& mem, uintptr_t client_base) {
     players.clear();
     debug_total_controllers = 0;
@@ -34,37 +70,39 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
+    // Calibrate once per session
+    static uintptr_t s_off    = 0;
+    static uintptr_t s_stride = 0;
+    static bool      s_done   = false;
+    if (!s_done) {
+        calibrate(mem, entity_list, local_pawn, s_off, s_stride);
+        s_done = true;
+    }
+
+    // Store calibrated values in debug
+    debug_sample_health = (int)s_off;    // reuse field to show chunk offset
+    debug_sample_team   = (int)s_stride; // reuse field to show stride
+
     constexpr int W = 1920, H = 1080;
 
-    // Strategy: scan ALL entity slots for anything that looks like a live player pawn.
-    // A player pawn has: health 1-100, team 2 or 3, non-zero position.
-    // We do NOT go through controllers at all.
-    for (int chunk = 0; chunk < 8; chunk++) {
-        uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + 0x10 + 8 * chunk);
+    for (int chunk = 0; chunk < 4; chunk++) {
+        uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + s_off + 8 * chunk);
         if (!chunk_ptr || chunk_ptr < 0x10000) continue;
 
         for (int i = 0; i < 512; i++) {
-            uintptr_t entity = mem.read<uintptr_t>(chunk_ptr + 120 * i);
+            uintptr_t entity = mem.read<uintptr_t>(chunk_ptr + s_stride * i);
             if (!entity || entity < 0x10000) continue;
             if (entity == local_pawn) continue;
             debug_total_controllers++;
 
-            // Health check first — fast reject for non-pawns
             int health = mem.read<int>(entity + offsets::m_iHealth);
             if (health <= 0 || health > 100) continue;
             debug_valid_pawns++;
 
-            if (debug_valid_pawns == 1) {
-                debug_sample_health = health;
-                debug_sample_team   = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
-            }
-
-            // Team check
             int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
             if (team != 2 && team != 3) continue;
             debug_alive++;
 
-            // Position
             Vec3 origin;
             origin.x = mem.read<float>(entity + offsets::m_vOldOrigin);
             origin.y = mem.read<float>(entity + offsets::m_vOldOrigin + 4);
