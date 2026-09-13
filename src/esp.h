@@ -6,7 +6,6 @@
 
 struct Vec3 { float x, y, z; };
 struct Vec2 { float x, y; };
-
 struct Matrix4x4 { float m[4][4]; };
 
 struct PlayerESP {
@@ -24,6 +23,13 @@ struct PlayerESP {
 class ESP {
 public:
     std::vector<PlayerESP> players;
+
+    // Debug counters — visible in menu so we know exactly where the chain breaks
+    int debug_total_controllers = 0;
+    int debug_valid_pawns       = 0;
+    int debug_alive             = 0;
+    int debug_positioned        = 0;
+    int debug_on_screen         = 0;
 
     void update(const Memory& mem, uintptr_t client_base);
 
