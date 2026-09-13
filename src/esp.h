@@ -1,52 +1,46 @@
 // --- src/esp.h ---
 #pragma once
-#include <cstdint>
-#include <mutex>
 #include <vector>
-#include <imgui.h>
-
-#include "cs2math.h"
+#include <mutex>
 #include "memory.h"
-#include "sdk.h"
+#include "offsets.h"
 
-// Written by the memory thread: world-space snapshot of one player.
+struct Vec3 { float x, y, z; };
+struct Vec2 { float x, y; };
+struct Matrix4x4 { float m[4][4]; };
+
+// Only world-space data stored — screen projection done fresh each render frame
 struct PlayerData {
-    Vec3  origin;                  // feet position
-    float distance = 0.0f;         // metres from local pawn
-    int   health   = 0;
-    int   team     = 0;
-    bool  bones_ok = false;        // bone data read + sanity-checked
-    Vec3  bone_pos[bones::count];  // world space, indexed by bone id
+    Vec3  origin;   // feet world position
+    int   health;
+    int   team;
+    float distance;
 };
 
-// Produced on the render thread: projected, ready to draw.
+// Screen-space result computed fresh every render frame
 struct PlayerESP {
-    Vec2  head;                    // screen pos of head (real bone 6, or origin+70 fallback)
-    Vec2  feet;                    // screen pos of origin
-    float box_h = 0.0f;
-    float box_w = 0.0f;
-    int   health = 0;
-    int   team   = 0;
-    float distance = 0.0f;
-    bool  bones_ok = false;
-    Vec2  bone_screen[bones::count];
-    bool  bone_ok[bones::count] = {};
+    Vec2  screen_head;
+    Vec2  screen_feet;
+    int   health;
+    int   team;
+    float distance;
+    float box_h;
+    float box_w;
 };
 
 class ESP {
 public:
-    // Memory thread: reads controllers -> pawns -> origin + all bones (world space).
+    // World-space data updated by memory thread
+    std::vector<PlayerData> world_players;
+    std::mutex              world_mutex;
+
+    // Called by memory thread — stores world positions only
     void update_world(const Memory& mem, uintptr_t client_base);
 
-    // Render thread: fresh view matrix every frame, projects the snapshot.
+    // Called by render thread — reads fresh view matrix, projects to screen
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
-                                   int screen_w, int screen_h);
+                                    int screen_w, int screen_h);
 
-    // Extra draw helpers (render thread only).
-    static void draw_head_dot(ImDrawList* dl, const PlayerESP& p, ImU32 col);
-    static void draw_skeleton(ImDrawList* dl, const PlayerESP& p, ImU32 col, float thickness);
-
-private:
-    std::mutex              world_mutex_;
-    std::vector<PlayerData> world_players_;
+    static bool world_to_screen(const Vec3& world, Vec2& screen,
+                                 const Matrix4x4& vm, int screen_w, int screen_h);
 };
