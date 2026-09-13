@@ -20,21 +20,21 @@ bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
 
 struct Config {
-    // visuals
+    // ESP visuals
     bool  esp_boxes    = true;
-    bool  esp_health   = true;
-    bool  esp_distance = true;
-    bool  esp_name     = true;
-    bool  esp_weapon   = true;
     bool  esp_skeleton = true;
     bool  esp_head_dot = true;
+    bool  esp_name     = true;
+    bool  esp_weapon   = true;
+    bool  esp_health   = true;
+    bool  esp_distance = true;
     bool  esp_bomb     = true;
     bool  esp_show_enemies = true;
     bool  esp_show_team    = true;
     float box_thickness = 0.5f;
 
-    // colours -- per visual, as requested
-    bool   team_colors = false;
+    // Colours -- one per visual.
+    bool   team_colors  = false;
     ImVec4 color_enemy  = { 1.00f, 0.15f, 0.15f, 1.00f };
     ImVec4 color_team   = { 0.20f, 0.90f, 0.35f, 1.00f };
     ImVec4 color_box    = { 1.00f, 0.15f, 0.15f, 1.00f };
@@ -45,14 +45,14 @@ struct Config {
     ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
     ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
 
-    bool bhop_enabled = true;
+    bool bhop_enabled    = true;
     bool bhop_input_mode = false;
 } g_cfg;
 
-static int g_screen_w = 1920;
-static int g_screen_h = 1080;
-static int g_local_team = 0;
-static int g_detected_hz = 0;
+static int  g_screen_w = 1920;
+static int  g_screen_h = 1080;
+static int  g_local_team = 0;
+static int  g_detected_hz = 0;
 static bool g_limit_fps = true;
 static int  g_fps_override = 0;
 
@@ -119,7 +119,7 @@ static bool find_cs2_window() {
     return true;
 }
 
-// Reader thread: world samples only. The bhop owns its own thread.
+// Reader thread: world samples. Bhop owns its own thread.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -132,12 +132,12 @@ void memory_thread() {
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             if (local_pawn)
                 g_local_team =
-                    g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
+                    g_mem.read<uint8_t>(local_pawn + offsets::m_iTeamNum);
 
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
-        // 8 ms (~125 Hz) is plenty: the game only writes positions at 64 Hz,
-        // and the render thread interpolates between samples anyway.
+        // 8 ms (~125 Hz): the game only writes positions at 64 Hz and the
+        // render thread interpolates, so faster sampling buys nothing.
         wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
     }
 }
@@ -157,7 +157,6 @@ void render_esp(ImDrawList* dl) {
         if (is_enemy    && !g_cfg.esp_show_enemies) continue;
         if (is_teammate && !g_cfg.esp_show_team)    continue;
 
-        // Per-visual colours, unless team colouring is switched on.
         const ImVec4 team_col = is_enemy ? g_cfg.color_enemy : g_cfg.color_team;
         auto pick = [&](const ImVec4& own) -> ImU32 {
             return col_of(g_cfg.team_colors ? team_col : own);
@@ -233,10 +232,9 @@ void render_esp(ImDrawList* dl) {
             const ImU32 c = col_of(g_cfg.color_bomb);
             float h = std::fabs(b.screen_top.y - b.screen.y);
             if (h < 6.0f) h = 6.0f;
-            const float w = h;
 
-            dl->AddRect({ b.screen.x - w / 2.0f, b.screen_top.y },
-                        { b.screen.x + w / 2.0f, b.screen.y }, c, 0.0f, 0,
+            dl->AddRect({ b.screen.x - h / 2.0f, b.screen_top.y },
+                        { b.screen.x + h / 2.0f, b.screen.y }, c, 0.0f, 0,
                         g_cfg.box_thickness);
             dl->AddText({ b.screen.x - 7.0f, b.screen_top.y - 16.0f }, c, "C4");
 
@@ -258,92 +256,96 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::Text("%s", label);
 }
 
-void render_menu() {
-    ImGui::SetNextWindowSize({ 620.0f, 470.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 440.0f, 320.0f }, { 1100.0f, 900.0f });
-    ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr);
+// ── menu tabs ────────────────────────────────────────────────────────────
 
-    if (!g_mem.is_valid()) {
-        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
-    } else {
-        ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
-            "[ attached  %dx%d  %d Hz  %d players ]",
-            g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
-        // Temporary: pins down where enumeration stops if the list is empty.
-        ImGui::TextDisabled("slots %d  read %s",
-                            g_esp.slots_found,
-                            g_esp.enum_bulk ? "bulk" : "per-slot");
-    }
-
-    ImGui::Separator();
-
-    const float win_w = ImGui::GetContentRegionAvail().x;
-    const float col_w = win_w / 2.0f;
+static void tab_esp() {
+    const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
-    ImGui::TextDisabled("[ ESP ]");
-    ImGui::Checkbox("Boxes", &g_cfg.esp_boxes);
-    ImGui::Checkbox("Skeleton", &g_cfg.esp_skeleton);
-    ImGui::Checkbox("Head dot", &g_cfg.esp_head_dot);
-    ImGui::Checkbox("Name", &g_cfg.esp_name);
-    ImGui::Checkbox("Weapon", &g_cfg.esp_weapon);
-    ImGui::Checkbox("Health bar", &g_cfg.esp_health);
-    ImGui::Checkbox("Distance", &g_cfg.esp_distance);
-    ImGui::Checkbox("Bomb (C4)", &g_cfg.esp_bomb);
+    ImGui::TextDisabled("[ Visuals ]");
+    ImGui::Checkbox("Boxes",       &g_cfg.esp_boxes);
+    ImGui::Checkbox("Skeleton",    &g_cfg.esp_skeleton);
+    ImGui::Checkbox("Head dot",    &g_cfg.esp_head_dot);
+    ImGui::Checkbox("Name",        &g_cfg.esp_name);
+    ImGui::Checkbox("Weapon",      &g_cfg.esp_weapon);
+    ImGui::Checkbox("Health bar",  &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",    &g_cfg.esp_distance);
+    ImGui::Checkbox("Bomb (C4)",   &g_cfg.esp_bomb);
 
     ImGui::Spacing();
-    ImGui::Checkbox("Show enemies", &g_cfg.esp_show_enemies);
+    ImGui::Checkbox("Show enemies",   &g_cfg.esp_show_enemies);
     ImGui::Checkbox("Show teammates", &g_cfg.esp_show_team);
 
-    ImGui::Spacing();
+    ImGui::NextColumn();
+
     ImGui::TextDisabled("[ Style ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 3.0f,
                        "thickness %.1f px");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Smoothing ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f,
-                       "smoothing %.0f ms");
+                       "%.0f ms");
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Interpolation delay. Higher = smoother and a\n"
-                          "touch more latency; 25-45 ms is the sweet spot.");
+        ImGui::SetTooltip("Snapshot interpolation delay.\n"
+                          "Higher = smoother, a touch more latency.\n"
+                          "25-45 ms is the sweet spot; 0 disables it.");
 
-    ImGui::NextColumn();
+    ImGui::Columns(1);
+}
 
+static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
     if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
         Bhop_SetInputMode(g_cfg.bhop_input_mode);
 
     const BhopDebug bd = Bhop_GetDebug();
-    const bool sig_z    = (bd.signals & 1) != 0;
-    const bool sig_flag = (bd.signals & 2) != 0;
-    const bool sig_hge  = (bd.signals & 4) != 0;
-    ImGui::Text("ground: %s    game focused: %s",
+    ImGui::Text("button: 0x%06llX  %s",
+        (unsigned long long)bd.offset,
+        bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[searching]"));
+    ImGui::Text("ground: %s   focused: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
-    ImGui::TextDisabled("signals: %s%s%s",
-        sig_z ? "z " : "", sig_flag ? "flag " : "", sig_hge ? "hge" : "");
-    if (!bd.focused && !bd.on_ground)
-        ImGui::TextDisabled("click back into the game");
 
-    ImGui::Spacing();
+    ImGui::TextDisabled("signals: %s%s%s",
+        (bd.signals & 1) ? "z " : "",
+        (bd.signals & 2) ? "flag " : "",
+        (bd.signals & 4) ? "hge" : "");
+    if ((bd.signals & 6) == 0)
+        ImGui::TextDisabled("jump around a bit to calibrate");
+
+    if (ImGui::Button("[Rescan button]")) Bhop_Rescan();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hold SPACE for a second if it will not lock.");
+
+    ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
+    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
     ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
-    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SetNextItemWidth(180.0f);
     ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
         g_fps_override ? "cap %d fps" : "cap auto (refresh)");
     ImGui::Checkbox("V-Sync", &g_vsync);
 
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ Colours ]");
+    ImGui::Separator();
+    ImGui::TextDisabled("entities: %d slots, %d alive, %d team",
+                        g_esp.diag_slots, g_esp.diag_hp, g_esp.diag_team);
+    ImGui::TextDisabled("read: %s", g_esp.diag_bulk ? "bulk" : "per-slot");
+}
+
+static void tab_colors() {
     ImGui::Checkbox("Use team colours", &g_cfg.team_colors);
+    ImGui::Separator();
+
+    const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
+    ImGui::Columns(2, nullptr, false);
+    ImGui::SetColumnWidth(0, col_w);
+
     color_row("##ce", "Enemy",    &g_cfg.color_enemy);
     color_row("##ct", "Team",     &g_cfg.color_team);
-
-    ImGui::NextColumn();
-    ImGui::NextColumn();
-
     color_row("##cb", "Boxes",    &g_cfg.color_box);
     color_row("##cs", "Skeleton", &g_cfg.color_skel);
     color_row("##ch", "Head dot", &g_cfg.color_head);
@@ -356,24 +358,57 @@ void render_menu() {
     color_row("##cc", "Bomb",     &g_cfg.color_bomb);
 
     ImGui::Columns(1);
+}
+
+void render_menu() {
+    ImGui::SetNextWindowSize({ 540.0f, 400.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
+    ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
+    ImGui::Begin("Orbital", nullptr);
+
+    if (!g_mem.is_valid()) {
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
+    } else {
+        ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
+            "[ attached  %dx%d  %d Hz  %d players ]",
+            g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::BeginTabBar("##orbital_tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabItem("ESP")) {
+            tab_esp();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("MISC")) {
+            tab_misc();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("COLORS")) {
+            tab_colors();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
     ImGui::Separator();
 
     const float btn_w =
-        (win_w - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f)
+        / 3.0f;
 
-    if (ImGui::Button("[Apply]", { btn_w, 0 })) {}
-    ImGui::SameLine();
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
         Bhop_SetInputMode(false);
     }
     ImGui::SameLine();
+    if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
+    ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
 
-    ImGui::Spacing();
     ImGui::TextDisabled("INSERT - menu    F9 - exit");
-    ImGui::TextDisabled("If ESP still stutters: engine_no_focus_sleep 0");
 
     ImGui::End();
 }
