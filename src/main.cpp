@@ -1,34 +1,40 @@
 // --- src/main.cpp ---
 #include <Windows.h>
-#include <thread>
 #include <chrono>
-#include <imgui.h>
-#include "memory.h"
-#include "esp.h"
-#include "overlay.h"
-#include "offsets.h"
-#include "bhop.h"
+#include <cstdio>
+#include <thread>
+#include <vector>
 
-static ESP  g_esp;
-static bool g_running   = true;
-bool        g_menu_open = false;
-HWND        g_cs2_hwnd  = nullptr;
+#include <imgui.h>
+
+#include "bhop.h"
+#include "esp.h"
+#include "memory.h"
+#include "offsets.h"
+#include "overlay.h"
+
+static ESP g_esp;
+static bool g_running = true;
+bool g_menu_open = false;
+HWND g_cs2_hwnd = nullptr;
 
 struct Config {
-    bool   esp_boxes         = true;
-    bool   esp_health        = true;
-    bool   esp_distance      = true;
-    bool   esp_show_enemies  = true;
-    bool   esp_show_team     = true;
-    float  box_thickness     = 1.5f;
-    ImVec4 color_enemy       = { 1.0f, 0.10f, 0.10f, 1.0f };
-    ImVec4 color_team        = { 0.10f, 1.0f, 0.20f, 1.0f };
-    bool   bhop_enabled      = true;
+    bool  esp_boxes        = true;
+    bool  esp_health       = true;
+    bool  esp_distance     = true;
+    bool  esp_show_enemies = true;
+    bool  esp_show_team    = true;
+    bool  esp_skeleton     = true;   // NEW
+    bool  esp_head_dots    = true;   // NEW
+    float box_thickness    = 1.5f;
+    ImVec4 color_enemy     = { 1.0f, 0.10f, 0.10f, 1.0f };
+    ImVec4 color_team      = { 0.10f, 1.0f, 0.20f, 1.0f };
+    bool  bhop_enabled     = true;
 } g_cfg;
 
-static int  g_screen_w   = 1920;
-static int  g_screen_h   = 1080;
-static int  g_local_team = 0;
+static int g_screen_w   = 1920;
+static int g_screen_h   = 1080;
+static int g_local_team = 0;
 
 static bool find_cs2_window() {
     g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
@@ -41,19 +47,18 @@ static bool find_cs2_window() {
     return true;
 }
 
-// Memory thread: only reads world positions and bhop
+// Memory thread: world positions + bones + bhop only. Never touches the view matrix.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
     while (g_running) {
         if (g_mem.is_valid()) {
-            uintptr_t local_pawn = g_mem.read<uintptr_t>(
-                g_mem.client_dll + offsets::dwLocalPlayerPawn);
+            const uintptr_t local_pawn =
+                g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
             if (local_pawn)
                 g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            // Only world positions — no view matrix here
             g_esp.update_world(g_mem, g_mem.client_dll);
 
             if (g_cfg.bhop_enabled) BhopTick();
@@ -65,83 +70,94 @@ void memory_thread() {
 void render_esp(ImDrawList* dl) {
     if (!g_mem.is_valid()) return;
 
-    // Project with fresh view matrix read THIS frame — no mouse lag
-    std::vector<PlayerESP> players = g_esp.project(
-        g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+    // Fresh view matrix read on THIS frame - no mouse lag.
+    std::vector<PlayerESP> players =
+        g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
     for (const auto& p : players) {
-        bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
-        bool is_enemy    = !is_teammate;
+        const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
+        const bool is_enemy    = !is_teammate;
 
         if (is_enemy    && !g_cfg.esp_show_enemies) continue;
         if (is_teammate && !g_cfg.esp_show_team)    continue;
 
-        ImVec4 col4 = is_enemy ? g_cfg.color_enemy : g_cfg.color_team;
-        ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
+        const ImVec4 col4 = is_enemy ? g_cfg.color_enemy : g_cfg.color_team;
+        const ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
 
-        float cx  = p.screen_head.x;
-        float top = p.screen_head.y;
-        float bot = p.screen_feet.y;
-        float bh  = p.box_h;
-        float bw  = p.box_w;
+        const float cx  = p.head.x;
+        const float top = p.head.y;
+        const float bot = p.feet.y;
+        const float bh  = p.box_h;
+        const float bw  = p.box_w;
 
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
 
+        // NEW: skeleton under everything else
+        if (g_cfg.esp_skeleton)
+            ESP::draw_skeleton(dl, p, col, g_cfg.box_thickness);
+
         if (g_cfg.esp_boxes) {
             dl->AddRect(
-                { cx - bw / 2.0f, top },
-                { cx + bw / 2.0f, bot },
-                col, 0.0f, 0, g_cfg.box_thickness
-            );
+                ImVec2(cx - bw / 2.0f, top),
+                ImVec2(cx + bw / 2.0f, bot),
+                col, 0.0f, 0, g_cfg.box_thickness);
         }
 
         if (g_cfg.esp_health) {
-            float bar_h  = bh * (p.health / 100.0f);
-            float bar_x  = cx - bw / 2.0f - 6.0f;
-            ImU32 hp_col = IM_COL32(
+            const float bar_h = bh * (p.health / 100.0f);
+            const float bar_x = cx - bw / 2.0f - 6.0f;
+            const ImU32 hp_col = IM_COL32(
                 (int)(255 * (1.0f - p.health / 100.0f)),
                 (int)(255 * (p.health / 100.0f)),
-                0, 255
-            );
-            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
-            dl->AddRect      ({ bar_x, top         }, { bar_x + 3.0f, bot }, IM_COL32(0,0,0,180));
+                0, 255);
+            dl->AddRectFilled(ImVec2(bar_x, bot - bar_h), ImVec2(bar_x + 3.0f, bot), hp_col);
+            dl->AddRect(ImVec2(bar_x, top), ImVec2(bar_x + 3.0f, bot), IM_COL32(0, 0, 0, 180));
         }
 
         if (g_cfg.esp_distance) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255,255,255,220), buf);
+            dl->AddText(ImVec2(cx - 12.0f, top - 14.0f), IM_COL32(255, 255, 255, 220), buf);
         }
+
+        // NEW: head dot on top
+        if (g_cfg.esp_head_dots)
+            ESP::draw_head_dot(dl, p, col);
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//  MENU — design untouched. Only two new checkboxes were added to the list.
+// ───────────────────────────────────────────────────────────────────────────
 void render_menu() {
-    ImGui::SetNextWindowSize({ 420.0f, 300.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 300.0f, 220.0f }, { 800.0f, 600.0f });
-    ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 300.0f), ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(300.0f, 220.0f), ImVec2(800.0f, 600.0f));
+    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoScrollbar);
 
-    float win_w = ImGui::GetContentRegionAvail().x;
+    const float win_w = ImGui::GetContentRegionAvail().x;
 
     if (!g_mem.is_valid())
-        ImGui::TextColored({ 1.0f,0.5f,0.0f,1.0f }, "[ Waiting for CS2... ]");
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "[ Waiting for CS2... ]");
     else
-        ImGui::TextColored({ 0.0f,0.7f,0.0f,1.0f },
+        ImGui::TextColored(ImVec4(0.0f, 0.7f, 0.0f, 1.0f),
             "[ Attached | %dx%d | Team:%d ]", g_screen_w, g_screen_h, g_local_team);
 
     ImGui::Separator();
 
-    float col_w = win_w / 2.0f;
+    const float col_w = win_w / 2.0f;
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
     ImGui::TextDisabled("[ ESP ]");
-    ImGui::Checkbox("Boxes",        &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health Bar",   &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",     &g_cfg.esp_distance);
+    ImGui::Checkbox("Boxes", &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health Bar", &g_cfg.esp_health);
+    ImGui::Checkbox("Distance", &g_cfg.esp_distance);
+    ImGui::Checkbox("Skeleton", &g_cfg.esp_skeleton);    // NEW
+    ImGui::Checkbox("Head Dots", &g_cfg.esp_head_dots);   // NEW
     ImGui::Checkbox("Show Enemies", &g_cfg.esp_show_enemies);
-    ImGui::Checkbox("Show Team",    &g_cfg.esp_show_team);
+    ImGui::Checkbox("Show Team", &g_cfg.esp_show_team);
     ImGui::Spacing();
     ImGui::TextDisabled("[ Colors ]");
     ImGui::ColorEdit4("##ec", &g_cfg.color_enemy.x,
@@ -162,15 +178,15 @@ void render_menu() {
     ImGui::Columns(1);
     ImGui::Separator();
 
-    float btn_w = (win_w - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
-    if (ImGui::Button("[Apply]", { btn_w, 0 })) {}
+    const float btn_w = (win_w - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+    if (ImGui::Button("[Apply]", ImVec2(btn_w, 0))) {}
     ImGui::SameLine();
-    if (ImGui::Button("[Reset]", { btn_w, 0 })) g_cfg = {};
+    if (ImGui::Button("[Reset]", ImVec2(btn_w, 0))) g_cfg = {};
     ImGui::SameLine();
-    if (ImGui::Button("[Exit]",  { btn_w, 0 })) g_running = false;
+    if (ImGui::Button("[Exit]", ImVec2(btn_w, 0))) g_running = false;
 
     ImGui::Spacing();
-    ImGui::TextDisabled("INSERT - menu    F9 - exit");
+    ImGui::TextDisabled("INSERT - menu F9 - exit");
     ImGui::End();
 }
 
@@ -191,8 +207,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) g_running = false;
         }
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
-        if (GetAsyncKeyState(VK_F9)     & 1) g_running   = false;
-        if (GetAsyncKeyState(VK_END)    & 1) g_running   = false;
+        if (GetAsyncKeyState(VK_F9) & 1)     g_running = false;
+        if (GetAsyncKeyState(VK_END) & 1)    g_running = false;
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
