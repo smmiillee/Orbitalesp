@@ -76,8 +76,9 @@ static int query_refresh_rate(HWND game) {
     return (hz < 30 || hz > 1000) ? 0 : hz;
 }
 
-// sleep_for() on Windows quantises to the ~15.6 ms timer, so a 4 ms cap
-// silently ran at 64 Hz. Sleep the bulk, spin the last stretch.
+// sleep_for() on Windows quantises to the timer resolution unless the process
+// raised it, which bhop does with timeBeginPeriod(1). Sleep the bulk, spin the
+// last stretch, so the frame cap is honest either way.
 static void wait_until(std::chrono::steady_clock::time_point deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -124,13 +125,22 @@ static bool find_cs2_window() {
     return true;
 }
 
+// Push the whole bhop config into the module. Called once at startup and by
+// [Reset], so the two can never drift apart.
+static void apply_bhop_config() {
+    Bhop_SetEnabled(g_cfg.bhop_enabled);
+    Bhop_SetPredict(g_cfg.bhop_predict);
+    Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
+    Bhop_SetLead(g_cfg.bhop_lead_ms);
+}
+
 // Reader thread: world samples. Bhop owns its own thread.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
     Bhop_Init();
-    Bhop_SetMode(g_cfg.bhop_mode);
+    apply_bhop_config();
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -323,41 +333,46 @@ static void tab_esp() {
 static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
+    ImGui::TextDisabled("keystroke injection only - no writes to CS2");
 
-    if (ImGui::RadioButton("Off", g_cfg.bhop_mode == BHOP_OFF)) {
-        g_cfg.bhop_mode = BHOP_OFF;   Bhop_SetMode(BHOP_OFF);
-    }
-    if (ImGui::RadioButton("Inject keys  -  NO writes to CS2",
-                           g_cfg.bhop_mode == BHOP_INJECT)) {
-        g_cfg.bhop_mode = BHOP_INJECT; Bhop_SetMode(BHOP_INJECT);
-    }
-    if (ImGui::RadioButton("Write jump button  -  WRITES to CS2",
-                           g_cfg.bhop_mode == BHOP_MEMORY)) {
-        g_cfg.bhop_mode = BHOP_MEMORY; Bhop_SetMode(BHOP_MEMORY);
-    }
+    if (ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled))
+        Bhop_SetEnabled(g_cfg.bhop_enabled);
 
-    if (g_cfg.bhop_mode == BHOP_MEMORY)
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-                           "this mode writes 2 int32s to cs2.exe per jump");
-    else if (g_cfg.bhop_mode == BHOP_INJECT)
-        ImGui::TextDisabled("no memory writes; timing has OS jitter");
+    if (ImGui::Checkbox("Predictive (press before landing)", &g_cfg.bhop_predict))
+        Bhop_SetPredict(g_cfg.bhop_predict);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Estimates the landing from your vertical velocity and\n"
+                          "presses early, so the press is already down when the\n"
+                          "engine samples input for the landing tick.\n"
+                          "The ground flag is still used as a fallback.");
+
+    ImGui::SetNextItemWidth(200.0f);
+    if (ImGui::SliderFloat("##lead", &g_cfg.bhop_lead_ms, 0.0f, 40.0f,
+                           "lead %.0f ms"))
+        Bhop_SetLead(g_cfg.bhop_lead_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How early prediction presses.\n"
+                          "One game tick is ~16 ms. 12-20 ms is the usual range.");
+
+    if (ImGui::Checkbox("Use Right Arrow (bind +jump)", &g_cfg.bhop_separate_key))
+        Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Injects RIGHT instead of SPACE.\n"
+                          "In-game: bind \";\" \"+jump\" on the right arrow, so\n"
+                          "the physical key we inject is never the one held.");
 
     const BhopDebug bd = Bhop_GetDebug();
-
-    if (g_cfg.bhop_mode == BHOP_MEMORY) {
-        ImGui::Text("button: 0x%06llX  %s",
-            (unsigned long long)bd.offset,
-            bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
-        if (!bd.locked)
-            ImGui::TextDisabled("hold SPACE to confirm the address");
-    }
 
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("press edges: %d   %s   %s",
-        bd.presses, bd.driving ? "[driving]" : "[idle]",
+    ImGui::TextDisabled("edges %d   predicted %d   %s%s",
+        bd.edges, bd.predicted,
+        bd.driving ? "[driving] " : "",
         bd.suppressing ? "[space swallowed]" : "");
+    if (g_cfg.bhop_predict)
+        ImGui::TextDisabled("vz %.0f   tti %.1f ms", bd.vz, bd.tti);
+
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - space gate may misbehave");
@@ -409,8 +424,8 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 580.0f, 460.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
+    ImGui::SetNextWindowSize({ 580.0f, 480.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 780.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
@@ -434,16 +449,14 @@ void render_menu() {
     ImGui::Separator();
 
     const float btn_w =
-        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f)
-        / 3.0f;
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x)
+        / 2.0f;
 
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
-        Bhop_SetMode(g_cfg.bhop_mode);
+        apply_bhop_config();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
 
