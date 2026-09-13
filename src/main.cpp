@@ -12,23 +12,26 @@
 Memory      g_mem;
 static ESP  g_esp;
 static bool g_running   = true;
-bool        g_menu_open = false; // extern'd in overlay.cpp
-HWND        g_cs2_hwnd  = nullptr; // extern'd in overlay.cpp
+bool        g_menu_open = false;
+HWND        g_cs2_hwnd  = nullptr;
 
 struct Config {
-    bool   esp_boxes     = true;
-    bool   esp_health    = true;
-    bool   esp_distance  = true;
-    bool   enemy_only    = true;
-    float  box_thickness = 1.5f;
-    ImVec4 color_enemy   = { 1.0f, 0.2f, 0.2f, 1.0f };
-    ImVec4 color_team    = { 0.2f, 1.0f, 0.4f, 1.0f };
+    // ESP
+    bool   esp_boxes      = true;
+    bool   esp_health     = true;
+    bool   esp_distance   = true;
+    bool   esp_enemy_only = true;
+    bool   esp_team       = false;
+    float  box_thickness  = 1.5f;
+    ImVec4 color_enemy    = { 1.0f, 0.10f, 0.10f, 1.0f };
+    ImVec4 color_team     = { 0.10f, 1.0f, 0.20f, 1.0f };
+    // Misc
+    bool   bhop_enabled   = true;
 } g_cfg;
 
 static int g_screen_w = 1920;
 static int g_screen_h = 1080;
 
-// ── Find CS2 window and read its exact client dimensions ─────────────────────
 static bool find_cs2_window() {
     g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
     if (!g_cs2_hwnd) return false;
@@ -40,7 +43,6 @@ static bool find_cs2_window() {
     return true;
 }
 
-// ── Memory + bhop thread ─────────────────────────────────────────────────────
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -48,16 +50,16 @@ void memory_thread() {
     while (g_running) {
         if (g_mem.is_valid()) {
             g_esp.update(g_mem, g_mem.base_address);
-            BhopTick();
+            if (g_cfg.bhop_enabled) BhopTick();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
-// ── ESP draw ─────────────────────────────────────────────────────────────────
 void render_esp(ImDrawList* dl) {
     for (const auto& p : g_esp.players) {
-        if (g_cfg.enemy_only && p.team == 2) continue;
+        if (g_cfg.esp_enemy_only && p.team == 2) continue;
+        if (!g_cfg.esp_team      && p.team != 3) continue;
 
         ImVec4 col4 = (p.team == 3) ? g_cfg.color_enemy : g_cfg.color_team;
         ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
@@ -95,53 +97,87 @@ void render_esp(ImDrawList* dl) {
         if (g_cfg.esp_distance) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255,255,255,200), buf);
+            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255,255,255,220), buf);
         }
     }
 }
 
-// ── ImGui menu ────────────────────────────────────────────────────────────────
+// ── BramptonHook-style two-column menu ───────────────────────────────────────
 void render_menu() {
-    ImGui::SetNextWindowSize({ 280, 290 }, ImGuiCond_Once);
-    ImGui::SetNextWindowPos ({ 30,  30  }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoResize);
+    const float col_w  = 200.0f;
+    const float win_w  = col_w * 2.0f + 24.0f; // two columns + padding
+    const float win_h  = 320.0f;
 
-    ImGui::SeparatorText("ESP");
-    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health",     &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
-    ImGui::Checkbox("Enemy Only", &g_cfg.enemy_only);
+    ImGui::SetNextWindowSize({ win_w, win_h }, ImGuiCond_Always);
+    ImGui::SetNextWindowPos ({ 20.0f, 20.0f }, ImGuiCond_Once);
+    ImGui::Begin("Orbital", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar);
 
-    ImGui::SeparatorText("Colors");
-    ImGui::ColorEdit4("Enemy", &g_cfg.color_enemy.x, ImGuiColorEditFlags_NoInputs);
-    ImGui::ColorEdit4("Team",  &g_cfg.color_team.x,  ImGuiColorEditFlags_NoInputs);
-
-    ImGui::SeparatorText("Style");
-    ImGui::SliderFloat("Thickness", &g_cfg.box_thickness, 0.5f, 4.0f);
-
-    ImGui::Separator();
-    ImGui::TextDisabled("INSERT - toggle menu");
-    ImGui::TextDisabled("F9     - exit");
-    ImGui::Separator();
-
-    if (!g_mem.is_valid())
-        ImGui::TextColored({ 1.0f, 0.6f, 0.0f, 1.0f }, "Waiting for CS2...");
-    else {
-        ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f }, "Attached");
-        ImGui::Text("Resolution: %dx%d", g_screen_w, g_screen_h);
+    // ── Status bar at top ────────────────────────────────────────────────────
+    if (!g_mem.is_valid()) {
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ Waiting for CS2... ]");
+    } else {
+        ImGui::TextColored({ 0.0f, 0.8f, 0.0f, 1.0f },
+            "[ Attached | %dx%d ]", g_screen_w, g_screen_h);
     }
+    ImGui::Separator();
+
+    // ── Two-column layout ────────────────────────────────────────────────────
+    ImGui::Columns(2, "main_cols", true);
+    ImGui::SetColumnWidth(0, col_w);
+
+    // LEFT: ESP
+    ImGui::TextDisabled("ESP");
+    ImGui::Separator();
+    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health Bar", &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
+    ImGui::Checkbox("Enemy Only", &g_cfg.esp_enemy_only);
+    ImGui::Checkbox("Show Team",  &g_cfg.esp_team);
+    ImGui::Spacing();
+    ImGui::TextDisabled("Colors");
+    ImGui::Separator();
+    ImGui::ColorEdit4("Enemy##col", &g_cfg.color_enemy.x,
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+    ImGui::SameLine(); ImGui::Text("Enemy");
+    ImGui::ColorEdit4("Team##col",  &g_cfg.color_team.x,
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+    ImGui::SameLine(); ImGui::Text("Team");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Style");
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
+
+    // RIGHT: Misc
+    ImGui::NextColumn();
+    ImGui::TextDisabled("Misc");
+    ImGui::Separator();
+    ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
+
+    ImGui::Columns(1);
+    ImGui::Separator();
+
+    // ── Bottom button bar ─────────────────────────────────────────────────────
+    float btn_w = (win_w - ImGui::GetStyle().WindowPadding.x * 2.0f
+                  - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+
+    if (ImGui::Button("[Apply]", { btn_w, 0 })) { /* config already live */ }
+    ImGui::SameLine();
+    if (ImGui::Button("[Reset]", { btn_w, 0 })) { g_cfg = {}; }
+    ImGui::SameLine();
+    if (ImGui::Button("[Exit]",  { btn_w, 0 })) { g_running = false; }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("INSERT - menu    F9 - exit");
 
     ImGui::End();
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // Spin until CS2's window exists — reads client rect for correct dimensions.
     while (!find_cs2_window())
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Overlay is a popup — no cross-process parenting.
-    // create() takes width/height only.
     Overlay overlay;
     if (!overlay.create(g_screen_w, g_screen_h)) return 1;
 
