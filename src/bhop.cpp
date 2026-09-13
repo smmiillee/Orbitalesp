@@ -12,7 +12,6 @@
 #include <thread>
 
 extern HWND g_cs2_hwnd;
-extern bool g_menu_open;
 
 namespace {
 
@@ -32,6 +31,7 @@ std::atomic<bool>      g_stop{false}, g_started{false}, g_locked{false};
 std::atomic<bool>      g_scanning{false}, g_input_mode{false};
 std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
 std::atomic<bool>      g_dbg_ground{false};
+std::atomic<bool>      g_dbg_focused{false};
 std::atomic<int>       g_dbg_signals{0};
 std::atomic<int>       g_dbg_calib{0};
 
@@ -45,8 +45,8 @@ double now_ms() {
 }
 
 // ~1 ms sleep that actually works: sleep the bulk, spin the last stretch.
-// Plain sleep_for(1ms) on Windows really sleeps ~15.6 ms, which is a whole
-// game tick -- that alone made bhop miss landings.
+// Plain sleep_for(1ms) on Windows really sleeps ~15.6 ms -- a whole game tick,
+// which is enough on its own to make bhop miss landings.
 void wait_ms(int ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(ms);
@@ -62,11 +62,10 @@ void wait_ms(int ms) {
 }
 
 bool cs2_focused() {
-    if (!g_cs2_hwnd) return false;
-    return GetForegroundWindow() == g_cs2_hwnd;
+    return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
-// ── jump-button scanner (unchanged: it works) ─────────────────────────────
+// ── jump-button scanner ──────────────────────────────────────────────────
 
 bool plausible_button(uint32_t v) {
     return v == 0x0u || v == 0x1u || v == 0x100u
@@ -85,8 +84,8 @@ int held_slot_mask() {
 
 bool block_ok(const Memory& mem, uintptr_t jump_addr, int mask) {
     for (size_t i = 0; i < kButtonCount; ++i) {
-        const uint32_t v =
-            mem.read<uint32_t>(jump_addr + static_cast<uintptr_t>(kButtonRel[i]));
+        const uint32_t v = mem.read<uint32_t>(
+            jump_addr + static_cast<uintptr_t>(kButtonRel[i]));
         if (!plausible_button(v)) return false;
         if ((mask & (1 << i)) && (v & 1u) == 0u) return false;
     }
@@ -132,7 +131,7 @@ void scan_thread_main() {
     }
 }
 
-// ── ground signals, validated against the local player's Z ────────────────
+// ── ground signals, graded against the local player's Z ──────────────────
 
 struct GroundWatch {
     bool   have_z = false;
@@ -140,19 +139,16 @@ struct GroundWatch {
     double z_changed = 0.0;
     bool   z_ground = true;
 
-    int    flag_g = 0, flag_a = 0;   // flag agreed with Z, per state
+    int    flag_g = 0, flag_a = 0;
     int    hge_g  = 0, hge_a  = 0;
     bool   flag_ok = false, hge_ok = false;
 };
 GroundWatch g_gw;
 
-// A sample counts as "standing" when Z has not moved for ~22 ms. Z comes from
-// m_vOldOrigin, which is verified-good (the ESP aligns), so this is the
-// reference the other signals are graded against.
 bool sample_ground(const Memory& mem, uintptr_t pawn) {
     const double now = now_ms();
 
-    const float z      = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
+    const float    z   = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
     const uint32_t fl  = mem.read<uint32_t>(pawn + offsets::m_fFlags);
     const uint32_t hge = mem.read<uint32_t>(pawn + offsets::m_hGroundEntity);
 
@@ -161,19 +157,18 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     g_gw.z_ground = (now - g_gw.z_changed) > 22.0;
 
     if (g_gw.z_ground) {
-        if (fl & 1u)              ++g_gw.flag_g;
-        if (hge != 0xFFFFFFFFu)   ++g_gw.hge_g;
+        if (fl & 1u)            ++g_gw.flag_g;
+        if (hge != 0xFFFFFFFFu) ++g_gw.hge_g;
     } else {
-        if (!(fl & 1u))           ++g_gw.flag_a;
-        if (hge == 0xFFFFFFFFu)   ++g_gw.hge_a;
+        if (!(fl & 1u))          ++g_gw.flag_a;
+        if (hge == 0xFFFFFFFFu)  ++g_gw.hge_a;
     }
 
-    // Only trust a signal once it has been seen in BOTH states. Until then it
-    // is ignored, so a wrong offset can't make bhop press while airborne.
+    // Only trust a signal once it has been seen in BOTH states.
     if (!g_gw.flag_ok && g_gw.flag_g >= 6 && g_gw.flag_a >= 6) g_gw.flag_ok = true;
     if (!g_gw.hge_ok  && g_gw.hge_g  >= 6 && g_gw.hge_a  >= 6) g_gw.hge_ok  = true;
 
-    int sig = 1;                                  // z is always available
+    int sig = 1;
     if (g_gw.flag_ok) sig |= 2;
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
@@ -202,7 +197,13 @@ void bhop_thread_main() {
 
         const uintptr_t jump_addr = g_mem.client_dll + g_jump_offset.load();
 
-        if (g_menu_open || !cs2_focused()) {
+        // Note: the menu no longer gates bhop. The overlay is non-activating,
+        // so CS2 keeps keyboard focus even with the menu open -- which means
+        // the panel can show live ground/signals while you play.
+        const bool focused = cs2_focused();
+        g_dbg_focused.store(focused);
+
+        if (!focused) {
             g_mem.write<int32_t>(jump_addr, kJumpRelease);
             continue;
         }
@@ -212,7 +213,6 @@ void bhop_thread_main() {
         }
 
         const double now = now_ms();
-        // Re-read the pawn occasionally: it changes on death/respawn.
         if (!pawn || now - pawn_at > 500.0) {
             pawn = g_mem.read<uintptr_t>(
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
@@ -223,16 +223,15 @@ void bhop_thread_main() {
             continue;
         }
 
-        // Sample at 2 ms; write every loop (~1 ms) so the button state is
-        // settled before the game reads input for the next tick.
+        // Sample at 2 ms but write every loop (~1 ms), so the button state is
+        // already settled before the game reads input for the next tick.
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
         // On the ground -> press, which re-jumps on every landing. Airborne ->
-        // release, so the landing is always a fresh press edge. Both are
-        // height- and surface-independent.
+        // release, so the next landing is always a fresh press edge.
         g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
     }
 }
@@ -260,6 +259,7 @@ BhopDebug Bhop_GetDebug() {
     BhopDebug d;
     d.offset      = g_jump_offset.load();
     d.on_ground   = g_dbg_ground.load();
+    d.focused     = g_dbg_focused.load();
     d.signals     = g_dbg_signals.load();
     d.calibrating = g_dbg_calib.load();
     d.locked      = g_locked.load();
