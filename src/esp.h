@@ -12,7 +12,7 @@ struct Vec3 { float x, y, z; };
 struct Vec2 { float x, y; };
 struct Matrix4x4 { float m[4][4]; };
 
-// ── CS2 skeleton bone ids (post animgraph_2_beta map) ───────────────────
+// ── CS2 skeleton bone ids (post animgraph_2_beta) ───────────────────────
 enum BoneId : int {
     BONE_ORIGIN     = 0,
     BONE_PELVIS     = 1,
@@ -61,7 +61,6 @@ struct Track {
     int   health = 0;
     int   team = 0;
     float distance = 0.0f;
-    double last_info = 0.0;
     double last_seen = 0.0;
 
     Snap hist[kHist];
@@ -94,21 +93,22 @@ struct BombESP {
     Vec2  screen{};
     Vec2  screen_top{};
     float distance = 0.0f;
-    float timer = -1.0f;   // seconds until detonation, -1 if unknown
+    float timer = -1.0f;
 };
 
 class ESP {
 public:
-    // Snapshot interpolation window, in ms. CS2 writes entity positions at
-    // ~64 Hz; drawing those raw steps at 144+ fps is the shake you see. This
-    // samples a fixed time in the past and interpolates between two REAL
-    // frames, so motion is smooth and the latency is CONSTANT -- constant lag
-    // is invisible, variable lag reads as shake.
+    // Snapshot interpolation delay in ms. CS2 writes entity positions at
+    // ~64 Hz; drawing those raw steps at 144+ fps is the shake. The reader
+    // timestamps every sample and the render thread draws a fixed time in the
+    // past, interpolating between two REAL frames -- so the latency is
+    // constant, and constant lag is invisible where variable lag reads as
+    // shake.
     float interp_delay_ms = 35.0f;
 
     std::mutex mtx;   // guards tracks_ / bomb state
 
-    void update_world(const Memory& mem, uintptr_t client_base);  // reader thread
+    void update_world(const Memory& mem, uintptr_t client_base);
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
                                    int screen_w, int screen_h);
     BombESP project_bomb(const Memory& mem, uintptr_t client_base,
@@ -116,20 +116,18 @@ public:
 
     int players_alive = 0;
 
-    // Diagnostics (temporary) -- which enumeration path is working, and how
-    // many entity-list slots it saw. If players is 0 and slots is 0, the chunk
-    // offset is wrong; if slots is large but players is 0, the filter is.
-    int  slots_found = 0;
-    bool enum_bulk   = false;
+    // ── temporary diagnostics (entity list) ───────────────────────────────
+    int  diag_slots = 0;   // valid entity-list pointers found
+    int  diag_hp    = 0;   // of those, how many read a sane health
+    int  diag_team  = 0;   // of those, how many read team 2/3
+    bool diag_bulk  = false;
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
 
 private:
-    // Everything below is discovered at runtime and validated, so an offset
-    // that moves after a game update degrades gracefully instead of lying.
     struct Calib {
-        uintptr_t chunk_off = offsets::kChunkOff;
+        uintptr_t chunk_off   = offsets::kChunkOff;
         uintptr_t slot_stride = offsets::kSlotStride;
 
         uintptr_t bone_node = 0, bone_arr = 0;
@@ -138,8 +136,10 @@ private:
 
         uintptr_t ctrl_link = 0;
         bool      ctrl_ok = false;
+        uintptr_t name_off = 0;
+        bool      name_ok = false;
 
-        uintptr_t wservices = 0, attrmgr = 0;
+        uintptr_t wservices = 0, wactive = 0, attrmgr = 0;
         bool      weapon_ok = false;
 
         uintptr_t node_origin = 0;
@@ -150,7 +150,6 @@ private:
 
     std::vector<Track> tracks_;
     bool   bomb_active_ = false;
-    double bomb_seen_ = 0.0;
     Vec3   bomb_origin_{};
     float  bomb_timer_ = -1.0f;
 };
