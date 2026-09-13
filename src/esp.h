@@ -34,4 +34,5 @@ public:
                                  const Matrix4x4& vm, int screen_w, int screen_h);
 private:
     uintptr_t get_entity(const Memory& mem, uintptr_t entity_list, int index) const;
+    uintptr_t resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t handle) const;
 };
