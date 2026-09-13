@@ -9,10 +9,11 @@
 #include "offsets.h"
 #include "bhop.h"
 
-Memory     g_mem;
-static ESP g_esp;
+Memory      g_mem;
+static ESP  g_esp;
 static bool g_running   = true;
 bool        g_menu_open = false; // extern'd in overlay.cpp
+HWND        g_cs2_hwnd  = nullptr; // extern'd in overlay.cpp
 
 struct Config {
     bool   esp_boxes     = true;
@@ -24,19 +25,16 @@ struct Config {
     ImVec4 color_team    = { 0.2f, 1.0f, 0.4f, 1.0f };
 } g_cfg;
 
-static int   g_screen_w  = 1920;
-static int   g_screen_h  = 1080;
-static HWND  g_cs2_hwnd  = nullptr;
+static int g_screen_w = 1920;
+static int g_screen_h = 1080;
 
-// ── Find CS2 window + read its exact client dimensions ───────────────────────
+// ── Find CS2 window and read its exact client dimensions ─────────────────────
 static bool find_cs2_window() {
     g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
     if (!g_cs2_hwnd) return false;
-
     RECT r{};
     if (!GetClientRect(g_cs2_hwnd, &r)) return false;
     if (r.right <= 0 || r.bottom <= 0)  return false;
-
     g_screen_w = r.right;
     g_screen_h = r.bottom;
     return true;
@@ -127,9 +125,9 @@ void render_menu() {
     ImGui::Separator();
 
     if (!g_mem.is_valid())
-        ImGui::TextColored({1.0f,0.6f,0.0f,1.0f}, "Waiting for CS2...");
+        ImGui::TextColored({ 1.0f, 0.6f, 0.0f, 1.0f }, "Waiting for CS2...");
     else {
-        ImGui::TextColored({0.4f,1.0f,0.4f,1.0f}, "Attached");
+        ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f }, "Attached");
         ImGui::Text("Resolution: %dx%d", g_screen_w, g_screen_h);
     }
 
@@ -138,17 +136,15 @@ void render_menu() {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // Wait until CS2's window exists so we have the right dimensions.
-    // This loop also means Orbital launched before CS2 just shows a
-    // brief spin rather than a black window at wrong resolution.
+    // Spin until CS2's window exists — reads client rect for correct dimensions.
     while (!find_cs2_window())
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Create overlay parented to CS2 at its exact client size.
+    // Overlay is a popup — no cross-process parenting.
+    // create() takes width/height only.
     Overlay overlay;
-    if (!overlay.create(g_cs2_hwnd, g_screen_w, g_screen_h)) return 1;
+    if (!overlay.create(g_screen_w, g_screen_h)) return 1;
 
-    // Memory attach + ESP update in background thread.
     std::thread mem_t(memory_thread);
 
     MSG msg{};
@@ -159,7 +155,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) g_running = false;
         }
 
-        // Hotkeys — GetAsyncKeyState & 1 fires once per press
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9)     & 1) g_running   = false;
         if (GetAsyncKeyState(VK_END)    & 1) g_running   = false;
