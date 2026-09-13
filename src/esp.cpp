@@ -1,4 +1,8 @@
 // --- src/esp.cpp ---
+// Entity scan: the exact iteration the previously WORKING version used
+// (list + 0x10 + 8*chunk, stride 0x78, 4 chunks x 512 slots, health/team
+// filter). Only additions bolted onto the same entities: bones, and
+// distance measured from the local pawn instead of world origin.
 #include "esp.h"
 #include "offsets.h"
 #include "sdk.h"
@@ -6,12 +10,9 @@
 #include <imgui.h>
 #include <cmath>
 
-// Head height fallback (used for the dot / box top when bone data is
-// unavailable). Same value your old code used.
-static constexpr float kHeadFallbackHeight = 70.0f;
+static constexpr float kHeadFallbackHeight = 70.0f; // dot fallback if bones are unavailable
 
-// One entire bone table (ids 0..27) read in a single ReadProcessMemory call:
-// 28 * 32 bytes.
+// One full bone table (ids 0..27) read in a single ReadProcessMemory call.
 struct BoneEntry {
     Vec3  pos;
     float pad[5];
@@ -31,39 +32,25 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     const Vec3 local_origin = mem.read<Vec3>(local_pawn + offsets::m_vOldOrigin);
 
     std::vector<PlayerData> fresh;
-    fresh.reserve(offsets::max_entities);
+    fresh.reserve(32);
 
-    // Chunk 0 of the entity list holds the 64 player controllers.
-    const uintptr_t ctrl_chunk =
-        mem.read<uintptr_t>(entity_list + sdk::list_chunk_offset);
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uintptr_t chunk_ptr = mem.read<uintptr_t>(
+            entity_list + sdk::list_chunk_offset + sizeof(uintptr_t) * (uintptr_t)chunk);
+        if (!chunk_ptr || chunk_ptr < 0x10000) continue;
 
-    if (ctrl_chunk && ctrl_chunk > 0x10000) {
-        for (int i = 0; i < offsets::max_entities; ++i) {
-            const uintptr_t controller =
-                mem.read<uintptr_t>(ctrl_chunk + sdk::list_entry_stride * (uintptr_t)i);
-            if (!controller || controller < 0x10000) continue;
+        for (int i = 0; i < 512; ++i) {
+            const uintptr_t entity = mem.read<uintptr_t>(
+                chunk_ptr + sdk::list_entry_stride * (uintptr_t)i);
+            if (!entity || entity < 0x10000 || entity == local_pawn) continue;
 
-            // Controller -> pawn handle -> pawn pointer (standard resolution).
-            const uint32_t pawn_handle =
-                mem.read<uint32_t>(controller + offsets::m_hPlayerPawn);
-            if (pawn_handle == 0xFFFFFFFFu) continue;
-
-            const uint32_t  idx  = pawn_handle & 0x7FFF;
-            const uintptr_t chunk = mem.read<uintptr_t>(
-                entity_list + sdk::list_chunk_offset + 8u * (idx >> 9));
-            if (!chunk || chunk < 0x10000) continue;
-
-            const uintptr_t pawn =
-                mem.read<uintptr_t>(chunk + sdk::list_entry_stride * (idx & 0x1FF));
-            if (!pawn || pawn < 0x10000 || pawn == local_pawn) continue;
-
-            const int health = mem.read<int>(pawn + offsets::m_iHealth);
+            const int health = mem.read<int>(entity + offsets::m_iHealth);
             if (health <= 0 || health > 100) continue;
 
-            const int team = mem.read<int>(pawn + offsets::m_iTeamNum) & 0xFF;
+            const int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
             if (team != 2 && team != 3) continue;
 
-            const Vec3 origin = mem.read<Vec3>(pawn + offsets::m_vOldOrigin);
+            const Vec3 origin = mem.read<Vec3>(entity + offsets::m_vOldOrigin);
             if (origin.x == 0.0f && origin.y == 0.0f) continue;
 
             PlayerData p{};
@@ -72,10 +59,13 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             p.team   = team;
 
             const Vec3 d = origin - local_origin;
-            p.distance   = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 40.0f;
+            p.distance = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) / 40.0f; // units -> ~metres
 
-            // ── bones: pawn -> scene node -> model state -> bone array ──
-            const uintptr_t scene_node = mem.read<uintptr_t>(pawn + offsets::m_pGameSceneNode);
+            // ── bones (optional add-on) ────────────────────────────────────
+            // entity -> scene node -> modelState -> boneArray pointer.
+            // If any hop fails, or the sanity check below fails, skeleton +
+            // head-dot fallback off silently. Boxes/health/distance never care.
+            const uintptr_t scene_node = mem.read<uintptr_t>(entity + offsets::m_pGameSceneNode);
             if (scene_node > 0x10000) {
                 const uintptr_t bone_array = mem.read<uintptr_t>(
                     scene_node + offsets::m_modelState + offsets::m_boneArray);
@@ -85,14 +75,14 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                         for (int b = 0; b < bones::count; ++b)
                             p.bone_pos[b] = buf[b].pos;
 
-                        // Sanity: the pelvis bone must sit near the pawn origin.
-                        // If your m_modelState value ever changes, this quietly
-                        // disables skeleton/dot-bones instead of drawing garbage.
+                        // Sanity: pelvis bone must sit near the pawn origin.
+                        // If m_modelState ever changes in a game update, this
+                        // disables bones instead of drawing garbage.
                         const Vec3 pel = p.bone_pos[bones::pelvis];
                         const float dx = pel.x - origin.x;
                         const float dy = pel.y - origin.y;
                         const float dz = pel.z - origin.z;
-                        p.bones_ok = (dx * dx + dy * dy + dz * dz) < (120.0f * 120.0f);
+                        p.bones_ok = (dx*dx + dy*dy + dz*dz) < (120.0f * 120.0f);
                     }
                 }
             }
@@ -121,7 +111,7 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
 
     result.reserve(snapshot.size());
     for (const auto& p : snapshot) {
-        Vec2 s_head, s_feet;
+        Vec2 s_feet, s_head;
 
         if (!WorldToScreen(p.origin, s_feet, vm, screen_w, screen_h)) continue;
 
