@@ -47,8 +47,8 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    bool bhop_enabled    = true;
-    bool bhop_input_mode = true;   // offset-free by default
+    // Bhop mode: BHOP_OFF / BHOP_INJECT (no CS2 writes) / BHOP_MEMORY (writes)
+    int  bhop_mode = BHOP_MEMORY;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -127,7 +127,7 @@ void memory_thread() {
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
     Bhop_Init();
-    Bhop_SetInputMode(g_cfg.bhop_input_mode);
+    Bhop_SetMode(g_cfg.bhop_mode);
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -319,29 +319,42 @@ static void tab_esp() {
 
 static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
-    ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
-    if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
-        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+    ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
+
+    if (ImGui::RadioButton("Off", g_cfg.bhop_mode == BHOP_OFF)) {
+        g_cfg.bhop_mode = BHOP_OFF;   Bhop_SetMode(BHOP_OFF);
+    }
+    if (ImGui::RadioButton("Inject keys  -  NO writes to CS2",
+                           g_cfg.bhop_mode == BHOP_INJECT)) {
+        g_cfg.bhop_mode = BHOP_INJECT; Bhop_SetMode(BHOP_INJECT);
+    }
+    if (ImGui::RadioButton("Write jump button  -  WRITES to CS2",
+                           g_cfg.bhop_mode == BHOP_MEMORY)) {
+        g_cfg.bhop_mode = BHOP_MEMORY; Bhop_SetMode(BHOP_MEMORY);
+    }
+
+    if (g_cfg.bhop_mode == BHOP_MEMORY)
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+                           "this mode writes 2 int32s to cs2.exe per jump");
+    else if (g_cfg.bhop_mode == BHOP_INJECT)
+        ImGui::TextDisabled("no memory writes; timing has OS jitter");
 
     const BhopDebug bd = Bhop_GetDebug();
 
-    if (g_cfg.bhop_input_mode) {
-        ImGui::Text("mode: synthesised spacebar");
-        ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
-    } else {
+    if (g_cfg.bhop_mode == BHOP_MEMORY) {
         ImGui::Text("button: 0x%06llX  %s",
             (unsigned long long)bd.offset,
             bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
         if (!bd.locked)
-            ImGui::TextDisabled("hold W or SPACE to confirm the address");
-        ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
+            ImGui::TextDisabled("hold SPACE to confirm the address");
     }
 
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("press edges: %d   %s",
-        bd.presses, bd.driving ? "[driving]" : "[idle]");
+    ImGui::TextDisabled("press edges: %d   %s   %s",
+        bd.presses, bd.driving ? "[driving]" : "[idle]",
+        bd.suppressing ? "[space swallowed]" : "");
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - space gate may misbehave");
@@ -424,7 +437,7 @@ void render_menu() {
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
-        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+        Bhop_SetMode(g_cfg.bhop_mode);
     }
     ImGui::SameLine();
     if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
