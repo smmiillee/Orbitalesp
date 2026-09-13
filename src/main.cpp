@@ -110,7 +110,7 @@ void render_esp(ImDrawList* dl) {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 400.0f, 290.0f }, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({ 400.0f, 310.0f }, ImGuiCond_Always);
     ImGui::SetNextWindowPos ({ 20.0f,  20.0f  }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr,
         ImGuiWindowFlags_NoResize |
