@@ -41,10 +41,9 @@ public:
             reinterpret_cast<LPCVOID>(address), out, size, nullptr) == TRUE;
     }
 
-    // Valid AND cs2.exe still running (a process handle signals on exit).
+    // Exactly what your working build had.
     bool is_valid() const {
-        if (!process_handle || client_dll == 0) return false;
-        return WaitForSingleObject(process_handle, 0) != WAIT_OBJECT_0;
+        return process_handle != nullptr && client_dll != 0;
     }
 
     uintptr_t get_module_base(DWORD pid, const std::wstring& module_name) const;
