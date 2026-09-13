@@ -1,7 +1,11 @@
 // --- src/esp.h ---
 #pragma once
-#include <vector>
+#include <array>
+#include <cstdint>
 #include <mutex>
+#include <unordered_map>
+#include <vector>
+
 #include "memory.h"
 #include "offsets.h"
 
@@ -9,38 +13,82 @@ struct Vec3 { float x, y, z; };
 struct Vec2 { float x, y; };
 struct Matrix4x4 { float m[4][4]; };
 
-// Only world-space data stored — screen projection done fresh each render frame
-struct PlayerData {
-    Vec3  origin;   // feet world position
-    int   health;
-    int   team;
-    float distance;
+// ── CS2 skeleton bone ids ────────────────────────────────────────────────
+// Indices match the current a2x dumps. The two hand bones are the only ones
+// that drift between dumps -- if the hands look off by one, try 10 and 15.
+enum BoneId : int {
+    BONE_PELVIS     = 0,
+    BONE_SPINE_1    = 2,
+    BONE_SPINE      = 4,
+    BONE_NECK       = 5,
+    BONE_HEAD       = 6,
+    BONE_L_SHOULDER = 8,
+    BONE_L_ARM      = 9,
+    BONE_L_HAND     = 11,
+    BONE_R_SHOULDER = 13,
+    BONE_R_ARM      = 14,
+    BONE_R_HAND     = 16,
+    BONE_L_HIP      = 22,
+    BONE_L_KNEE     = 23,
+    BONE_L_FOOT     = 24,
+    BONE_R_HIP      = 25,
+    BONE_R_KNEE     = 26,
+    BONE_R_FOOT     = 27,
+    BONE_COUNT      = 28,
 };
 
-// Screen-space result computed fresh every render frame
+// World-space data, filled by the reader thread.
+struct PlayerData {
+    uintptr_t pawn = 0;
+    Vec3  origin{};                                  // feet
+    Vec3  head{};                                    // bone 6 (or origin+70 fallback)
+    std::array<Vec3, BONE_COUNT> bones{};
+    std::array<bool, BONE_COUNT> bone_ok{};
+    bool  has_bones = false;
+    int   health = 0;
+    int   team = 0;
+    float distance = 0.0f;
+};
+
+// Screen-space result, recomputed fresh every render frame.
 struct PlayerESP {
-    Vec2  screen_head;
-    Vec2  screen_feet;
-    int   health;
-    int   team;
-    float distance;
-    float box_h;
-    float box_w;
+    Vec2  screen_head{};
+    Vec2  screen_feet{};
+    std::array<Vec2, BONE_COUNT> bones{};
+    std::array<bool, BONE_COUNT> bone_ok{};
+    bool  has_bones = false;
+    int   health = 0;
+    int   team = 0;
+    float distance = 0.0f;
+    float box_h = 0.0f;
+    float box_w = 0.0f;
 };
 
 class ESP {
 public:
-    // World-space data updated by memory thread
+    // World-space data updated by the reader thread.
     std::vector<PlayerData> world_players;
-    std::mutex              world_mutex;
+    std::mutex world_mutex;
 
-    // Called by memory thread — stores world positions only
     void update_world(const Memory& mem, uintptr_t client_base);
 
-    // Called by render thread — reads fresh view matrix, projects to screen
+    // Fresh view matrix read for THIS frame, plus interpolation of the
+    // 64 Hz game positions up to the current render rate.
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
-                                    int screen_w, int screen_h);
+                                   int screen_w, int screen_h);
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
-                                 const Matrix4x4& vm, int screen_w, int screen_h);
+                                const Matrix4x4& vm, int screen_w, int screen_h);
+
+private:
+    // Render-thread-only interpolation state. This is what removes the
+    // "boxes jitter while moving the mouse" stepping.
+    struct Smooth {
+        Vec3  origin{};
+        Vec3  head{};
+        std::array<Vec3, BONE_COUNT> bones{};
+        bool  init = false;
+        uint64_t last_frame = 0;
+    };
+    std::unordered_map<uintptr_t, Smooth> smooth_;
 };
