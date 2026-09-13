@@ -14,27 +14,45 @@ struct Vec2 { float x, y; };
 struct Matrix4x4 { float m[4][4]; };
 
 // ── CS2 skeleton bone ids ────────────────────────────────────────────────
-// The two hand bones are the only ones that drift between dumps -- if the
-// hands look off by one, try 10 and 15.
+// CURRENT map (post animgraph_2_beta). Valve renumbered every bone in the
+// April 2026 animation update, and the previous map silently produced a
+// garbled skeleton instead of failing -- head was reading the NECK, and the
+// legs were reading unrelated bones.
+//
+//   old -> new:  pelvis 0->1,  neck 5->6,  head 6->7,
+//                shoulders 8/13->9/13,  elbows 9/14->10/14,  hands 11/16->11/15,
+//                hips 22/25->17/20,  knees 23/26->18/21,  feet 24/27->19/22
+//
+// Source: a2x/cs2-dumper #583 and the v2026 bone index table.
+// If Valve ever migrates the remaining models again, this is the ONE block to
+// change -- nothing else in the project depends on the numbering.
 enum BoneId : int {
-    BONE_PELVIS     = 0,
-    BONE_SPINE_1    = 2,
-    BONE_SPINE      = 4,
-    BONE_NECK       = 5,
-    BONE_HEAD       = 6,
-    BONE_L_SHOULDER = 8,
-    BONE_L_ARM      = 9,
+    BONE_ORIGIN     = 0,
+    BONE_PELVIS     = 1,
+    BONE_SPINE_0    = 2,
+    BONE_SPINE_1    = 3,
+    BONE_SPINE_2    = 4,
+    BONE_NECK       = 6,
+    BONE_HEAD       = 7,
+    BONE_CLAVICLE_L = 8,
+    BONE_L_SHOULDER = 9,
+    BONE_L_ELBOW    = 10,
     BONE_L_HAND     = 11,
+    BONE_CLAVICLE_R = 12,
     BONE_R_SHOULDER = 13,
-    BONE_R_ARM      = 14,
-    BONE_R_HAND     = 16,
-    BONE_L_HIP      = 22,
-    BONE_L_KNEE     = 23,
-    BONE_L_FOOT     = 24,
-    BONE_R_HIP      = 25,
-    BONE_R_KNEE     = 26,
-    BONE_R_FOOT     = 27,
-    BONE_COUNT      = 28,
+    BONE_R_ELBOW    = 14,
+    BONE_R_HAND     = 15,
+    BONE_L_HIP      = 17,
+    BONE_L_KNEE     = 18,
+    BONE_L_FOOT     = 19,
+    BONE_R_HIP      = 20,
+    BONE_R_KNEE     = 21,
+    BONE_R_FOOT     = 22,
+    BONE_CHEST      = 23,
+    BONE_GUN        = 24,
+    BONE_EYE_L      = 25,
+    BONE_EYE_R      = 26,
+    BONE_COUNT      = 32,
 };
 
 // World-space data, filled by the reader thread.
