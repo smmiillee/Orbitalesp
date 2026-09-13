@@ -1,19 +1,12 @@
 // --- src/bhop.cpp ---
 // Bhop via CS2 button system write.
-// The jump button is a CCSGOInputButton struct in client.dll.
-// Writing buttonState = 3 (held) triggers the jump on landing.
-// Offset from your September 11 build — re-dump if CS2 updates.
+// jump button offset from a2x/cs2-dumper buttons.hpp 2026-08-29
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 #include <Windows.h>
 
-// CCSGOInputButton layout:
-//   +0x00: uint64 buttonFlags  (current held state)
-//   +0x08: uint64 buttonState  (write 3 = pressed this tick)
-//   +0x10: uint64 buttonState2
-// Writing 65537 (0x10001) to buttonFlags triggers jump in CS2's input system
-constexpr uintptr_t dwJumpButton    = 0x1813610; // client.dll buttons::jump (Sept 2026 build)
+constexpr uintptr_t dwJumpButton    = 0x20B3E00; // client.dll buttons::jump
 constexpr uintptr_t m_hGroundEntity = 0x50C;
 
 void BhopTick() {
@@ -21,6 +14,8 @@ void BhopTick() {
 
     if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
         wasInAir = false;
+        // Clear button when space released
+        g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
         return;
     }
 
@@ -32,10 +27,10 @@ void BhopTick() {
     bool inAir = (ground == 0xFFFFFFFF);
 
     if (!inAir) {
-        // On ground holding space — force jump button state
+        // On ground holding space — write jump
         g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 65537ULL);
     } else {
-        // In air — clear it so we don't double-jump
+        // In air — clear so we don't hold jump
         g_mem.write<uint64_t>(g_mem.client_dll + dwJumpButton, 0ULL);
     }
 
