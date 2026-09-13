@@ -29,8 +29,8 @@ struct Config {
     bool  esp_skeleton = true;
     bool  esp_head_dot = true;
     bool  esp_bomb     = true;
-    bool  show_enemies = true;
-    bool  show_team    = true;
+    bool  esp_show_enemies = true;
+    bool  esp_show_team    = true;
     float box_thickness = 0.5f;
 
     // colours -- per visual, as requested
