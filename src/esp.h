@@ -1,21 +1,18 @@
 // --- src/esp.h ---
 #pragma once
 #include <vector>
-#include <array>
 #include "memory.h"
 #include "offsets.h"
 
 struct Vec3 { float x, y, z; };
 struct Vec2 { float x, y; };
 
-struct Matrix4x4 {
-    float m[4][4];
-};
+struct Matrix4x4 { float m[4][4]; };
 
 struct PlayerESP {
     Vec3  origin;
-    Vec2  screen_head;  // top of head in screen space  (was screen_pos — renamed to match main.cpp)
-    Vec2  screen_feet;  // feet in screen space
+    Vec2  screen_head;
+    Vec2  screen_feet;
     int   health;
     int   team;
     bool  visible;
