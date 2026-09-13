@@ -49,19 +49,16 @@ static void calibrate(const Memory& mem, uintptr_t entity_list,
 }
 
 void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int screen_h) {
-    players.clear();
-    debug_total_controllers = 0;
-    debug_valid_pawns       = 0;
-    debug_alive             = 0;
-    debug_positioned        = 0;
-    debug_on_screen         = 0;
-    debug_sample_health     = 0;
-    debug_sample_team       = 0;
+    std::vector<PlayerESP> new_players;
 
     Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
-    if (!entity_list || !local_pawn) return;
+    if (!entity_list || !local_pawn) {
+        std::lock_guard<std::mutex> lock(players_mutex);
+        players.clear();
+        return;
+    }
 
     static uintptr_t s_off = 0, s_stride = 0;
     static bool s_done = false;
@@ -70,33 +67,25 @@ void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int scr
         s_done = true;
     }
 
-    debug_sample_health = (int)s_off;
-    debug_sample_team   = (int)s_stride;
-
     for (int chunk = 0; chunk < 4; chunk++) {
         uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + s_off + 8 * chunk);
         if (!chunk_ptr || chunk_ptr < 0x10000) continue;
 
         for (int i = 0; i < 512; i++) {
             uintptr_t entity = mem.read<uintptr_t>(chunk_ptr + s_stride * i);
-            if (!entity || entity < 0x10000) continue;
-            if (entity == local_pawn) continue;
-            debug_total_controllers++;
+            if (!entity || entity < 0x10000 || entity == local_pawn) continue;
 
             int health = mem.read<int>(entity + offsets::m_iHealth);
             if (health <= 0 || health > 100) continue;
-            debug_valid_pawns++;
 
             int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
             if (team != 2 && team != 3) continue;
-            debug_alive++;
 
             Vec3 origin;
             origin.x = mem.read<float>(entity + offsets::m_vOldOrigin);
             origin.y = mem.read<float>(entity + offsets::m_vOldOrigin + 4);
             origin.z = mem.read<float>(entity + offsets::m_vOldOrigin + 8);
             if (origin.x == 0.0f && origin.y == 0.0f) continue;
-            debug_positioned++;
 
             Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
             Vec2 screen_head, screen_feet;
@@ -105,18 +94,21 @@ void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int scr
 
             float box_h = screen_feet.y - screen_head.y;
             if (box_h < 5.0f) continue;
-            debug_on_screen++;
 
             float dist = std::sqrt(
                 origin.x * origin.x +
                 origin.y * origin.y +
                 origin.z * origin.z) / 40.0f;
 
-            players.push_back({
+            new_players.push_back({
                 origin, screen_head, screen_feet,
                 health, team, true, dist,
                 box_h, box_h * 0.45f
             });
         }
     }
+
+    // Swap under lock — render thread never sees a partial write
+    std::lock_guard<std::mutex> lock(players_mutex);
+    players = std::move(new_players);
 }
