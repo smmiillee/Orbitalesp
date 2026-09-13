@@ -1,22 +1,20 @@
 // --- src/bhop.cpp ---
-// Bhop via the CS2 jump button.
+// Bhop: either the CS2 jump button, or a synthesised spacebar.
 //
 //   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
 //
 // The button block is 13 dwords on a 0x90 stride:
 //   sprint -0x630  reload -0x5A0  attack -0x510  attack2 -0x480
-//   turnleft -0x3F0  turnright -0x360  forward -0x2D0  back -0x240
-//   left -0x1B0  right -0x120  use -0x090  JUMP  duck +0x090
+//   turnleft -0x3F0 turnright -0x360 forward -0x2D0 back -0x240
+//   left -0x1B0     right -0x120     use -0x090      JUMP   duck +0x090
 //
-// WHY THE OLD SCANNER NEVER LOCKED: it walked every 4-byte-aligned dword in a
-// 512 KB window and, for each one holding 0 or 256 (i.e. essentially every zero
-// dword in memory), issued 13 SEPARATE syscalls to test the block. That is
-// ~1.7 million reads per sweep, so it never finished -- which is why the menu
-// sat on "[searching]" forever.
+// INPUT MODE is the default because it is offset-free. It auto-jumps while
+// grounded; it does NOT read the spacebar, precisely so its own injected
+// keystrokes can't feed back into that test.
 //
-// The rewrite filters with a bitmap over each already-read page, so the search
-// costs almost no syscalls, and candidates are then proven against the keys you
-// are actually holding.
+// MEMORY MODE never locks on a guess. A lock requires the candidate block to
+// validate against a key you are physically holding, so a region of zeros can
+// never masquerade as the button block.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -44,20 +42,14 @@ constexpr intptr_t kRel[] = {
 };
 constexpr int kSlotCount = static_cast<int>(sizeof(kRel) / sizeof(kRel[0]));
 constexpr int kJumpSlot  = 11;
-constexpr int kFwdSlot   = 6;
 
-// Tried first, best guess first. A block that validates instantly is proof
-// enough, so this is just a shortcut to avoid sweeping.
+// Only hints. A lock still has to be confirmed by a held key.
 constexpr uintptr_t kCandidates[] = {
-    0x2095490, // a2x current dump
-    0x2096490, // +0x1000, if this build is one step newer
-    0x2094490, // ExitScam 2026-07-09
-    0x2093490, // a2x, earlier
-    0x205BAF0, // a2x, early 2026
+    0x2095490, 0x2096490, 0x2094490, 0x2093490, 0x205BAF0,
 };
 
 std::atomic<bool>      g_stop{false}, g_started{false}, g_locked{false};
-std::atomic<bool>      g_scanning{false}, g_input_mode{false};
+std::atomic<bool>      g_scanning{false}, g_input_mode{true};
 std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
 std::atomic<bool>      g_dbg_ground{false};
 std::atomic<bool>      g_dbg_focused{false};
@@ -73,8 +65,8 @@ double now_ms() {
 }
 
 // ~1 ms sleep that actually works: sleep the bulk, spin the last stretch.
-// Plain sleep_for(1ms) on Windows really sleeps ~15.6 ms -- a full game tick,
-// enough on its own to make bhop miss every landing.
+// Plain sleep_for(1ms) on Windows really sleeps ~15.6 ms -- a whole game tick,
+// which is enough on its own to make bhop miss every landing.
 void wait_ms(int ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(ms);
@@ -121,11 +113,11 @@ bool plausible_dw(uint32_t v) {
     }
 }
 
-// Validates the whole 13-slot block anchored at `j`.
+// Validates the whole 13-slot block anchored at j.
 //   * a slot the user IS holding must have its down bit set
 //   * a slot the user is NOT holding must read exactly 0 or 256
-//   * `require_evidence` additionally demands at least two non-zero slots, so a
-//     long run of zeros cannot masquerade as a button block
+//   * require_evidence additionally demands two non-zero slots, so a long run
+//     of zeros cannot masquerade as a button block
 bool block_valid(uintptr_t j, int mask, bool require_evidence) {
     int pressed = 0, released_nonzero = 0;
     for (int i = 0; i < kSlotCount; ++i) {
@@ -143,9 +135,9 @@ bool block_valid(uintptr_t j, int mask, bool require_evidence) {
     return true;
 }
 
-// Sweep for a pressed dword (low bit set) and check the block around it.
-// Only a handful of dwords in the whole window are ever pressed, so this is
-// the cheap and unambiguous path -- and it uses YOUR key presses as proof.
+// Decisive path: find a dword with its down bit set, then work out where the
+// block's jump slot would have to be for the held key to explain it. This uses
+// YOUR key presses as proof, so it cannot lock onto a coincidence.
 uintptr_t scan_pressed(int mask) {
     const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
     const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
@@ -156,7 +148,7 @@ uintptr_t scan_pressed(int mask) {
 
     for (uintptr_t a = lo; a + PIECE <= hi; a += PIECE) {
         if (g_stop.load()) return 0;
-        if (held_mask() != mask) return 0;        // keys changed, retry later
+        if (held_mask() != mask) return 0;      // keys changed, retry later
         if (!g_mem.read_bytes(a, buf.data(), PIECE)) continue;
 
         for (size_t k = 0; k + 4 <= PIECE; k += 4) {
@@ -165,17 +157,27 @@ uintptr_t scan_pressed(int mask) {
             if ((v & 1u) == 0u) continue;
             if (!plausible_dw(v)) continue;
 
-            const uintptr_t cand = a + k;
-            if (!block_valid(cand, mask, false)) continue;
-            return cand;
+            const uintptr_t p = a + k;
+
+            // If this dword is slot i of a block, the jump address is p-kRel[i].
+            for (int i = 0; i < kSlotCount; ++i) {
+                if (!((mask >> i) & 1)) continue;
+                const uintptr_t jump =
+                    p - static_cast<uintptr_t>(kRel[i]);
+                if (jump < g_mem.client_dll) continue;
+                if (!block_valid(jump, mask, false)) continue;
+                return jump;
+            }
         }
     }
     return 0;
 }
 
-// Nothing held: find 13-slot runs of plausible dwords using a bitmap over the
-// page, so the scan costs no syscalls until a candidate actually passes.
-uintptr_t scan_idle() {
+// Nothing held: collect candidates with a bitmap over the already-read page so
+// the sweep costs almost no syscalls. These are only candidates -- they still
+// need a held key to confirm.
+void collect_candidates(std::vector<uintptr_t>& out) {
+    out.clear();
     const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
     const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
     constexpr size_t PIECE = 0x40000;
@@ -183,10 +185,8 @@ uintptr_t scan_idle() {
     static std::vector<uint8_t> buf, flag;
     if (buf.size() < PIECE) { buf.resize(PIECE); flag.resize(PIECE / 4); }
 
-    std::vector<uintptr_t> cands;
-
     for (uintptr_t a = lo; a + PIECE <= hi; a += PIECE) {
-        if (g_stop.load()) return 0;
+        if (g_stop.load()) return;
         if (!g_mem.read_bytes(a, buf.data(), PIECE)) continue;
 
         for (size_t k = 0; k + 4 <= PIECE; k += 4) {
@@ -197,61 +197,51 @@ uintptr_t scan_idle() {
 
         for (size_t off = 0x640; off + 0x94 <= PIECE; off += 4) {
             bool ok = true;
-            int  nonzero = 0;
-            for (int i = 0; i < kSlotCount; ++i) {
+            for (int i = 0; i < kSlotCount && ok; ++i) {
                 const intptr_t pos = static_cast<intptr_t>(off) + kRel[i];
-                if (pos < 0 || pos + 4 > static_cast<intptr_t>(PIECE)) {
-                    ok = false; break;
-                }
-                if (!flag[pos / 4]) { ok = false; break; }
-                uint32_t v = 0;
-                std::memcpy(&v, buf.data() + pos, 4);
-                if (v) ++nonzero;
+                if (pos < 0 || pos + 4 > static_cast<intptr_t>(PIECE)) ok = false;
+                else if (!flag[pos / 4]) ok = false;
             }
-            if (!ok || nonzero < 2) continue;
-            cands.push_back(a + off);
-            if (cands.size() >= 24) break;
+            if (!ok) continue;
+            out.push_back(a + off);
+            if (out.size() >= 32) return;
         }
-        if (cands.size() >= 24) break;
     }
-
-    g_dbg_cands.store(static_cast<int>(cands.size()));
-
-    for (uintptr_t c : cands) {
-        if (g_stop.load()) return 0;
-        if (!block_valid(c, 0, true)) continue;
-        wait_ms(25);
-        if (!block_valid(c, held_mask(), true)) continue;
-        return c;
-    }
-    return 0;
 }
 
 void scan_thread_main() {
     for (int i = 0; i < 150 && !g_stop.load(); ++i) wait_ms(10);
+
+    std::vector<uintptr_t> candidates;
 
     while (!g_stop.load()) {
         if (g_locked.load()) { wait_ms(500); continue; }
 
         g_scanning.store(true);
 
+        const int mask = held_mask();
         uintptr_t hit = 0;
 
-        // 1. known candidates (instant when one is right)
+        // 1. known hints, confirmed against held keys
         for (uintptr_t off : kCandidates) {
             const uintptr_t abs = g_mem.client_dll + off;
-            const int m = held_mask();
-            if (block_valid(abs, m, m == 0)) { hit = abs; break; }
+            if (block_valid(abs, mask, mask == 0)) { hit = abs; break; }
         }
 
-        // 2. proven against held keys
-        if (!hit) {
-            const int m = held_mask();
-            if (m) hit = scan_pressed(m);
+        // 2. decisive: a key you are holding proves the block
+        if (!hit && mask) hit = scan_pressed(mask);
+
+        // 3. candidates gathered while idle, now confirmable
+        if (!hit && mask) {
+            for (uintptr_t c : candidates)
+                if (block_valid(c, mask, false)) { hit = c; break; }
         }
 
-        // 3. structural sweep
-        if (!hit) hit = scan_idle();
+        // 4. refresh candidates (cheap, no per-candidate syscalls yet)
+        if (!hit && !mask) {
+            collect_candidates(candidates);
+            g_dbg_cands.store(static_cast<int>(candidates.size()));
+        }
 
         if (hit) {
             g_jump_offset.store(hit - g_mem.client_dll);
@@ -259,7 +249,7 @@ void scan_thread_main() {
         }
         g_scanning.store(false);
 
-        if (!g_locked.load()) wait_ms(300);
+        if (!g_locked.load()) wait_ms(mask ? 50 : 300);
     }
 }
 
@@ -271,7 +261,7 @@ struct GroundWatch {
     double z_changed = 0.0;
     bool   z_ground = true;
     int    flag_g = 0, flag_a = 0;
-    int    hge_g  = 0, hge_a  = 0;
+    int    hge_g = 0, hge_a = 0;
     bool   flag_ok = false, hge_ok = false;
 };
 GroundWatch g_gw;
@@ -279,14 +269,6 @@ GroundWatch g_gw;
 bool sample_ground(const Memory& mem, uintptr_t pawn) {
     const double now = now_ms();
 
-    // Z comes from m_vOldOrigin, which is VERIFIED (the ESP aligns), so it is
-    // the reference the other two signals are graded against.
-    //
-    // m_fFlags and m_hGroundEntity are NOT verified for this build, which is
-    // exactly why they are graded rather than trusted: each one has to be seen
-    // set while Z is static AND clear while Z is moving before it is allowed
-    // to influence the verdict. A wrong offset therefore degrades the result
-    // instead of breaking it.
     const float    z   = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
     const uint32_t fl  = mem.read<uint32_t>(pawn + offsets::m_fFlags);
     const uint32_t hge = mem.read<uint32_t>(pawn + offsets::m_hGroundEntity);
@@ -303,27 +285,37 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
         if (hge == 0xFFFFFFFFu)  ++g_gw.hge_a;
     }
 
+    // A signal is trusted only after it has been seen in BOTH states.
     if (!g_gw.flag_ok && g_gw.flag_g >= 6 && g_gw.flag_a >= 6) g_gw.flag_ok = true;
     if (!g_gw.hge_ok  && g_gw.hge_g  >= 6 && g_gw.hge_a  >= 6) g_gw.hge_ok  = true;
 
-    int sig = 1;                       // z is always available
+    int sig = 1;
     if (g_gw.flag_ok) sig |= 2;
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
 
-    // Grounded if Z is static, or if a signal that has actually proven itself
-    // agrees. Height- and surface-independent either way.
-    const bool ground = g_gw.z_ground
-                     || (g_gw.flag_ok && (fl & 1u))
-                     || (g_gw.hge_ok  && hge != 0xFFFFFFFFu);
+    // The flag is instance-accurate where the Z test needs a 22 ms window, so
+    // once it has proven itself it becomes the primary signal. That matters for
+    // bhop, where the grounded frame can be a single tick.
+    bool ground;
+    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
+    else              ground = g_gw.z_ground;
+
+    if (g_gw.hge_ok) ground = ground || (hge != 0xFFFFFFFFu);
+
     g_dbg_ground.store(ground);
     return ground;
 }
 
 // ── input mode: no offsets, cannot go stale ──────────────────────────────
-// Hold the synthetic spacebar while grounded, release it while airborne. That
-// is exactly the macro a bhop script performs, and it needs no memory access.
+// Hold the synthetic spacebar while grounded, release while airborne. That is
+// the macro a bhop script performs. Deliberately does NOT read the spacebar,
+// because SendInput feeds back into GetAsyncKeyState and would latch itself on.
 void inject_space(bool down) {
+    static bool s_down = false;
+    if (down == s_down) return;      // only send on change
+    s_down = down;
+
     INPUT in{};
     in.type = INPUT_KEYBOARD;
     in.ki.wVk = VK_SPACE;
@@ -337,9 +329,8 @@ void bhop_thread_main() {
         g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(), kJumpRelease);
 
     uintptr_t pawn = 0;
-    double    pawn_at = 0.0, last_sample = 0.0, last_check = 0.0;
+    double    pawn_at = 0.0, last_sample = 0.0;
     bool      ground = false;
-    int       check_fail = 0;
 
     while (!g_stop.load()) {
         wait_ms(1);
@@ -348,32 +339,11 @@ void bhop_thread_main() {
         const bool focused = cs2_focused();
         g_dbg_focused.store(focused);
 
-        const bool space = key_down(VK_SPACE);
-
-        // ── input mode ────────────────────────────────────────────────────
-        if (g_input_mode.load()) {
-            if (!focused || !space) { continue; }
-            const double now = now_ms();
-            if (!pawn || now - pawn_at > 500.0) {
-                pawn = g_mem.read<uintptr_t>(
-                    g_mem.client_dll + offsets::dwLocalPlayerPawn);
-                pawn_at = now;
-            }
-            if (!pawn) continue;
-
-            if (now - last_sample >= 2.0) {
-                last_sample = now;
-                ground = sample_ground(g_mem, pawn);
-            }
-            inject_space(ground);
-            continue;
-        }
-
-        // ── memory mode ───────────────────────────────────────────────────
-        const uintptr_t jump_addr = g_mem.client_dll + g_jump_offset.load();
-
-        if (!focused || !space) {
-            g_mem.write<int32_t>(jump_addr, kJumpRelease);
+        // Outside the game, make sure nothing is left held down.
+        if (!focused) {
+            if (g_input_mode.load()) inject_space(false);
+            else g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
+                                      kJumpRelease);
             continue;
         }
 
@@ -383,39 +353,28 @@ void bhop_thread_main() {
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             pawn_at = now;
         }
-        if (!pawn) {
-            g_mem.write<int32_t>(jump_addr, kJumpRelease);
-            continue;
-        }
+        if (!pawn) continue;
 
-        // Self-check: if a movement key is held but its slot is not pressed,
-        // this is not the button block. Drop the lock and rescan. The jump slot
-        // is excluded because we deliberately write 256 there while airborne.
-        if (g_locked.load() && now - last_check > 1000.0) {
-            last_check = now;
-            const int m = held_mask() & ~(1 << kJumpSlot);
-            if (m) {
-                bool ok = true;
-                for (int i = 0; i < kSlotCount && ok; ++i) {
-                    if (!((m >> i) & 1)) continue;
-                    if ((g_mem.read<uint32_t>(jump_addr + kRel[i]) & 1u) == 0u)
-                        ok = false;
-                }
-                if (!ok && ++check_fail > 3) { g_locked.store(false); check_fail = 0; }
-                else if (ok) check_fail = 0;
-            }
-        }
-
+        // 2 ms sampling: the grounded frame can be a single 15.6 ms tick, so
+        // this needs to be comfortably faster than a tick.
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
-        // Grounded -> press, which re-jumps on every landing. Airborne ->
-        // release, so the next landing is always a fresh press edge. Both are
-        // height- and surface-independent.
-        g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
+        if (g_input_mode.load()) {
+            // Grounded -> hold jump, which re-jumps on every landing.
+            // Airborne -> release, so the next landing is a fresh press edge.
+            inject_space(ground);
+        } else {
+            if (!g_locked.load()) continue;   // never write to an unconfirmed address
+            const uintptr_t jump_addr =
+                g_mem.client_dll + g_jump_offset.load();
+            g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
+        }
     }
+
+    if (g_input_mode.load()) inject_space(false);
 }
 
 } // namespace
@@ -432,6 +391,7 @@ void Bhop_Init() {
 
 void Bhop_Shutdown() {
     g_stop.store(true);
+    inject_space(false);
     if (g_bhop_thread.joinable()) g_bhop_thread.join();
     if (g_scan_thread.joinable()) g_scan_thread.join();
     g_started.store(false);
