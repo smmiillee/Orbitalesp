@@ -4,29 +4,27 @@
 
 // Bhop has two backends:
 //
-//  * memory mode (default) - writes the CS2 jump button. Fast and clean, but
-//    the button offset moves on every CS2 update, so it is resolved at runtime
-//    by Bhop_DetectJump() instead of being hard-coded.
+//  * memory mode (default) - writes the CS2 jump button. The button address
+//    moves on every CS2 update, so it is found at runtime by watching the
+//    button block while you play. No keys to hold, no manual offsets.
 //
 //  * input mode - synthesises a spacebar through SendInput. Needs no offsets
-//    at all, so it survives any game update, but it depends on the game
-//    accepting injected input and on CS2 being the foreground window.
-void Bhop_Init();
-void BhopTick();
+//    at all, but depends on CS2 accepting injected input.
+struct BhopDebug {
+    uintptr_t offset        = 0;      // current jump-button offset
+    uint32_t  live_value    = 0;      // live dword at that address
+    bool      on_ground     = false;  // combined ground verdict
+    uint32_t  flags         = 0;      // m_fFlags
+    uint32_t  ground_entity = 0;      // m_hGroundEntity
+    bool      locked        = false;  // address confirmed by the scanner
+    bool      scanning      = false;  // sweep in progress
+};
 
-// ── runtime jump-button discovery ─────────────────────────────────────────
-// Hold W (or SPACE) while calling, so the scanner has a pressed slot to lock
-// onto. Returns:
-//    1 = found using the held key   (reliable)
-//    0 = found structurally only    (verify with Bhop_LiveJumpValue())
-//   -1 = not found                 (hold W or SPACE and try again)
-int Bhop_DetectJump();
+void Bhop_Init();      // starts the bhop + scanner threads (after attach)
+void Bhop_Shutdown();  // stops and joins them
 
-uintptr_t Bhop_JumpOffset();               // offset relative to client.dll
-void      Bhop_SetJumpOffset(uintptr_t off);
-uint32_t  Bhop_LiveJumpValue();            // live dword at the jump address
-bool      Bhop_IsOnGround();
+BhopDebug Bhop_GetDebug();
+void      Bhop_Rescan();  // forget the locked address and sweep again
 
-// ── input-mode fallback ───────────────────────────────────────────────────
 void Bhop_SetInputMode(bool enabled);
 bool Bhop_InputMode();
