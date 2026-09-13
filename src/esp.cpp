@@ -19,19 +19,17 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
-// Entity list structure:
-//   entity_list + ((index >> 9) + 1) * 8  -> chunk pointer
-//   chunk        + (index & 0x1FF) * 0x78 -> IGameObject* (controller)
+// entity_list + 8*((index>>9)+1) -> chunk
+// chunk       + 0x78*(index&0x1FF) -> controller ptr
 uintptr_t ESP::get_entity(const Memory& mem, uintptr_t entity_list, int index) const {
     uintptr_t chunk = mem.read<uintptr_t>(entity_list + 8 * ((index >> 9) + 1));
     if (!chunk) return 0;
     return mem.read<uintptr_t>(chunk + 0x78 * (index & 0x1FF));
 }
 
-// Resolve a CHandle<> (stored as uint32) to its pawn pointer via entity list.
-// CHandle encodes entity index in bits 0-14, serial in bits 15-29.
+// CHandle<> uint32: bits 0-14 = entity index — resolve through entity list
 uintptr_t ESP::resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t handle) const {
-    if (handle == 0xFFFFFFFF) return 0;
+    if (!handle || handle == 0xFFFFFFFF) return 0;
     int index = handle & 0x7FFF;
     uintptr_t chunk = mem.read<uintptr_t>(entity_list + 8 * ((index >> 9) + 1));
     if (!chunk) return 0;
@@ -46,43 +44,32 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
-    int local_team = mem.read<int>(local_pawn + offsets::m_iTeamNum);
-
-    // Read screen size from engine2.dll would need a second module base.
-    // Use compile-time constants — main.cpp passes actual res to render_esp.
+    // Read screen dimensions — hardcoded here, main.cpp culls by actual res
     constexpr int W = 1920, H = 1080;
 
     for (int i = 0; i < offsets::max_entities; ++i) {
-        // Get the controller for entity slot i
         uintptr_t controller = get_entity(mem, entity_list, i);
-        if (!controller || controller == local_pawn) continue;
+        if (!controller) continue;
 
-        // Resolve m_hPlayerPawn handle -> actual pawn pointer
+        // Decode m_hPlayerPawn CHandle -> pawn pointer
         uint32_t pawn_handle = mem.read<uint32_t>(controller + offsets::m_hPlayerPawn);
         uintptr_t pawn = resolve_handle(mem, entity_list, pawn_handle);
         if (!pawn || pawn == local_pawn) continue;
 
-        // Alive check
+        // Life check: 0 = alive
         uint8_t life = mem.read<uint8_t>(pawn + offsets::m_lifeState);
-        if (life != 0) continue; // 0 = LIFE_ALIVE
+        if (life != 0) continue;
 
-        // Health
         int health = mem.read<int>(pawn + offsets::m_iHealth);
         if (health <= 0 || health > 100) continue;
 
-        // Team
         int team = mem.read<int>(pawn + offsets::m_iTeamNum);
 
-        // Scene node -> world origin
-        uintptr_t scene_node = mem.read<uintptr_t>(pawn + offsets::m_pGameSceneNode);
-        if (!scene_node) continue;
-
-        Vec3 origin = mem.read<Vec3>(scene_node + offsets::m_nodeToWorld);
-
-        // Sanity check — invalid reads produce garbage coords
+        // m_vOldOrigin: world position directly on pawn — no scene node needed
+        Vec3 origin = mem.read<Vec3>(pawn + offsets::m_vOldOrigin);
         if (origin.x == 0.0f && origin.y == 0.0f && origin.z == 0.0f) continue;
 
-        // Head estimate: +70 units above origin (feet)
+        // Head: +70 units above feet
         Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
 
         Vec2 screen_head, screen_feet;
@@ -92,11 +79,11 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
         float box_h = screen_feet.y - screen_head.y;
         if (box_h < 5.0f) continue;
 
-        float box_w = box_h * 0.45f;
-
-        // Distance in meters (Hammer units / 39.37 ~ meters, simpler: / 40)
-        float dx = origin.x, dy = origin.y, dz = origin.z;
-        float dist = std::sqrt(dx*dx + dy*dy + dz*dz) / 40.0f;
+        // Distance: Hammer units / 40 ≈ metres
+        float dist = std::sqrt(
+            origin.x * origin.x +
+            origin.y * origin.y +
+            origin.z * origin.z) / 40.0f;
 
         players.push_back({
             origin,
@@ -107,7 +94,7 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
             true,
             dist,
             box_h,
-            box_w
+            box_h * 0.45f
         });
     }
 }
