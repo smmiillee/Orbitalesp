@@ -1,9 +1,8 @@
 // --- src/offsets.h ---
-// Global offsets from user-supplied offsets.hpp (a2x/cs2-dumper 2026-09-11)
-// Schema offsets from a2x/cs2-dumper client_dll.hpp (confirmed live)
+// Globals:  user-supplied offsets.hpp 2026-09-11
+// Schema:   a2x client_dll.hpp + confirmed working project values
 #pragma once
 #include <cstdint>
-#include <cstddef>
 
 namespace offsets {
 
@@ -13,21 +12,15 @@ namespace offsets {
     constexpr uintptr_t dwLocalPlayerCtrl = 0x23A78D0;
     constexpr uintptr_t dwViewMatrix      = 0x23D21F0;
 
-    // ── C_BaseEntity ──────────────────────────────────────────────────────────
-    constexpr uintptr_t m_pGameSceneNode  = 0x330; // CGameSceneNode*
-    constexpr uintptr_t m_iHealth         = 0x34C; // int32
-    constexpr uintptr_t m_lifeState       = 0x354; // uint8  (0 = alive)
-    constexpr uintptr_t m_iTeamNum        = 0x3EB; // uint8  (2=CT, 3=T)
+    // ── C_BaseEntity / C_CSPlayerPawn (pawn offsets) ──────────────────────────
+    constexpr uintptr_t m_iHealth         = 0x34C;  // int32
+    constexpr uintptr_t m_lifeState       = 0x354;  // uint8,  0 = alive
+    constexpr uintptr_t m_iTeamNum        = 0x3E7;  // uint8,  2=CT 3=T  (confirmed working)
+    constexpr uintptr_t m_vOldOrigin      = 0x13B8; // Vector, world pos (confirmed working)
 
     // ── CCSPlayerController ───────────────────────────────────────────────────
-    constexpr uintptr_t m_hPlayerPawn     = 0x90C; // handle -> pawn
+    constexpr uintptr_t m_hPlayerPawn     = 0x90C;  // CHandle — decode via entity list
 
-    // ── CGameSceneNode ────────────────────────────────────────────────────────
-    // m_nodeToWorld: the node-to-world transform matrix starts at 0x10.
-    // The Vec3 origin sits at the first 12 bytes (x,y,z floats).
-    constexpr uintptr_t m_nodeToWorld     = 0x10;  // Vec3 origin
-
-    // ── Entity iteration cap ──────────────────────────────────────────────────
+    // ── Iteration cap ─────────────────────────────────────────────────────────
     constexpr int max_entities            = 64;
-
-} // namespace offsets
+}
