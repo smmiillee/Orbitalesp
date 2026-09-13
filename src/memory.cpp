@@ -4,18 +4,23 @@
 Memory g_mem;
 
 bool Memory::attach(const std::wstring& process_name) {
-    DWORD pid = get_process_id(process_name);
+    const DWORD pid = get_process_id(process_name);
     if (!pid) return false;
 
-    // Need VM_WRITE for bhop dwForceJump
+    // VM_WRITE + VM_OPERATION needed for the bhop jump-button write.
     process_handle = OpenProcess(
-        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
         FALSE, pid);
     if (!process_handle) return false;
 
     base_address = get_module_base(pid, process_name);
     client_dll   = get_module_base(pid, L"client.dll");
-    return client_dll != 0;
+    if (client_dll == 0) {
+        CloseHandle(process_handle);
+        process_handle = nullptr;
+        return false;
+    }
+    return true;
 }
 
 void Memory::detach() {
@@ -46,7 +51,8 @@ uintptr_t Memory::get_module_base(DWORD pid, const std::wstring& module_name) co
     if (Module32FirstW(snap, &entry)) {
         do {
             if (module_name == entry.szModule) {
-                base = reinterpret_cast<uintptr_t>(entry.modBaseAddr); break;
+                base = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+                break;
             }
         } while (Module32NextW(snap, &entry));
     }
