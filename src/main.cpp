@@ -16,7 +16,7 @@
 static ESP g_esp;
 static bool g_running = true;
 bool g_menu_open = false;
-bool g_vsync = false;          // false = uncapped overlay -> less mouse lag
+bool g_vsync = false;          // false = uncapped overlay (see end_frame)
 HWND g_cs2_hwnd = nullptr;
 
 struct Config {
@@ -32,6 +32,7 @@ struct Config {
     ImVec4 color_team      = { 0.10f, 1.00f, 0.20f, 1.00f };
     ImVec4 color_skeleton  = { 1.00f, 1.00f, 1.00f, 0.90f };
     bool  bhop_enabled     = true;
+    bool  bhop_input_mode  = false;
 } g_cfg;
 
 static int g_screen_w   = 1920;
@@ -75,7 +76,7 @@ void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    Bhop_Init(); // was never called before -- part of why bhop did nothing
+    Bhop_Init();
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -100,6 +101,8 @@ void render_esp(ImDrawList* dl) {
     std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
+    int skel_drawn = 0;
+
     for (const auto& p : players) {
         const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
         const bool is_enemy    = !is_teammate;
@@ -123,8 +126,8 @@ void render_esp(ImDrawList* dl) {
 
         if (g_cfg.esp_boxes) {
             dl->AddRect(
-                { cx - bw / 2.0f, top },
-                { cx + bw / 2.0f, bot },
+                { cx - bw / 2.0f, bot },
+                { cx + bw / 2.0f, top },
                 col, 0.0f, 0, g_cfg.box_thickness);
         }
 
@@ -139,11 +142,12 @@ void render_esp(ImDrawList* dl) {
                     { p.bones[b].x, p.bones[b].y },
                     skel_col, g_cfg.box_thickness);
             }
+            ++skel_drawn;
         }
 
         // ── head dot ──
-        // p.screen_head is the actual head bone when bones are readable, and
-        // falls back to origin + 70 when they aren't.
+        // p.screen_head IS the head bone when the chain resolved, and the
+        // origin+70 fallback when it didn't.
         if (g_cfg.esp_head_dot) {
             float r = bh * 0.035f;
             if (r < 2.5f) r = 2.5f;
@@ -166,7 +170,6 @@ void render_esp(ImDrawList* dl) {
                              IM_COL32(0, 0, 0, 180));
         }
 
-        // ── distance (now measured from you, not from the map origin) ──
         if (g_cfg.esp_distance) {
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%.0fm", p.distance);
@@ -174,13 +177,18 @@ void render_esp(ImDrawList* dl) {
                         IM_COL32(255, 255, 255, 220), buf);
         }
     }
+
+    // Not in the loop: this is a once-per-frame diagnostic.
+    g_esp.last_skeleton_count = skel_drawn;
 }
 
+static const char* g_detect_msg = "";
+
 void render_menu() {
-    ImGui::SetNextWindowSize({ 480.0f, 380.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 340.0f, 260.0f }, { 900.0f, 720.0f });
+    ImGui::SetNextWindowSize({ 560.0f, 520.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 380.0f, 300.0f }, { 1000.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoScrollbar);
+    ImGui::Begin("Orbital", nullptr);
 
     const float win_w = ImGui::GetContentRegionAvail().x;
 
@@ -188,7 +196,8 @@ void render_menu() {
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ Waiting for CS2... ]");
     else
         ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
-            "[ Attached | %dx%d | Team:%d ]", g_screen_w, g_screen_h, g_local_team);
+            "[ Attached | %dx%d | Team:%d | bones:%d ]",
+            g_screen_w, g_screen_h, g_local_team, g_esp.last_skeleton_count);
 
     ImGui::Separator();
 
@@ -225,13 +234,48 @@ void render_menu() {
     ImGui::Spacing();
     ImGui::TextDisabled("[ Style ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
+    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "thick %.1f px");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##smooth", &g_esp.smoothing_ms, 0.0f, 60.0f, "smooth %.0f ms");
 
     ImGui::NextColumn();
 
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
     ImGui::Checkbox("V-Sync (off = less lag)", &g_vsync);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Bhop Button ]");
+
+    if (g_cfg.bhop_input_mode) {
+        ImGui::Text("mode: input (no offsets)");
+    } else {
+        ImGui::Text("off : 0x%06llX",
+                    (unsigned long long)Bhop_JumpOffset());
+        ImGui::Text("live: %u  %s", Bhop_LiveJumpValue(),
+                    (GetAsyncKeyState(VK_SPACE) & 0x8000) ? "<- SPACE" : "");
+
+        if (ImGui::Button("[Detect Jump]  hold W")) {
+            const int r = Bhop_DetectJump();
+            if (r == 1)      g_detect_msg = "found (held key) - verify with SPACE";
+            else if (r == 0) g_detect_msg = "found (structural) - verify with SPACE";
+            else             g_detect_msg = "NOT FOUND - hold W or SPACE, retry";
+        }
+        if (g_detect_msg[0]) ImGui::TextWrapped("%s", g_detect_msg);
+        ImGui::TextDisabled("press SPACE: live value must hit 65537");
+    }
+
+    if (ImGui::Checkbox("Input mode (no offsets needed)", &g_cfg.bhop_input_mode))
+        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Align ]  (only if boxes are still off)");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##ascale", &g_esp.align_scale, 0.90f, 1.10f, "scale %.3f");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##ax", &g_esp.align_offset_x, -100.0f, 100.0f, "offX %.0f");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##ay", &g_esp.align_offset_y, -100.0f, 100.0f, "offY %.0f");
 
     ImGui::Columns(1);
     ImGui::Separator();
@@ -241,18 +285,31 @@ void render_menu() {
 
     if (ImGui::Button("[Apply]", { btn_w, 0 })) {}
     ImGui::SameLine();
-    if (ImGui::Button("[Reset]", { btn_w, 0 })) g_cfg = Config{};
+    if (ImGui::Button("[Reset]", { btn_w, 0 })) {
+        g_cfg = Config{};
+        g_esp.smoothing_ms = 20.0f;
+        g_esp.align_scale = 1.0f;
+        g_esp.align_offset_x = 0.0f;
+        g_esp.align_offset_y = 0.0f;
+        Bhop_SetInputMode(false);
+    }
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
 
     ImGui::Spacing();
     ImGui::TextDisabled("INSERT - menu    F9 - exit");
-    ImGui::TextDisabled("ESP choppy in game? run:  engine_no_focus_sleep 0");
+    ImGui::TextDisabled("If ESP still stutters: engine_no_focus_sleep 0");
+    ImGui::TextDisabled("Also try disabling G-Sync / FreeSync.");
 
     ImGui::End();
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // MUST be first: before any window exists in this process. Without it,
+    // GetClientRect on the CS2 window returns DPI-virtualised numbers, and
+    // every ESP coordinate is scaled wrong.
+    Overlay::enable_dpi_awareness();
+
     while (!find_cs2_window())
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -272,6 +329,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
         if (GetAsyncKeyState(VK_END) & 1)    g_running   = false;
+
+        // Keep the overlay glued to the game window and in sync with its size.
+        if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
+            RECT r{};
+            if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
+                g_screen_w = r.right;
+                g_screen_h = r.bottom;
+            }
+            overlay.sync_to_game();
+        }
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
