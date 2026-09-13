@@ -340,6 +340,8 @@ static void tab_misc() {
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
+    ImGui::TextDisabled("press edges: %d   %s",
+        bd.presses, bd.driving ? "[driving]" : "[idle]");
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - space gate may misbehave");
