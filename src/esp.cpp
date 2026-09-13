@@ -43,8 +43,7 @@ Vec3 read_origin(const Memory& mem, uintptr_t ent) {
 struct EntHead { int health = 0; int team = 0; };
 
 // One 0x100 window covers health and team. Falls back to two separate reads --
-// the exact path the earlier working build used, so a refused bulk read can
-// never be what empties the player list.
+// the path the radar uses, so a refused bulk read can't empty the list.
 EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
     EntHead o;
     uint8_t buf[0x100];
@@ -59,22 +58,15 @@ EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
 }
 
 // ── entity-list enumeration ──────────────────────────────────────────────
-// *** THE BUG THAT EMPTIED THE LIST ***
-// This used to read each 61 KB chunk in fixed 16 KB pieces, then step by the
-// slot stride from each piece start. But 16384 is not a multiple of the 120
-// byte stride (16384/120 = 136.5), so only the FIRST piece landed on real slot
-// boundaries -- every later piece read from 64 bytes inside a slot and
-// returned noise. Pawns past slot 136 were therefore never seen at all.
-//
-// The fix is to make each read exactly a whole number of slots.
+// Each read is a WHOLE NUMBER OF SLOTS. Reading fixed 16 KB pieces used to
+// step off the slot grid (16384 / 120 = 136.5), so every piece after the first
+// read from 64 bytes inside a slot and returned noise.
 void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                     uintptr_t stride, std::vector<uintptr_t>& out,
-                     bool& used_bulk) {
+                     uintptr_t stride, std::vector<uintptr_t>& out) {
     out.clear();
-    used_bulk = false;
     if (!stride) return;
 
-    constexpr size_t kSlotsPerRead = 128;           // 128 * 120 = 15 KB
+    constexpr size_t kSlotsPerRead = 128;
     const size_t piece_bytes = kSlotsPerRead * stride;
 
     static std::vector<uint8_t> buf;
@@ -84,57 +76,38 @@ void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         const uintptr_t base = mem.read<uintptr_t>(el + chunk_off + 8 * ch);
         if (!valid_ptr(base)) continue;
 
-        std::vector<uintptr_t> local;
-        bool ok = true;
-
         for (size_t s0 = 0; s0 < static_cast<size_t>(offsets::kSlots);
              s0 += kSlotsPerRead) {
-            const size_t n_slots =
-                (std::min)(kSlotsPerRead,
-                           static_cast<size_t>(offsets::kSlots) - s0);
-            const size_t bytes = n_slots * stride;
-
-            // Always a whole number of slots from a slot-aligned start.
-            if (!mem.read_bytes(base + s0 * stride, buf.data(), bytes)) {
-                ok = false;
+            const size_t n = (std::min)(kSlotsPerRead,
+                             static_cast<size_t>(offsets::kSlots) - s0);
+            if (!mem.read_bytes(base + s0 * stride, buf.data(), n * stride))
                 break;
-            }
-            for (size_t k = 0; k < n_slots; ++k) {
+            for (size_t k = 0; k < n; ++k) {
                 uintptr_t e = 0;
                 std::memcpy(&e, buf.data() + k * stride, 8);
-                if (valid_ptr(e)) local.push_back(e);
-            }
-        }
-
-        if (ok) {
-            used_bulk = true;
-            out.insert(out.end(), local.begin(), local.end());
-        } else {
-            for (int i = 0; i < offsets::kSlots; ++i) {
-                const uintptr_t e = mem.read<uintptr_t>(base + stride * i);
                 if (valid_ptr(e)) out.push_back(e);
             }
         }
     }
 }
 
-// Slots -> live player pawns, with staged counters so a failure is visible.
+// Slots -> live player pawns, skipping the local player and anyone dead.
 void collect_pawns(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                   uintptr_t stride, std::vector<uintptr_t>& all,
-                   std::vector<uintptr_t>& hp, std::vector<uintptr_t>& team_ok,
-                   bool& bulk) {
-    enumerate_slots(mem, el, chunk_off, stride, all, bulk);
+                   uintptr_t stride, uintptr_t local_pawn,
+                   std::vector<uintptr_t>& all, std::vector<uintptr_t>& out) {
+    enumerate_slots(mem, el, chunk_off, stride, all);
 
-    hp.clear();
-    team_ok.clear();
+    out.clear();
     for (uintptr_t e : all) {
+        if (e == local_pawn) continue;              // never box ourselves
         const EntHead h = read_ent_head(mem, e);
-        if (h.health <= 0 || h.health > 100) continue;
-        hp.push_back(e);
-        if (h.team == 2 || h.team == 3) team_ok.push_back(e);
+        if (h.health <= 0 || h.health > 150) continue;
+        if (h.team != 2 && h.team != 3) continue;
+        out.push_back(e);
     }
 }
 
+// A handle is an entity index: 9 bits of chunk, 9 bits of slot.
 uintptr_t resolve_handle(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                          uintptr_t stride, uint32_t handle) {
     const uint32_t idx = handle & 0x7FFF;
@@ -155,18 +128,100 @@ void sanitize(char* dst, size_t cap, const char* src, size_t src_len) {
     dst[j] = '\0';
 }
 
-// A plausible player name: printable, short, and not a run of one character.
-bool name_looks_ok(const char* s) {
-    size_t n = 0;
-    for (; n < 32 && s[n]; ++n) {
-        const unsigned char ch = static_cast<unsigned char>(s[n]);
-        if (ch < 32 || ch >= 127) return false;
+// ── weapon name (designer string) ────────────────────────────────────────
+// The radar reads the weapon's designer name rather than mapping item indices,
+// and that is what makes WEAPON ESP work. Chain:
+//     weapon + 0x10 -> firstLevel
+//     firstLevel + 0x20 -> char* ("weapon_ak47")
+const char* prettify(const char* n) {
+    struct Map { const char* in; const char* out; };
+    static const Map kMap[] = {
+        {"ak47","AK-47"}, {"m4a1","M4A4"}, {"m4a1_silencer","M4A1-S"},
+        {"awp","AWP"}, {"deagle","Desert Eagle"}, {"glock","Glock-18"},
+        {"usp_silencer","USP-S"}, {"hkp2000","P2000"}, {"p250","P250"},
+        {"fiveseven","Five-SeveN"}, {"tec9","Tec-9"}, {"cz75a","CZ75-Auto"},
+        {"revolver","R8 Revolver"}, {"elite","Dual Berettas"}, {"ssg08","SSG 08"},
+        {"sg556","SG 553"}, {"aug","AUG"}, {"famas","FAMAS"},
+        {"galilar","Galil AR"}, {"g3sg1","G3SG1"}, {"scar20","SCAR-20"},
+        {"mp9","MP9"}, {"mp7","MP7"}, {"mp5sd","MP5-SD"}, {"ump45","UMP-45"},
+        {"p90","P90"}, {"bizon","PP-Bizon"}, {"mac10","MAC-10"},
+        {"xm1014","XM1014"}, {"mag7","MAG-7"}, {"sawedoff","Sawed-Off"},
+        {"nova","Nova"}, {"negev","Negev"}, {"m249","M249"},
+        {"taser","Zeus x27"}, {"smokegrenade","Smoke"}, {"flashbang","Flashbang"},
+        {"hegrenade","HE Grenade"}, {"molotov","Molotov"},
+        {"incgrenade","Incendiary"}, {"decoy","Decoy"}, {"c4","C4"},
+        {"healthshot","Health Shot"},
+    };
+    for (const Map& m : kMap)
+        if (std::strcmp(n, m.in) == 0) return m.out;
+    if (std::strncmp(n, "knife", 5) == 0 || std::strncmp(n, "bayonet", 7) == 0)
+        return "Knife";
+    return nullptr;   // unknown -> show the raw name
+}
+
+struct WeaponInfo {
+    char name[24]{};
+    bool is_c4 = false;
+    bool ok = false;
+};
+
+// pawn -> weapon services -> active weapon -> designer name (+ C4 check).
+WeaponInfo read_weapon(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                       uintptr_t stride, uintptr_t pawn) {
+    WeaponInfo out;
+
+    const uintptr_t ws = mem.read<uintptr_t>(pawn + offsets::m_pWeaponServices);
+    if (!valid_ptr(ws)) return out;
+
+    const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
+    if (!h || h == 0xFFFFFFFFu) return out;
+
+    const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
+    if (!valid_ptr(w)) return out;
+
+    const uintptr_t lvl1 = mem.read<uintptr_t>(w + offsets::m_designerLvl1);
+    if (valid_ptr(lvl1)) {
+        const uintptr_t np = mem.read<uintptr_t>(lvl1 + offsets::m_designerPtr);
+        if (valid_ptr(np)) {
+            char raw[48] = {};
+            if (mem.read_bytes(np, raw, 40)) {
+                raw[39] = '\0';
+                const char* s = raw;
+                if (std::strncmp(s, "weapon_", 7) == 0) s += 7;
+                sanitize(out.name, sizeof(out.name), s, std::strlen(s));
+            }
+        }
     }
-    if (n < 2) return false;
-    bool varied = false;
-    for (size_t i = 1; i < n; ++i)
-        if (s[i] != s[0]) { varied = true; break; }
-    return varied;
+
+    // Secondary C4 check through the embedded econ item, in case the designer
+    // string is unavailable for this particular weapon entity.
+    if (!out.is_c4) {
+        const uint16_t id = mem.read<uint16_t>(
+            w + offsets::m_AttributeManager + offsets::m_Item +
+            offsets::m_iItemDefinitionIndex);
+        if (id == offsets::kItemDefC4) out.is_c4 = true;
+    }
+    if (out.is_c4) std::snprintf(out.name, sizeof(out.name), "C4");
+
+    out.ok = out.name[0] != '\0';
+    return out;
+}
+
+void read_player_name(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                      uintptr_t stride, uintptr_t pawn, char* out, size_t cap) {
+    out[0] = '\0';
+    // pawn -> controller, which is the direction the schema defines.
+    const uint32_t h = mem.read<uint32_t>(pawn + offsets::m_hController);
+    if (!h || h == 0xFFFFFFFFu) return;
+
+    const uintptr_t ctrl = resolve_handle(mem, el, chunk_off, stride, h);
+    if (!valid_ptr(ctrl)) return;
+
+    char raw[128] = {};
+    if (!mem.read_bytes(ctrl + offsets::m_iszPlayerName, raw, sizeof(raw)))
+        return;
+    raw[127] = '\0';
+    sanitize(out, cap, raw, sizeof(raw));
 }
 
 // ── skeleton ─────────────────────────────────────────────────────────────
@@ -267,34 +322,48 @@ bool read_bones(const Memory& mem, uintptr_t pawn, const Vec3& origin,
     return n >= 6;
 }
 
-// ── weapon id -> name ────────────────────────────────────────────────────
-const char* weapon_name(int id) {
-    switch (id) {
-        case 1:  return "Deagle";     case 2:  return "Dual Berettas";
-        case 3:  return "Five-SeveN"; case 4:  return "Glock-18";
-        case 7:  return "AK-47";      case 8:  return "AUG";
-        case 9:  return "AWP";        case 10: return "FAMAS";
-        case 11: return "G3SG1";      case 13: return "Galil AR";
-        case 14: return "M249";       case 16: return "M4A4";
-        case 17: return "MAC-10";     case 19: return "P90";
-        case 23: return "MP5-SD";     case 24: return "UMP-45";
-        case 25: return "XM1014";     case 26: return "PP-Bizon";
-        case 27: return "MAG-7";      case 28: return "Negev";
-        case 29: return "Sawed-Off";  case 30: return "Tec-9";
-        case 31: return "Zeus x27";   case 32: return "P2000";
-        case 33: return "MP7";        case 34: return "MP9";
-        case 35: return "Nova";       case 36: return "P250";
-        case 38: return "SCAR-20";    case 39: return "SG 553";
-        case 40: return "SSG 08";     case 43: return "Flashbang";
-        case 44: return "HE Grenade"; case 45: return "Smoke";
-        case 46: return "Molotov";    case 47: return "Decoy";
-        case 48: return "Incendiary"; case 49: return "C4";
-        case 60: return "M4A1-S";     case 61: return "USP-S";
-        case 63: return "CZ75-Auto";  case 64: return "R8 Revolver";
-        default: break;
+// ── planted C4 ───────────────────────────────────────────────────────────
+// dwPlantedC4 is a pointer chain, and which variant it is differs by build, so
+// both are tried exactly like the radar does: the value may BE the entity, or
+// it may point at one.
+uintptr_t scene_node_of(const Memory& mem, uintptr_t ent) {
+    static const uintptr_t kCand[] = { 0x338, 0x340, 0x348, 0x350, 0x358, 0x360 };
+    for (uintptr_t off : kCand) {
+        const uintptr_t n = mem.read<uintptr_t>(ent + off);
+        if (valid_ptr(n)) return n;
     }
-    if (id >= 500 && id <= 600) return "Knife";
-    return nullptr;
+    return 0;
+}
+
+bool looks_like_entity(const Memory& mem, uintptr_t ent) {
+    if (!valid_ptr(ent)) return false;
+    return scene_node_of(mem, ent) != 0;
+}
+
+bool read_scene_pos(const Memory& mem, uintptr_t node, Vec3& out) {
+    // X at +0xC4, then Y and Z follow contiguously.
+    out.x = mem.read<float>(node + offsets::m_vecAbsOrigin);
+    out.y = mem.read<float>(node + offsets::m_vecAbsOrigin + 4);
+    out.z = mem.read<float>(node + offsets::m_vecAbsOrigin + 8);
+    return sane_vec(out);
+}
+
+bool read_planted_c4(const Memory& mem, uintptr_t client_base, Vec3& out) {
+    const uintptr_t p = mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
+    if (!valid_ptr(p)) return false;
+
+    uintptr_t ent = 0;
+    if (looks_like_entity(mem, p)) {
+        ent = p;                       // direct entity pointer
+    } else {
+        const uintptr_t inner = mem.read<uintptr_t>(p);
+        if (looks_like_entity(mem, inner)) ent = inner;   // pointer-to-pointer
+    }
+    if (!ent) return false;
+
+    const uintptr_t node = scene_node_of(mem, ent);
+    if (!node) return false;
+    return read_scene_pos(mem, node, out);
 }
 
 } // namespace
@@ -338,7 +407,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static std::vector<uintptr_t> slots;
     static std::vector<uintptr_t> pawns;
     static double slots_at = -1e9;
-    static int    refresh_n = 0;
+    static double info_at  = -1e9;
 
     // ── refresh the pawn list ~10x/sec, auto-detecting the list layout ────
     if (now - slots_at > 100.0) {
@@ -350,164 +419,25 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         };
 
         int best = -1;
+        std::vector<uintptr_t> best_all, best_pawns;
         for (const Layout& L : kLayouts) {
-            std::vector<uintptr_t> all, hp, tm;
-            bool bulk = false;
-            collect_pawns(mem, el, L.off, L.stride, all, hp, tm, bulk);
-
-            if (static_cast<int>(hp.size()) > best) {
-                best = static_cast<int>(hp.size());
+            std::vector<uintptr_t> all, got;
+            collect_pawns(mem, el, L.off, L.stride, local_pawn, all, got);
+            if (static_cast<int>(got.size()) > best) {
+                best = static_cast<int>(got.size());
                 c_.chunk_off   = L.off;
                 c_.slot_stride = L.stride;
-                slots = std::move(all);
-                // Prefer the team-filtered set; if the team offset is stale and
-                // nothing matched, fall back to health-only so boxes still draw.
-                pawns = tm.empty() ? hp : tm;
-                diag_slots = static_cast<int>(slots.size());
-                diag_hp    = static_cast<int>(hp.size());
-                diag_team  = static_cast<int>(tm.size());
-                diag_bulk  = bulk;
+                best_all  = std::move(all);
+                best_pawns = std::move(got);
             }
         }
-        if (best <= 0) pawns.clear();
-
-        ++refresh_n;
-
-        // ── names / weapons: slow-moving, refresh a couple of times a second
-        if (refresh_n % 5 == 0 && !pawns.empty()) {
-            // controller -> pawn handle. Prefer the schema value, then vote.
-            if (!c_.ctrl_ok) {
-                static const uintptr_t cand[] = {
-                    0x90C, 0x8FC, 0x908, 0x900, 0x910, 0x914,
-                    0x918, 0x91C, 0x920, 0x924, 0x8F8, 0x904,
-                };
-                int best_v = 0;
-                for (uintptr_t off : cand) {
-                    int score = 0;
-                    for (uintptr_t s : slots) {
-                        const uint32_t h = mem.read<uint32_t>(s + off);
-                        if (!h || h == 0xFFFFFFFFu) continue;
-                        const uintptr_t p = resolve_handle(
-                            mem, el, c_.chunk_off, c_.slot_stride, h);
-                        if (p && std::find(pawns.begin(), pawns.end(), p) !=
-                                 pawns.end())
-                            ++score;
-                    }
-                    if (score > best_v) { best_v = score; c_.ctrl_link = off; }
-                }
-                c_.ctrl_ok = best_v >= 1;
-            }
-
-            // name offset: pick whichever candidate yields a real-looking name
-            // for the most controllers.
-            if (c_.ctrl_ok && !c_.name_ok) {
-                static const uintptr_t name_c[] = {
-                    0x6F4, 0x6E8, 0x700, 0x6E0, 0x6C8, 0x708, 0x710, 0x6D8,
-                };
-                int best_v = 0;
-                for (uintptr_t off : name_c) {
-                    int score = 0;
-                    for (uintptr_t s : slots) {
-                        const uint32_t h = mem.read<uint32_t>(s + c_.ctrl_link);
-                        if (!h || h == 0xFFFFFFFFu) continue;
-                        const uintptr_t ctrl = resolve_handle(
-                            mem, el, c_.chunk_off, c_.slot_stride, h);
-                        if (!ctrl) continue;
-                        char raw[32] = {};
-                        if (!mem.read_bytes(ctrl + off, raw, sizeof(raw)))
-                            continue;
-                        if (name_looks_ok(raw)) ++score;
-                    }
-                    if (score > best_v) { best_v = score; c_.name_off = off; }
-                }
-                c_.name_ok = best_v >= 2;
-            }
-
-            // weapon chain: services ptr -> active weapon handle -> defindex.
-            // Graded by whether the id is a real weapon, so a wrong candidate
-            // can't win.
-            if (!c_.weapon_ok && pawns.size() >= 2) {
-                static const uintptr_t svc_c[] = {
-                    0x13F0, 0x11E0, 0x11D8, 0x11E8, 0x13D8, 0x13E0, 0x1200,
-                };
-                static const uintptr_t act_c[] = { 0x58, 0x60, 0x50 };
-                static const uintptr_t attr_c[] = { 0x1180, 0x1378, 0x1370 };
-
-                int best_v = 0;
-                for (uintptr_t so : svc_c) {
-                    for (uintptr_t ao : act_c) {
-                        for (uintptr_t at : attr_c) {
-                            int score = 0;
-                            for (uintptr_t p : pawns) {
-                                const uintptr_t svc = mem.read<uintptr_t>(p + so);
-                                if (!valid_ptr(svc)) continue;
-                                const uint32_t h =
-                                    mem.read<uint32_t>(svc + ao);
-                                const uintptr_t w = resolve_handle(
-                                    mem, el, c_.chunk_off, c_.slot_stride, h);
-                                if (!valid_ptr(w)) continue;
-                                const uint16_t id = mem.read<uint16_t>(
-                                    w + at + 0x50 + 0x1BA);
-                                const bool plausible =
-                                    (id >= 1 && id <= 90) ||
-                                    (id >= 500 && id <= 600);
-                                if (plausible) ++score;
-                            }
-                            if (score > best_v) {
-                                best_v = score;
-                                c_.wservices = so;
-                                c_.wactive   = ao;
-                                c_.attrmgr   = at;
-                            }
-                        }
-                    }
-                }
-                c_.weapon_ok = best_v >= 1;
-            }
-
-            // pull name + weapon per pawn
-            for (uintptr_t p : pawns) {
-                for (Track& t : tracks_) {
-                    if (t.pawn != p) continue;
-
-                    if (c_.ctrl_ok && c_.name_ok) {
-                        for (uintptr_t s : slots) {
-                            const uint32_t h =
-                                mem.read<uint32_t>(s + c_.ctrl_link);
-                            if (!h || h == 0xFFFFFFFFu) continue;
-                            const uintptr_t ctrl = resolve_handle(
-                                mem, el, c_.chunk_off, c_.slot_stride, h);
-                            if (ctrl != p) continue;
-                            char raw[32] = {};
-                            if (mem.read_bytes(ctrl + c_.name_off, raw,
-                                               sizeof(raw)))
-                                sanitize(t.name, sizeof(t.name), raw,
-                                         sizeof(raw));
-                            break;
-                        }
-                    }
-
-                    if (c_.weapon_ok) {
-                        const uintptr_t svc = mem.read<uintptr_t>(p + c_.wservices);
-                        if (valid_ptr(svc)) {
-                            const uint32_t h =
-                                mem.read<uint32_t>(svc + c_.wactive);
-                            const uintptr_t w = resolve_handle(
-                                mem, el, c_.chunk_off, c_.slot_stride, h);
-                            if (valid_ptr(w)) {
-                                const uint16_t id = mem.read<uint16_t>(
-                                    w + c_.attrmgr + 0x50 + 0x1BA);
-                                const char* nm = weapon_name(id);
-                                if (nm)
-                                    std::snprintf(t.weapon, sizeof(t.weapon),
-                                                  "%s", nm);
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
+        if (best > 0) {
+            slots = std::move(best_all);
+            pawns = std::move(best_pawns);
+        } else {
+            pawns.clear();
         }
+        diag_slots = static_cast<int>(slots.size());
     }
 
     // ── bone chain, resolved once and re-probed if it goes stale ─────────
@@ -540,7 +470,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
     for (uintptr_t p : pawns) {
         const EntHead h = read_ent_head(mem, p);
-        if (h.health <= 0 || h.health > 100) continue;
+        if (h.health <= 0 || h.health > 150) continue;
 
         const Vec3 origin = read_origin(mem, p);
         if (!sane_vec(origin)) continue;
@@ -557,6 +487,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                      ? s.bones[BONE_HEAD]
                      : Vec3{ origin.x, origin.y, origin.z + kFallbackHeadZ };
 
+        // Reuse the existing track so its interpolation history, name and
+        // weapon survive between ticks.
         Track* dst = nullptr;
         for (Track& t : tracks_) {
             if (t.pawn == p) { dst = &t; break; }
@@ -571,11 +503,11 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         const float dy = origin.y - local_origin.y;
         const float dz = origin.z - local_origin.z;
 
-        Track moved = *dst;      // copies history + name + weapon
+        Track moved = *dst;
         moved.health    = h.health;
         moved.team      = h.team;
         moved.distance  = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
-        moved.last_seen = now;
+        moved.bone_health = s.has_bones ? 1 : 0;
         moved.push(s);
         fresh.push_back(std::move(moved));
     }
@@ -583,62 +515,32 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ── bomb: planted C4 ────────────────────────────────────────────────
-    bool  bomb_active = false;
-    Vec3  bomb_origin{};
-    float bomb_timer = -1.0f;
+    // ── names + weapons: slow-moving, ~3x/sec ─────────────────────────────
+    if (now - info_at > 300.0) {
+        info_at = now;
+        for (Track& t : fresh) {
+            read_player_name(mem, el, c_.chunk_off, c_.slot_stride,
+                             t.pawn, t.name, sizeof(t.name));
 
-    const uintptr_t planted =
-        mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
-    if (valid_ptr(planted)) {
-        const uintptr_t node =
-            mem.read<uintptr_t>(planted + offsets::m_pGameSceneNode);
-        if (valid_ptr(node)) {
-            if (!c_.origin_ok) {
-                for (uintptr_t off = 0x40; off <= 0x180; off += 4) {
-                    Vec3 v{};
-                    v.x = mem.read<float>(node + off);
-                    v.y = mem.read<float>(node + off + 4);
-                    v.z = mem.read<float>(node + off + 8);
-                    if (!sane_vec(v)) continue;
-                    const float d = std::sqrt(
-                        (v.x - local_origin.x) * (v.x - local_origin.x) +
-                        (v.y - local_origin.y) * (v.y - local_origin.y) +
-                        (v.z - local_origin.z) * (v.z - local_origin.z));
-                    if (d > 8000.0f) continue;
-                    c_.node_origin = off;
-                    c_.origin_ok = true;
-                    break;
-                }
-            }
-            if (c_.origin_ok) {
-                bomb_origin.x = mem.read<float>(node + c_.node_origin);
-                bomb_origin.y = mem.read<float>(node + c_.node_origin + 4);
-                bomb_origin.z = mem.read<float>(node + c_.node_origin + 8);
-                if (sane_vec(bomb_origin)) {
-                    bomb_active = true;
-                    if (!c_.timer_ok) {
-                        for (uintptr_t off = 0x900; off <= 0x1400; off += 4) {
-                            const float v = mem.read<float>(planted + off);
-                            if (v > 0.1f && v <= 45.0f) {
-                                c_.timer_off = off;
-                                c_.timer_ok  = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (c_.timer_ok)
-                        bomb_timer = mem.read<float>(planted + c_.timer_off);
-                }
+            const WeaponInfo w =
+                read_weapon(mem, el, c_.chunk_off, c_.slot_stride, t.pawn);
+            t.has_bomb = w.is_c4;
+            if (w.ok) {
+                const char* pretty = prettify(w.name);
+                std::snprintf(t.weapon, sizeof(t.weapon), "%s",
+                              pretty ? pretty : w.name);
             }
         }
     }
 
+    // ── planted C4 ───────────────────────────────────────────────────────
+    Vec3 bomb{};
+    const bool bomb_active = read_planted_c4(mem, client_base, bomb);
+
     std::lock_guard<std::mutex> lk(mtx);
     tracks_       = std::move(fresh);
     bomb_active_  = bomb_active;
-    bomb_origin_  = bomb_origin;
-    bomb_timer_   = bomb_timer;
+    bomb_origin_  = bomb;
     players_alive = static_cast<int>(tracks_.size());
 }
 
@@ -731,6 +633,7 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
         e.team      = t.team;
         e.distance  = t.distance;
         e.has_bones = s.has_bones;
+        e.has_bomb  = t.has_bomb;
         std::snprintf(e.name,   sizeof(e.name),   "%s", t.name);
         std::snprintf(e.weapon, sizeof(e.weapon), "%s", t.weapon);
 
@@ -775,7 +678,6 @@ BombESP ESP::project_bomb(const Memory& mem, uintptr_t client_base,
     const float dy = bomb_origin_.y - lo.y;
     const float dz = bomb_origin_.z - lo.z;
     b.distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
-    b.timer    = bomb_timer_;
     b.active   = true;
     return b;
 }
