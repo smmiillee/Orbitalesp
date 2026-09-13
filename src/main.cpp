@@ -9,11 +9,10 @@
 #include "offsets.h"
 #include "bhop.h"
 
-// Non-static: extern Memory g_mem declared in memory.h — bhop.cpp reads it directly.
-Memory g_mem;
-static ESP  g_esp;
+Memory     g_mem;
+static ESP g_esp;
 static bool g_running   = true;
-bool        g_menu_open = false; // extern'd in overlay.cpp for input mode toggling
+bool        g_menu_open = false; // extern'd in overlay.cpp
 
 struct Config {
     bool   esp_boxes     = true;
@@ -25,10 +24,29 @@ struct Config {
     ImVec4 color_team    = { 0.2f, 1.0f, 0.4f, 1.0f };
 } g_cfg;
 
-static int g_screen_w = 1920;
-static int g_screen_h = 1080;
+static int   g_screen_w  = 1920;
+static int   g_screen_h  = 1080;
+static HWND  g_cs2_hwnd  = nullptr;
 
+// ── Find CS2 window + read its exact client dimensions ───────────────────────
+static bool find_cs2_window() {
+    g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
+    if (!g_cs2_hwnd) return false;
+
+    RECT r{};
+    if (!GetClientRect(g_cs2_hwnd, &r)) return false;
+    if (r.right <= 0 || r.bottom <= 0)  return false;
+
+    g_screen_w = r.right;
+    g_screen_h = r.bottom;
+    return true;
+}
+
+// ── Memory + bhop thread ─────────────────────────────────────────────────────
 void memory_thread() {
+    while (g_running && !g_mem.attach(L"cs2.exe"))
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
     while (g_running) {
         if (g_mem.is_valid()) {
             g_esp.update(g_mem, g_mem.base_address);
@@ -38,6 +56,7 @@ void memory_thread() {
     }
 }
 
+// ── ESP draw ─────────────────────────────────────────────────────────────────
 void render_esp(ImDrawList* dl) {
     for (const auto& p : g_esp.players) {
         if (g_cfg.enemy_only && p.team == 2) continue;
@@ -52,8 +71,8 @@ void render_esp(ImDrawList* dl) {
         float bw  = bh * 0.45f;
 
         if (bh < 5.0f) continue;
-        if (cx - bw / 2.0f > g_screen_w || cx + bw / 2.0f < 0) continue;
-        if (top > g_screen_h || bot < 0) continue;
+        if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
+        if (bot < 0 || top > g_screen_h) continue;
 
         if (g_cfg.esp_boxes) {
             dl->AddRect(
@@ -71,28 +90,29 @@ void render_esp(ImDrawList* dl) {
                 (int)(255 * (p.health / 100.0f)),
                 0, 255
             );
-            dl->AddRectFilled({ bar_x,        bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
-            dl->AddRect      ({ bar_x,        top         }, { bar_x + 3.0f, bot }, IM_COL32(0, 0, 0, 180));
+            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
+            dl->AddRect      ({ bar_x, top         }, { bar_x + 3.0f, bot }, IM_COL32(0,0,0,180));
         }
 
         if (g_cfg.esp_distance) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255, 255, 255, 200), buf);
+            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255,255,255,200), buf);
         }
     }
 }
 
+// ── ImGui menu ────────────────────────────────────────────────────────────────
 void render_menu() {
-    ImGui::SetNextWindowSize({ 280, 280 }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({ 280, 290 }, ImGuiCond_Once);
     ImGui::SetNextWindowPos ({ 30,  30  }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoResize);
 
     ImGui::SeparatorText("ESP");
-    ImGui::Checkbox("Boxes",       &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health",      &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",    &g_cfg.esp_distance);
-    ImGui::Checkbox("Enemy Only",  &g_cfg.enemy_only);
+    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health",     &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
+    ImGui::Checkbox("Enemy Only", &g_cfg.enemy_only);
 
     ImGui::SeparatorText("Colors");
     ImGui::ColorEdit4("Enemy", &g_cfg.color_enemy.x, ImGuiColorEditFlags_NoInputs);
@@ -107,24 +127,28 @@ void render_menu() {
     ImGui::Separator();
 
     if (!g_mem.is_valid())
-        ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "CS2 not found");
-    else
-        ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f }, "Attached");
+        ImGui::TextColored({1.0f,0.6f,0.0f,1.0f}, "Waiting for CS2...");
+    else {
+        ImGui::TextColored({0.4f,1.0f,0.4f,1.0f}, "Attached");
+        ImGui::Text("Resolution: %dx%d", g_screen_w, g_screen_h);
+    }
 
     ImGui::End();
 }
 
+// ── Entry point ───────────────────────────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    g_screen_w = GetSystemMetrics(SM_CXSCREEN);
-    g_screen_h = GetSystemMetrics(SM_CYSCREEN);
+    // Wait until CS2's window exists so we have the right dimensions.
+    // This loop also means Orbital launched before CS2 just shows a
+    // brief spin rather than a black window at wrong resolution.
+    while (!find_cs2_window())
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    while (!g_mem.attach(L"cs2.exe")) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    }
-
+    // Create overlay parented to CS2 at its exact client size.
     Overlay overlay;
-    if (!overlay.create(g_screen_w, g_screen_h)) return 1;
+    if (!overlay.create(g_cs2_hwnd, g_screen_w, g_screen_h)) return 1;
 
+    // Memory attach + ESP update in background thread.
     std::thread mem_t(memory_thread);
 
     MSG msg{};
@@ -135,16 +159,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) g_running = false;
         }
 
+        // Hotkeys — GetAsyncKeyState & 1 fires once per press
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9)     & 1) g_running   = false;
         if (GetAsyncKeyState(VK_END)    & 1) g_running   = false;
 
         overlay.begin_frame();
-
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
         render_esp(dl);
         if (g_menu_open) render_menu();
-
         overlay.end_frame();
     }
 
