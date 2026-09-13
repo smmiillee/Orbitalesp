@@ -26,6 +26,8 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     debug_alive             = 0;
     debug_positioned        = 0;
     debug_on_screen         = 0;
+    debug_sample_health     = 0;
+    debug_sample_team       = 0;
 
     Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
@@ -44,26 +46,45 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
             if (entity == local_pawn) continue;
             debug_total_controllers++;
 
-            // Filter to player pawns: team must be CT(2) or T(3)
             int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
             if (team != 2 && team != 3) continue;
             debug_valid_pawns++;
 
-            // Health check
-            int health = mem.read<int>(entity + offsets::m_iHealth);
+            // Sample first match for debug display
+            if (debug_valid_pawns == 1) {
+                debug_sample_health = mem.read<int>(entity + offsets::m_iHealth);
+                debug_sample_team   = team;
+            }
+
+            // These are controllers — need to resolve to pawn via m_hPlayerPawn
+            // Controller offset 0x90C holds CHandle to the pawn
+            uint32_t pawn_handle = mem.read<uint32_t>(entity + offsets::m_hPlayerPawn);
+            if (!pawn_handle || pawn_handle == 0xFFFFFFFF) continue;
+
+            // Resolve handle: index = handle & 0x7FFF
+            int pawn_index = pawn_handle & 0x7FFF;
+            uintptr_t pawn_chunk = mem.read<uintptr_t>(
+                entity_list + 0x10 + 8 * (pawn_index >> 9));
+            if (!pawn_chunk || pawn_chunk < 0x10000) continue;
+
+            uintptr_t pawn = mem.read<uintptr_t>(
+                pawn_chunk + 120 * (pawn_index & 0x1FF));
+            if (!pawn || pawn < 0x10000 || pawn == local_pawn) continue;
+
+            int health = mem.read<int>(pawn + offsets::m_iHealth);
             if (health <= 0 || health > 100) continue;
             debug_alive++;
 
-            // Position
             Vec3 origin;
-            origin.x = mem.read<float>(entity + offsets::m_vOldOrigin);
-            origin.y = mem.read<float>(entity + offsets::m_vOldOrigin + 4);
-            origin.z = mem.read<float>(entity + offsets::m_vOldOrigin + 8);
+            origin.x = mem.read<float>(pawn + offsets::m_vOldOrigin);
+            origin.y = mem.read<float>(pawn + offsets::m_vOldOrigin + 4);
+            origin.z = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
             if (origin.x == 0.0f && origin.y == 0.0f) continue;
             debug_positioned++;
 
-            Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
+            int pawn_team = mem.read<int>(pawn + offsets::m_iTeamNum) & 0xFF;
 
+            Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
             Vec2 screen_head, screen_feet;
             if (!world_to_screen(head,   screen_head, vm, W, H)) continue;
             if (!world_to_screen(origin, screen_feet, vm, W, H)) continue;
@@ -79,7 +100,7 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
 
             players.push_back({
                 origin, screen_head, screen_feet,
-                health, team, true, dist,
+                health, pawn_team, true, dist,
                 box_h, box_h * 0.45f
             });
         }
