@@ -77,6 +77,9 @@ public:
     float align_offset_x = 0.0f;
     float align_offset_y = 0.0f;
 
+    // Diagnostic: how many players had a skeleton drawn last frame.
+    int last_skeleton_count = 0;
+
     // World-space data updated by the reader thread.
     std::vector<PlayerData> world_players;
     std::mutex world_mutex;
