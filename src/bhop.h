@@ -4,39 +4,40 @@
 
 // Bhop writes the CS2 jump button:
 //   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
-// Both have been stable for the life of CS2. Only the ADDRESS moves.
 //
-// GROUND DETECTION is the part that kept breaking. m_fFlags is a per-update
-// offset, and a wrong offset doesn't fail loudly -- it just reads a constant
-// (we were reading bit 16, FL_AIMTARGET, which is why ground: never said YES).
+// The ADDRESS is found at runtime by the scanner, so it never needs editing.
 //
-// So the ground flag is now CALIBRATED AT RUNTIME against the local player's
-// Z position, which is known-good (the ESP is aligned, so m_vOldOrigin is
-// definitely right):
-//   * Z unchanged between samples  -> the player is standing on something
-//   * Z rising fast                -> they just jumped
-//   * Z dropping fast              -> they are falling
-// The reader watches a window of u32s in the pawn and keeps whichever offset
-// actually splits into "set while standing, clear while airborne".
+// GROUND DETECTION is what kept failing, and the reason is now known: the
+// schema offset for m_fFlags is correct (0x3F4) but the client-side predicted
+// pawn does not report FL_ONGROUND in bit 0, so the flag reads 0x10000 while
+// you are standing still and bhop could never fire.
+//
+// So ground state is now taken from whichever signals PROVE themselves against
+// the local player's Z position (m_vOldOrigin, which is verified working):
+//
+//   z     - Z unchanged for ~22 ms -> standing on something. Always available,
+//           works on any surface and at any height (a landing off a roof looks
+//           exactly like a landing on flat ground).
+//   flag  - used only after it has been seen both set while Z is static and
+//           clear while Z is moving.
+//   hge   - m_hGroundEntity, used only after the same proof.
+//
+// A signal that never proves itself is simply ignored, so a wrong offset can
+// degrade the result but can't break it.
 struct BhopDebug {
-    uintptr_t offset        = 0;      // current jump-button offset
-    uint32_t  live_value    = 0;      // live dword at that address
-    bool      on_ground     = false;  // combined ground verdict
-    uint32_t  flags         = 0;      // value at the calibrated flag offset
-    uintptr_t flag_offset   = 0;      // calibrated m_fFlags offset (0 = none)
-    int       calib_score   = 0;      // confidence of the calibration
-    bool      locked        = false;  // jump address confirmed by the scanner
-    bool      scanning      = false;  // sweep in progress
+    uintptr_t offset      = 0;
+    bool      on_ground   = false;
+    int       signals     = 0;   // bit0 z, bit1 flag, bit2 hge
+    int       calibrating = 0;   // 0..100
+    bool      locked      = false;
+    bool      scanning    = false;
 };
 
-void Bhop_Init();      // starts the bhop + scanner threads (after attach)
-void Bhop_Shutdown();  // stops and joins them
+void Bhop_Init();
+void Bhop_Shutdown();
 
 BhopDebug Bhop_GetDebug();
-void      Bhop_Rescan();  // forget the locked jump address and sweep again
+void      Bhop_Rescan();
 
 void Bhop_SetInputMode(bool enabled);
 bool Bhop_InputMode();
-</｜DSML｜ parameter>
-</｜DSML｜ invoke>
-</｜DSML｜ calls>
