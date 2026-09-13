@@ -19,15 +19,12 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
-// entity_list + 8*((index>>9)+1) -> chunk
-// chunk       + 0x78*(index&0x1FF) -> controller ptr
 uintptr_t ESP::get_entity(const Memory& mem, uintptr_t entity_list, int index) const {
     uintptr_t chunk = mem.read<uintptr_t>(entity_list + 8 * ((index >> 9) + 1));
     if (!chunk) return 0;
     return mem.read<uintptr_t>(chunk + 0x78 * (index & 0x1FF));
 }
 
-// CHandle<> uint32: bits 0-14 = entity index — resolve through entity list
 uintptr_t ESP::resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t handle) const {
     if (!handle || handle == 0xFFFFFFFF) return 0;
     int index = handle & 0x7FFF;
@@ -38,38 +35,42 @@ uintptr_t ESP::resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t
 
 void ESP::update(const Memory& mem, uintptr_t client_base) {
     players.clear();
+    debug_total_controllers = 0;
+    debug_valid_pawns       = 0;
+    debug_alive             = 0;
+    debug_positioned        = 0;
+    debug_on_screen         = 0;
 
     Matrix4x4 vm          = mem.read<Matrix4x4>(client_base + offsets::dwViewMatrix);
     uintptr_t entity_list = mem.read<uintptr_t>(client_base + offsets::dwEntityList);
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
-    // Read screen dimensions — hardcoded here, main.cpp culls by actual res
     constexpr int W = 1920, H = 1080;
 
     for (int i = 0; i < offsets::max_entities; ++i) {
         uintptr_t controller = get_entity(mem, entity_list, i);
         if (!controller) continue;
+        debug_total_controllers++;
 
-        // Decode m_hPlayerPawn CHandle -> pawn pointer
         uint32_t pawn_handle = mem.read<uint32_t>(controller + offsets::m_hPlayerPawn);
         uintptr_t pawn = resolve_handle(mem, entity_list, pawn_handle);
         if (!pawn || pawn == local_pawn) continue;
+        debug_valid_pawns++;
 
-        // Life check: 0 = alive
         uint8_t life = mem.read<uint8_t>(pawn + offsets::m_lifeState);
         if (life != 0) continue;
+        debug_alive++;
 
         int health = mem.read<int>(pawn + offsets::m_iHealth);
         if (health <= 0 || health > 100) continue;
 
         int team = mem.read<int>(pawn + offsets::m_iTeamNum);
 
-        // m_vOldOrigin: world position directly on pawn — no scene node needed
         Vec3 origin = mem.read<Vec3>(pawn + offsets::m_vOldOrigin);
         if (origin.x == 0.0f && origin.y == 0.0f && origin.z == 0.0f) continue;
+        debug_positioned++;
 
-        // Head: +70 units above feet
         Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
 
         Vec2 screen_head, screen_feet;
@@ -78,23 +79,17 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
 
         float box_h = screen_feet.y - screen_head.y;
         if (box_h < 5.0f) continue;
+        debug_on_screen++;
 
-        // Distance: Hammer units / 40 ≈ metres
         float dist = std::sqrt(
             origin.x * origin.x +
             origin.y * origin.y +
             origin.z * origin.z) / 40.0f;
 
         players.push_back({
-            origin,
-            screen_head,
-            screen_feet,
-            health,
-            team,
-            true,
-            dist,
-            box_h,
-            box_h * 0.45f
+            origin, screen_head, screen_feet,
+            health, team, true, dist,
+            box_h, box_h * 0.45f
         });
     }
 }
