@@ -10,10 +10,7 @@ public:
     IDXGISwapChain*         swapchain = nullptr;
     ID3D11RenderTargetView* rtv       = nullptr;
 
-    // cs2_hwnd: the SDL_app window we parent ourselves to.
-    // width/height: CS2 client rect dimensions.
-    bool create(HWND cs2_hwnd, int width, int height);
-
+    bool create(int width, int height);
     void begin_frame();
     void end_frame();
     void cleanup();
@@ -22,7 +19,7 @@ private:
     bool init_dx11(int width, int height);
     bool create_rtv();
     void release_rtv();
-    void update_input_mode();
+    void update_visibility_and_input();
 
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     WNDCLASSEXW wc{};
