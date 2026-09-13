@@ -19,8 +19,6 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
-// Try all 4 combos of (chunkOff, stride) and pick the one that finds most live players
-// Mirrors orbitalweb CalibrateEntityList exactly
 static void calibrate(const Memory& mem, uintptr_t entity_list,
                       uintptr_t local_pawn,
                       uintptr_t& best_off, uintptr_t& best_stride) {
@@ -28,11 +26,8 @@ static void calibrate(const Memory& mem, uintptr_t entity_list,
     constexpr Combo combos[] = {
         {0x10, 112}, {0x10, 120}, {0x08, 112}, {0x08, 120}
     };
-
     int best_score = -1;
-    best_off    = 0x10;
-    best_stride = 120;
-
+    best_off = 0x10; best_stride = 120;
     for (const auto& c : combos) {
         int score = 0;
         for (int chunk = 0; chunk < 4; chunk++) {
@@ -48,14 +43,12 @@ static void calibrate(const Memory& mem, uintptr_t entity_list,
             }
         }
         if (score > best_score) {
-            best_score  = score;
-            best_off    = c.off;
-            best_stride = c.stride;
+            best_score = score; best_off = c.off; best_stride = c.stride;
         }
     }
 }
 
-void ESP::update(const Memory& mem, uintptr_t client_base) {
+void ESP::update(const Memory& mem, uintptr_t client_base, int screen_w, int screen_h) {
     players.clear();
     debug_total_controllers = 0;
     debug_valid_pawns       = 0;
@@ -70,20 +63,15 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
-    // Calibrate once per session
-    static uintptr_t s_off    = 0;
-    static uintptr_t s_stride = 0;
-    static bool      s_done   = false;
+    static uintptr_t s_off = 0, s_stride = 0;
+    static bool s_done = false;
     if (!s_done) {
         calibrate(mem, entity_list, local_pawn, s_off, s_stride);
         s_done = true;
     }
 
-    // Store calibrated values in debug
-    debug_sample_health = (int)s_off;    // reuse field to show chunk offset
-    debug_sample_team   = (int)s_stride; // reuse field to show stride
-
-    constexpr int W = 1920, H = 1080;
+    debug_sample_health = (int)s_off;
+    debug_sample_team   = (int)s_stride;
 
     for (int chunk = 0; chunk < 4; chunk++) {
         uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + s_off + 8 * chunk);
@@ -112,8 +100,8 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
 
             Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
             Vec2 screen_head, screen_feet;
-            if (!world_to_screen(head,   screen_head, vm, W, H)) continue;
-            if (!world_to_screen(origin, screen_feet, vm, W, H)) continue;
+            if (!world_to_screen(head,   screen_head, vm, screen_w, screen_h)) continue;
+            if (!world_to_screen(origin, screen_feet, vm, screen_w, screen_h)) continue;
 
             float box_h = screen_feet.y - screen_head.y;
             if (box_h < 5.0f) continue;
