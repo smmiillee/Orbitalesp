@@ -1,4 +1,18 @@
 // --- src/bhop.cpp ---
+// Bhop via a direct write to the CS2 jump button.
+//
+//   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
+//
+// Only the ADDRESS moves, and it moves on every update -- so it is found at
+// runtime rather than hard-coded. The button block is 13 dwords on a 0x90
+// stride, which is what makes it findable without a fresh dump:
+//
+//   sprint -0x630   reload -0x5A0   attack -0x510   attack2 -0x480
+//   turnleft -0x3F0 turnright -0x360 forward -0x2D0  back -0x240
+//   left -0x1B0     right -0x120     use -0x090      JUMP   duck +0x090
+//
+// Unpressed button slots read EXACTLY 0 or 256, which is a very tight filter:
+// a random region of memory essentially never satisfies it for all 13 slots.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -9,7 +23,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 extern HWND g_cs2_hwnd;
 
@@ -18,14 +34,12 @@ namespace {
 constexpr int32_t kJumpPress   = 65537; // +jump
 constexpr int32_t kJumpRelease = 256;   // -jump
 
-// The 13 CS2 buttons sit on a fixed 0x90 stride in a fixed order; the LAYOUT is
-// stable even though the base address is not.
-constexpr intptr_t kButtonRel[] = {
+constexpr intptr_t kRel[] = {
     -0x630, -0x5A0, -0x510, -0x480, -0x3F0, -0x360, -0x2D0,
     -0x240, -0x1B0, -0x120, -0x090,  0x000,  0x090,
 };
-constexpr size_t kButtonCount = sizeof(kButtonRel) / sizeof(kButtonRel[0]);
-constexpr int    kJumpSlot    = 11;
+constexpr int kSlotCount = static_cast<int>(sizeof(kRel) / sizeof(kRel[0]));
+constexpr int kJumpSlot  = 11;
 
 std::atomic<bool>      g_stop{false}, g_started{false}, g_locked{false};
 std::atomic<bool>      g_scanning{false}, g_input_mode{false};
@@ -33,7 +47,6 @@ std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
 std::atomic<bool>      g_dbg_ground{false};
 std::atomic<bool>      g_dbg_focused{false};
 std::atomic<int>       g_dbg_signals{0};
-std::atomic<int>       g_dbg_calib{0};
 
 std::thread g_bhop_thread;
 std::thread g_scan_thread;
@@ -65,53 +78,129 @@ bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
-// ── jump-button scanner ──────────────────────────────────────────────────
-
-bool plausible_button(uint32_t v) {
-    return v == 0x0u || v == 0x1u || v == 0x100u
-        || v == 0x101u || v == 0x10000u || v == 0x10001u;
+bool key_down(int vk) {
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
-int held_slot_mask() {
-    int mask = 0;
-    if (GetAsyncKeyState('W') & 0x8000)      mask |= 1 << 6;
-    if (GetAsyncKeyState('S') & 0x8000)      mask |= 1 << 7;
-    if (GetAsyncKeyState('A') & 0x8000)      mask |= 1 << 8;
-    if (GetAsyncKeyState('D') & 0x8000)      mask |= 1 << 9;
-    if (GetAsyncKeyState(VK_SPACE) & 0x8000) mask |= 1 << kJumpSlot;
-    return mask;
+// Which button slots the user is physically holding, as a bitmask over kRel.
+int held_mask() {
+    int m = 0;
+    if (key_down(VK_SHIFT))   m |= 1 << 0;   // sprint
+    if (key_down('R'))        m |= 1 << 1;   // reload
+    if (key_down(VK_LBUTTON)) m |= 1 << 2;   // attack
+    if (key_down(VK_RBUTTON)) m |= 1 << 3;   // attack2
+    // slots 4/5 (turnleft/turnright) are usually unbound -> left unchecked
+    if (key_down('W'))        m |= 1 << 6;
+    if (key_down('S'))        m |= 1 << 7;
+    if (key_down('A'))        m |= 1 << 8;
+    if (key_down('D'))        m |= 1 << 9;
+    if (key_down('E'))        m |= 1 << 10;  // use
+    if (key_down(VK_SPACE))   m |= 1 << 11;  // jump
+    if (key_down(VK_CONTROL)) m |= 1 << 12;  // duck
+    return m;
 }
 
-bool block_ok(const Memory& mem, uintptr_t jump_addr, int mask) {
-    for (size_t i = 0; i < kButtonCount; ++i) {
-        const uint32_t v = mem.read<uint32_t>(
-            jump_addr + static_cast<uintptr_t>(kButtonRel[i]));
-        if (!plausible_button(v)) return false;
-        if ((mask & (1 << i)) && (v & 1u) == 0u) return false;
+// Is the 13-slot block anchored at j the button block?
+//
+//  * every slot the user IS holding must have its down bit set
+//  * every slot the user is NOT holding must read exactly 0 or 256
+//
+// The second rule is what stops the scanner from locking onto `forward` when
+// you hold W: from `forward`'s address the slot that would be "jump" reads
+// 0x10001, which is neither 0 nor 256, so it is rejected.
+bool block_valid(uintptr_t j, int mask, bool require_mixed) {
+    int pressed = 0, released = 0;
+    for (int i = 0; i < kSlotCount; ++i) {
+        const uint32_t v = g_mem.read<uint32_t>(j + kRel[i]);
+
+        if (i == 4 || i == 5) {   // turnleft / turnright: unbound, accept anything
+            if (v != 0u && v != 0x100u && v != 0x10000u &&
+                v != 0x101u && v != 0x10001u) return false;
+            continue;
+        }
+
+        if ((mask >> i) & 1) {
+            if ((v & 1u) == 0u) return false;         // must be held
+            ++pressed;
+        } else {
+            if (v != 0u && v != 0x100u) return false; // must be idle
+            ++released;
+        }
     }
-    if (!(mask & (1 << kJumpSlot)) && (mem.read<uint32_t>(jump_addr) & 1u))
-        return false;
+    // Without a key held we need at least one latent 256, otherwise a long run
+    // of zeros would match every 0x90 stride inside it.
+    if (require_mixed && pressed == 0 && released == kSlotCount) {
+        bool any_256 = false;
+        for (int i = 0; i < kSlotCount; ++i)
+            if (g_mem.read<uint32_t>(j + kRel[i]) == 0x100u) any_256 = true;
+        if (!any_256) return false;
+    }
     return true;
 }
 
-bool sweep(int mask) {
-    const uintptr_t center = g_mem.client_dll + offsets::dwForceJump;
-    const uintptr_t lo = center - offsets::kJumpScanRadius;
-    const uintptr_t hi = center + offsets::kJumpScanRadius;
+// Sweep the window for dwords equal to 0x10001, then check the block.
+uintptr_t scan_pressed(int mask) {
+    const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
+    const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
 
-    for (uintptr_t a = lo; a <= hi; a += offsets::kScanStep) {
-        if (g_stop.load()) return false;
-        if (held_slot_mask() == 0) return false;
-        if (mask != held_slot_mask()) return false;
-        if (!block_ok(g_mem, a, mask)) continue;
+    static std::vector<uint8_t> buf;
+    const size_t piece = 0x10000;
+    if (buf.size() < piece) buf.resize(piece);
 
-        wait_ms(25);
-        if (!block_ok(g_mem, a, held_slot_mask())) continue;
+    for (uintptr_t a = lo; a + piece <= hi; a += piece) {
+        if (g_stop.load()) return 0;
+        if (!g_mem.read_bytes(a, buf.data(), piece)) continue;
 
-        g_jump_offset.store(a - g_mem.client_dll);
-        return true;
+        for (size_t k = 0; k + 4 <= piece; k += 4) {
+            uint32_t v = 0;
+            std::memcpy(&v, buf.data() + k, 4);
+            if (v != 0x10001u) continue;
+
+            const uintptr_t cand = a + k;
+            if (held_mask() != mask) return 0;      // keys changed, retry later
+            if (!block_valid(cand, mask, false)) continue;
+
+            wait_ms(25);
+            if (held_mask() != mask) return 0;      // keys changed, retry later
+            if (!block_valid(cand, mask, false)) continue;
+            return cand;
+        }
     }
-    return false;
+    return 0;
+}
+
+// Sweep for the block with nothing held (all slots 0 or 256).
+uintptr_t scan_idle() {
+    const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
+    const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
+
+    static std::vector<uint8_t> buf;
+    const size_t piece = 0x10000;
+    if (buf.size() < piece) buf.resize(piece);
+
+    uintptr_t found = 0;
+    int hits = 0;
+
+    for (uintptr_t a = lo; a + piece <= hi; a += piece) {
+        if (g_stop.load()) return 0;
+        if (!g_mem.read_bytes(a, buf.data(), piece)) continue;
+
+        for (size_t k = 0; k + 4 <= piece; k += 4) {
+            uint32_t v = 0;
+            std::memcpy(&v, buf.data() + k, 4);
+            if (v != 0u && v != 0x100u) continue;
+
+            const uintptr_t cand = a + k;
+            const uintptr_t anchor =
+                cand - static_cast<uintptr_t>(kRel[0]);  // candidate jump addr
+            if (anchor < g_mem.client_dll) continue;
+            if (!block_valid(anchor, 0, true)) continue;
+
+            if (found != anchor) { ++hits; found = anchor; }
+            if (hits > 3) return 0;   // too many matches, not distinctive
+        }
+    }
+    return (hits == 1) ? found : 0;
 }
 
 void scan_thread_main() {
@@ -120,14 +209,20 @@ void scan_thread_main() {
     while (!g_stop.load()) {
         if (g_locked.load()) { wait_ms(500); continue; }
 
-        const int mask = held_slot_mask();
-        if (mask == 0) { wait_ms(50); continue; }
-
         g_scanning.store(true);
-        if (sweep(mask)) g_locked.store(true);
+
+        uintptr_t hit = 0;
+        const int mask = held_mask();
+        if (mask != 0) hit = scan_pressed(mask);
+        if (!hit)      hit = scan_idle();
+
+        if (hit) {
+            g_jump_offset.store(hit - g_mem.client_dll);
+            g_locked.store(true);
+        }
         g_scanning.store(false);
 
-        if (!g_locked.load()) wait_ms(200);
+        if (!g_locked.load()) wait_ms(300);
     }
 }
 
@@ -138,7 +233,6 @@ struct GroundWatch {
     float  z = 0.0f;
     double z_changed = 0.0;
     bool   z_ground = true;
-
     int    flag_g = 0, flag_a = 0;
     int    hge_g  = 0, hge_a  = 0;
     bool   flag_ok = false, hge_ok = false;
@@ -172,7 +266,6 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     if (g_gw.flag_ok) sig |= 2;
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
-    g_dbg_calib.store(sig == 1 ? 40 : (sig == 3 || sig == 5 ? 75 : 100));
 
     const bool ground = g_gw.z_ground
                      || (g_gw.flag_ok && (fl & 1u))
@@ -197,9 +290,6 @@ void bhop_thread_main() {
 
         const uintptr_t jump_addr = g_mem.client_dll + g_jump_offset.load();
 
-        // Note: the menu no longer gates bhop. The overlay is non-activating,
-        // so CS2 keeps keyboard focus even with the menu open -- which means
-        // the panel can show live ground/signals while you play.
         const bool focused = cs2_focused();
         g_dbg_focused.store(focused);
 
@@ -207,7 +297,7 @@ void bhop_thread_main() {
             g_mem.write<int32_t>(jump_addr, kJumpRelease);
             continue;
         }
-        if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
+        if (!key_down(VK_SPACE)) {
             g_mem.write<int32_t>(jump_addr, kJumpRelease);
             continue;
         }
@@ -224,14 +314,14 @@ void bhop_thread_main() {
         }
 
         // Sample at 2 ms but write every loop (~1 ms), so the button state is
-        // already settled before the game reads input for the next tick.
+        // settled before the game reads input for the next tick.
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
         // On the ground -> press, which re-jumps on every landing. Airborne ->
-        // release, so the next landing is always a fresh press edge.
+        // release, so the landing is always a fresh press edge.
         g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
     }
 }
@@ -257,13 +347,12 @@ void Bhop_Shutdown() {
 
 BhopDebug Bhop_GetDebug() {
     BhopDebug d;
-    d.offset      = g_jump_offset.load();
-    d.on_ground   = g_dbg_ground.load();
-    d.focused     = g_dbg_focused.load();
-    d.signals     = g_dbg_signals.load();
-    d.calibrating = g_dbg_calib.load();
-    d.locked      = g_locked.load();
-    d.scanning    = g_scanning.load();
+    d.offset    = g_jump_offset.load();
+    d.on_ground = g_dbg_ground.load();
+    d.focused   = g_dbg_focused.load();
+    d.signals   = g_dbg_signals.load();
+    d.locked    = g_locked.load();
+    d.scanning  = g_scanning.load();
     return d;
 }
 
