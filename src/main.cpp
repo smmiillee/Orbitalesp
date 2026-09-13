@@ -9,11 +9,11 @@
 #include "offsets.h"
 #include "bhop.h"
 
-// Non-static so the extern Memory g_mem declaration in memory.h resolves.
-// bhop.cpp reads g_mem.base_address and g_mem.read<>() directly.
+// Non-static: extern Memory g_mem declared in memory.h — bhop.cpp reads it directly.
 Memory g_mem;
-static ESP    g_esp;
-static bool   g_running = true;
+static ESP  g_esp;
+static bool g_running   = true;
+bool        g_menu_open = false; // extern'd in overlay.cpp for input mode toggling
 
 struct Config {
     bool   esp_boxes     = true;
@@ -25,7 +25,8 @@ struct Config {
     ImVec4 color_team    = { 0.2f, 1.0f, 0.4f, 1.0f };
 } g_cfg;
 
-bool g_menu_open = false;
+static int g_screen_w = 1920;
+static int g_screen_h = 1080;
 
 void memory_thread() {
     while (g_running) {
@@ -37,21 +38,22 @@ void memory_thread() {
     }
 }
 
-void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
+void render_esp(ImDrawList* dl) {
     for (const auto& p : g_esp.players) {
         if (g_cfg.enemy_only && p.team == 2) continue;
 
         ImVec4 col4 = (p.team == 3) ? g_cfg.color_enemy : g_cfg.color_team;
         ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
 
-        // screen_head is the top-of-head screen position (Vec2)
         float cx  = p.screen_head.x;
         float top = p.screen_head.y;
         float bot = p.screen_feet.y;
         float bh  = bot - top;
         float bw  = bh * 0.45f;
 
-        if (cx < 0 || cx > screen_w || top < 0 || bot > screen_h) continue;
+        if (bh < 5.0f) continue;
+        if (cx - bw / 2.0f > g_screen_w || cx + bw / 2.0f < 0) continue;
+        if (top > g_screen_h || bot < 0) continue;
 
         if (g_cfg.esp_boxes) {
             dl->AddRect(
@@ -61,8 +63,6 @@ void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
             );
         }
 
-        float label_y = top - 14.0f;
-
         if (g_cfg.esp_health) {
             float bar_h  = bh * (p.health / 100.0f);
             float bar_x  = cx - bw / 2.0f - 6.0f;
@@ -71,28 +71,28 @@ void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
                 (int)(255 * (p.health / 100.0f)),
                 0, 255
             );
-            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
-            dl->AddRect      ({ bar_x, top },          { bar_x + 3.0f, bot }, IM_COL32(0, 0, 0, 180));
+            dl->AddRectFilled({ bar_x,        bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
+            dl->AddRect      ({ bar_x,        top         }, { bar_x + 3.0f, bot }, IM_COL32(0, 0, 0, 180));
         }
 
         if (g_cfg.esp_distance) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, label_y }, IM_COL32(255, 255, 255, 200), buf);
+            dl->AddText({ cx - 12.0f, top - 14.0f }, IM_COL32(255, 255, 255, 200), buf);
         }
     }
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 280, 260 }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({ 280, 280 }, ImGuiCond_Once);
     ImGui::SetNextWindowPos ({ 30,  30  }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoResize);
 
     ImGui::SeparatorText("ESP");
-    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health",     &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
-    ImGui::Checkbox("Enemy Only", &g_cfg.enemy_only);
+    ImGui::Checkbox("Boxes",       &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health",      &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",    &g_cfg.esp_distance);
+    ImGui::Checkbox("Enemy Only",  &g_cfg.enemy_only);
 
     ImGui::SeparatorText("Colors");
     ImGui::ColorEdit4("Enemy", &g_cfg.color_enemy.x, ImGuiColorEditFlags_NoInputs);
@@ -102,6 +102,10 @@ void render_menu() {
     ImGui::SliderFloat("Thickness", &g_cfg.box_thickness, 0.5f, 4.0f);
 
     ImGui::Separator();
+    ImGui::TextDisabled("INSERT - toggle menu");
+    ImGui::TextDisabled("F9     - exit");
+    ImGui::Separator();
+
     if (!g_mem.is_valid())
         ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "CS2 not found");
     else
@@ -111,13 +115,15 @@ void render_menu() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    g_screen_w = GetSystemMetrics(SM_CXSCREEN);
+    g_screen_h = GetSystemMetrics(SM_CYSCREEN);
+
     while (!g_mem.attach(L"cs2.exe")) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 
-    constexpr int W = 1920, H = 1080;
     Overlay overlay;
-    if (!overlay.create(W, H)) return 1;
+    if (!overlay.create(g_screen_w, g_screen_h)) return 1;
 
     std::thread mem_t(memory_thread);
 
@@ -130,12 +136,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
+        if (GetAsyncKeyState(VK_F9)     & 1) g_running   = false;
         if (GetAsyncKeyState(VK_END)    & 1) g_running   = false;
 
         overlay.begin_frame();
 
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        render_esp(dl, W, H);
+        render_esp(dl);
         if (g_menu_open) render_menu();
 
         overlay.end_frame();
