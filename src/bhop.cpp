@@ -1,4 +1,7 @@
 // --- src/bhop.cpp ---
+// Bhop via SendInput keyboard jump — no bind required.
+// Detects landing frame via m_hGroundEntity, sends a SPACE keydown+keyup
+// through the Win32 input stack on the landing tick.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -6,44 +9,44 @@
 #include <thread>
 #include <chrono>
 
-static constexpr uintptr_t m_hGroundEntity = 0x50C;
+constexpr uintptr_t m_hGroundEntity = 0x50C;
 
-static void SendScrollDown() {
-    INPUT inp{};
-    inp.type         = INPUT_MOUSE;
-    inp.mi.dwFlags   = MOUSEEVENTF_WHEEL;
-    inp.mi.mouseData = static_cast<DWORD>(-WHEEL_DELTA);
-    SendInput(1, &inp, sizeof(INPUT));
+static void send_jump() {
+    INPUT inputs[2]{};
+
+    // SPACE down
+    inputs[0].type       = INPUT_KEYBOARD;
+    inputs[0].ki.wVk     = VK_SPACE;
+    inputs[0].ki.dwFlags = 0;
+
+    // SPACE up
+    inputs[1].type       = INPUT_KEYBOARD;
+    inputs[1].ki.wVk     = VK_SPACE;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(2, inputs, sizeof(INPUT));
 }
 
 void BhopTick() {
-    static uint32_t lastGroundEntity = 0xFFFFFFFF;
-    static bool     wasInAir         = false;
+    static bool wasInAir = false;
 
+    // Only run when player is holding space
     if (!(GetAsyncKeyState(VK_SPACE) & 0x8000)) {
-        lastGroundEntity = 0xFFFFFFFF;
-        wasInAir         = false;
+        wasInAir = false;
         return;
     }
 
-    HWND cs2Hwnd = FindWindowA("SDL_app", nullptr);
-    if (!cs2Hwnd || GetForegroundWindow() != cs2Hwnd)
-        return;
-
-    // Use client_dll base — dwLocalPlayerPawn is a client.dll offset
-    uintptr_t localPawn = g_mem.read<uintptr_t>(
+    uintptr_t local_pawn = g_mem.read<uintptr_t>(
         g_mem.client_dll + offsets::dwLocalPlayerPawn);
-    if (!localPawn) return;
+    if (!local_pawn) return;
 
-    uint32_t groundEnt = g_mem.read<uint32_t>(localPawn + m_hGroundEntity);
-    bool inAir = (groundEnt == 0xFFFFFFFF);
+    uint32_t ground = g_mem.read<uint32_t>(local_pawn + m_hGroundEntity);
+    bool inAir = (ground == 0xFFFFFFFF);
 
     if (wasInAir && !inAir) {
-        SendScrollDown();
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
-        SendScrollDown();
+        // Just landed — send jump immediately
+        send_jump();
     }
 
-    wasInAir         = inAir;
-    lastGroundEntity = groundEnt;
+    wasInAir = inAir;
 }
