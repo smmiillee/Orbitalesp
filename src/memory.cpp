@@ -1,6 +1,8 @@
 // --- src/memory.cpp ---
 #include "memory.h"
 
+Memory g_mem;
+
 bool Memory::attach(const std::wstring& process_name) {
     DWORD pid = get_process_id(process_name);
     if (!pid) return false;
@@ -8,8 +10,13 @@ bool Memory::attach(const std::wstring& process_name) {
     process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!process_handle) return false;
 
+    // cs2.exe base
     base_address = get_module_base(pid, process_name);
-    return base_address != 0;
+
+    // client.dll base — this is where ALL offsets (dwEntityList, dwViewMatrix etc) live
+    client_dll = get_module_base(pid, L"client.dll");
+
+    return client_dll != 0;
 }
 
 void Memory::detach() {
@@ -18,6 +25,7 @@ void Memory::detach() {
         process_handle = nullptr;
     }
     base_address = 0;
+    client_dll   = 0;
 }
 
 DWORD Memory::get_process_id(const std::wstring& process_name) const {
@@ -27,7 +35,6 @@ DWORD Memory::get_process_id(const std::wstring& process_name) const {
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
-
     if (Process32FirstW(snap, &entry)) {
         do {
             if (process_name == entry.szExeFile) {
@@ -47,7 +54,6 @@ uintptr_t Memory::get_module_base(DWORD pid, const std::wstring& module_name) co
 
     MODULEENTRY32W entry{};
     entry.dwSize = sizeof(entry);
-
     if (Module32FirstW(snap, &entry)) {
         do {
             if (module_name == entry.szModule) {
