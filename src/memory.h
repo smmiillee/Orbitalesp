@@ -8,7 +8,8 @@
 class Memory {
 public:
     HANDLE    process_handle = nullptr;
-    uintptr_t base_address   = 0;
+    uintptr_t base_address   = 0;  // cs2.exe base (kept for compatibility)
+    uintptr_t client_dll     = 0;  // client.dll base — ALL game offsets live here
 
     bool attach(const std::wstring& process_name);
     void detach();
@@ -24,14 +25,13 @@ public:
     }
 
     bool is_valid() const {
-        return process_handle != nullptr && base_address != 0;
+        return process_handle != nullptr && client_dll != 0;
     }
 
-private:
-    DWORD     get_process_id(const std::wstring& process_name) const;
     uintptr_t get_module_base(DWORD pid, const std::wstring& module_name) const;
+
+private:
+    DWORD get_process_id(const std::wstring& process_name) const;
 };
 
-// Defined in main.cpp — visible to every TU that includes this header.
-// bhop.cpp uses g_mem.read<>() and g_mem.base_address directly.
 extern Memory g_mem;
