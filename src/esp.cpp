@@ -32,51 +32,53 @@ void lerp3(Vec3& out, const Vec3& a, const Vec3& b, float f) {
     out.z = a.z + (b.z - a.z) * f;
 }
 
-// ── entity access ────────────────────────────────────────────────────────
-
-struct EntHead {
-    int      health = 0;
-    int      team = 0;
-    uint32_t flags = 0;
-};
-
-// One 0x100 window covers health/team/flags. Falls back to three separate
-// reads -- and that fallback is the path the working build used, so a refusal
-// here can never be what empties the player list again.
-bool read_ent_head(const Memory& mem, uintptr_t ent, EntHead& out) {
-    uint8_t buf[0x100];
-    if (mem.read_bytes(ent + 0x340, buf, sizeof(buf))) {
-        std::memcpy(&out.health, buf + (offsets::m_iHealth - 0x340), 4);
-        out.team = buf[offsets::m_iTeamNum - 0x340];
-        std::memcpy(&out.flags, buf + (offsets::m_fFlags - 0x340), 4);
-        return true;
-    }
-    out.health = mem.read<int>(ent + offsets::m_iHealth);
-    out.team   = mem.read<uint8_t>(ent + offsets::m_iTeamNum);
-    out.flags  = mem.read<uint32_t>(ent + offsets::m_fFlags);
-    return true;
-}
-
 Vec3 read_origin(const Memory& mem, uintptr_t ent) {
     Vec3 v{};
     mem.read_bytes(ent + offsets::m_vOldOrigin, &v, sizeof(v));
     return v;
 }
 
-// ── enumeration ──────────────────────────────────────────────────────────
-// Reads each chunk in 16 KB pieces so one unreadable page can't fail the whole
-// scan, and falls back to per-slot reads (the proven path) if a chunk won't
-// read at all. Whatever happens, something sensible comes out.
+// ── entity access ────────────────────────────────────────────────────────
+
+struct EntHead { int health = 0; int team = 0; };
+
+// One 0x100 window covers health and team. Falls back to two separate reads --
+// the exact path the earlier working build used, so a refused bulk read can
+// never be what empties the player list.
+EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
+    EntHead o;
+    uint8_t buf[0x100];
+    if (mem.read_bytes(ent + 0x340, buf, sizeof(buf))) {
+        std::memcpy(&o.health, buf + (offsets::m_iHealth - 0x340), 4);
+        o.team = buf[offsets::m_iTeamNum - 0x340];
+        return o;
+    }
+    o.health = mem.read<int>(ent + offsets::m_iHealth);
+    o.team   = mem.read<uint8_t>(ent + offsets::m_iTeamNum);
+    return o;
+}
+
+// ── entity-list enumeration ──────────────────────────────────────────────
+// *** THE BUG THAT EMPTIED THE LIST ***
+// This used to read each 61 KB chunk in fixed 16 KB pieces, then step by the
+// slot stride from each piece start. But 16384 is not a multiple of the 120
+// byte stride (16384/120 = 136.5), so only the FIRST piece landed on real slot
+// boundaries -- every later piece read from 64 bytes inside a slot and
+// returned noise. Pawns past slot 136 were therefore never seen at all.
+//
+// The fix is to make each read exactly a whole number of slots.
 void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                      uintptr_t stride, std::vector<uintptr_t>& out,
                      bool& used_bulk) {
     out.clear();
     used_bulk = false;
+    if (!stride) return;
+
+    constexpr size_t kSlotsPerRead = 128;           // 128 * 120 = 15 KB
+    const size_t piece_bytes = kSlotsPerRead * stride;
 
     static std::vector<uint8_t> buf;
-    const size_t chunk_bytes = static_cast<size_t>(offsets::kSlots) * stride;
-    const size_t piece = 0x4000;
-    if (buf.size() < piece) buf.resize(piece);
+    if (buf.size() < piece_bytes) buf.resize(piece_bytes);
 
     for (int ch = 0; ch < offsets::kChunks; ++ch) {
         const uintptr_t base = mem.read<uintptr_t>(el + chunk_off + 8 * ch);
@@ -85,12 +87,21 @@ void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         std::vector<uintptr_t> local;
         bool ok = true;
 
-        for (size_t off = 0; off < chunk_bytes; off += piece) {
-            const size_t n = (std::min)(piece, chunk_bytes - off);
-            if (!mem.read_bytes(base + off, buf.data(), n)) { ok = false; break; }
-            for (size_t k = 0; k + 8 <= n; k += stride) {
+        for (size_t s0 = 0; s0 < static_cast<size_t>(offsets::kSlots);
+             s0 += kSlotsPerRead) {
+            const size_t n_slots =
+                (std::min)(kSlotsPerRead,
+                           static_cast<size_t>(offsets::kSlots) - s0);
+            const size_t bytes = n_slots * stride;
+
+            // Always a whole number of slots from a slot-aligned start.
+            if (!mem.read_bytes(base + s0 * stride, buf.data(), bytes)) {
+                ok = false;
+                break;
+            }
+            for (size_t k = 0; k < n_slots; ++k) {
                 uintptr_t e = 0;
-                std::memcpy(&e, buf.data() + k, 8);
+                std::memcpy(&e, buf.data() + k * stride, 8);
                 if (valid_ptr(e)) local.push_back(e);
             }
         }
@@ -107,21 +118,20 @@ void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     }
 }
 
-// Slots -> live player pawns.
+// Slots -> live player pawns, with staged counters so a failure is visible.
 void collect_pawns(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                   uintptr_t stride, std::vector<uintptr_t>& out,
-                   bool& bulk, int& slots_n) {
-    std::vector<uintptr_t> slots;
-    enumerate_slots(mem, el, chunk_off, stride, slots, bulk);
-    slots_n = static_cast<int>(slots.size());
+                   uintptr_t stride, std::vector<uintptr_t>& all,
+                   std::vector<uintptr_t>& hp, std::vector<uintptr_t>& team_ok,
+                   bool& bulk) {
+    enumerate_slots(mem, el, chunk_off, stride, all, bulk);
 
-    out.clear();
-    for (uintptr_t e : slots) {
-        EntHead h;
-        if (!read_ent_head(mem, e, h)) continue;
+    hp.clear();
+    team_ok.clear();
+    for (uintptr_t e : all) {
+        const EntHead h = read_ent_head(mem, e);
         if (h.health <= 0 || h.health > 100) continue;
-        if (h.team != 2 && h.team != 3) continue;
-        out.push_back(e);
+        hp.push_back(e);
+        if (h.team == 2 || h.team == 3) team_ok.push_back(e);
     }
 }
 
@@ -135,14 +145,28 @@ uintptr_t resolve_handle(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     return mem.read<uintptr_t>(chunk + stride * (idx & 0x1FF));
 }
 
-void sanitize(char* dst, size_t cap, const char* src) {
+void sanitize(char* dst, size_t cap, const char* src, size_t src_len) {
     size_t j = 0;
-    for (size_t i = 0; i + 1 < cap; ++i) {
+    for (size_t i = 0; i + 1 < cap && i < src_len; ++i) {
         const unsigned char ch = static_cast<unsigned char>(src[i]);
         if (ch == 0) break;
         if (ch >= 32 && ch < 127) dst[j++] = static_cast<char>(ch);
     }
     dst[j] = '\0';
+}
+
+// A plausible player name: printable, short, and not a run of one character.
+bool name_looks_ok(const char* s) {
+    size_t n = 0;
+    for (; n < 32 && s[n]; ++n) {
+        const unsigned char ch = static_cast<unsigned char>(s[n]);
+        if (ch < 32 || ch >= 127) return false;
+    }
+    if (n < 2) return false;
+    bool varied = false;
+    for (size_t i = 1; i < n; ++i)
+        if (s[i] != s[0]) { varied = true; break; }
+    return varied;
 }
 
 // ── skeleton ─────────────────────────────────────────────────────────────
@@ -311,60 +335,53 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
     const Vec3 local_origin = read_origin(mem, local_pawn);
 
-    // ── refresh the pawn list ~10x/sec ───────────────────────────────────
     static std::vector<uintptr_t> slots;
     static std::vector<uintptr_t> pawns;
-    static double slots_at   = -1e9;
-    static double last_calib = -1e9;
-    static int    refresh_n  = 0;
+    static double slots_at = -1e9;
+    static int    refresh_n = 0;
 
+    // ── refresh the pawn list ~10x/sec, auto-detecting the list layout ────
     if (now - slots_at > 100.0) {
         slots_at = now;
 
-        bool bulk = false;
-        int  slots_n = 0;
-        std::vector<uintptr_t> found;
-        collect_pawns(mem, el, c_.chunk_off, c_.slot_stride, found, bulk, slots_n);
+        struct Layout { uintptr_t off, stride; };
+        static const Layout kLayouts[] = {
+            {0x10, 120}, {0x10, 112}, {0x08, 120}, {0x08, 112},
+        };
 
-        // Nothing found -> re-derive the entity-list layout from scratch. The
-        // pair that produces the most live players wins, which is exactly the
-        // calibration the working build used.
-        if (found.empty() && now - last_calib > 500.0) {
-            last_calib = now;
-            static const uintptr_t offs[]    = { 0x10, 0x08 };
-            static const uintptr_t strides[] = { 120, 112 };
-            int best = 0;
-            for (uintptr_t o : offs) {
-                for (uintptr_t s : strides) {
-                    bool b2 = false;
-                    int  n2 = 0;
-                    std::vector<uintptr_t> tmp;
-                    collect_pawns(mem, el, o, s, tmp, b2, n2);
-                    if (static_cast<int>(tmp.size()) > best) {
-                        best = static_cast<int>(tmp.size());
-                        found = std::move(tmp);
-                        bulk = b2;
-                        slots_n = n2;
-                        c_.chunk_off   = o;
-                        c_.slot_stride = s;
-                    }
-                }
+        int best = -1;
+        for (const Layout& L : kLayouts) {
+            std::vector<uintptr_t> all, hp, tm;
+            bool bulk = false;
+            collect_pawns(mem, el, L.off, L.stride, all, hp, tm, bulk);
+
+            if (static_cast<int>(hp.size()) > best) {
+                best = static_cast<int>(hp.size());
+                c_.chunk_off   = L.off;
+                c_.slot_stride = L.stride;
+                slots = std::move(all);
+                // Prefer the team-filtered set; if the team offset is stale and
+                // nothing matched, fall back to health-only so boxes still draw.
+                pawns = tm.empty() ? hp : tm;
+                diag_slots = static_cast<int>(slots.size());
+                diag_hp    = static_cast<int>(hp.size());
+                diag_team  = static_cast<int>(tm.size());
+                diag_bulk  = bulk;
             }
         }
+        if (best <= 0) pawns.clear();
 
-        pawns        = std::move(found);
-        slots_found  = slots_n;
-        enum_bulk    = bulk;
         ++refresh_n;
 
-        // Names / weapons change rarely -- a couple of times a second is plenty.
-        if (refresh_n % 5 == 0) {
+        // ── names / weapons: slow-moving, refresh a couple of times a second
+        if (refresh_n % 5 == 0 && !pawns.empty()) {
+            // controller -> pawn handle. Prefer the schema value, then vote.
             if (!c_.ctrl_ok) {
                 static const uintptr_t cand[] = {
-                    0x900, 0x904, 0x908, 0x90C, 0x910, 0x914,
-                    0x918, 0x91C, 0x920, 0x8F8, 0x8FC, 0x924
+                    0x90C, 0x8FC, 0x908, 0x900, 0x910, 0x914,
+                    0x918, 0x91C, 0x920, 0x924, 0x8F8, 0x904,
                 };
-                int best = 0;
+                int best_v = 0;
                 for (uintptr_t off : cand) {
                     int score = 0;
                     for (uintptr_t s : slots) {
@@ -376,52 +393,84 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                                  pawns.end())
                             ++score;
                     }
-                    if (score > best) { best = score; c_.ctrl_link = off; }
+                    if (score > best_v) { best_v = score; c_.ctrl_link = off; }
                 }
-                c_.ctrl_ok = best >= 1;
+                c_.ctrl_ok = best_v >= 1;
             }
 
+            // name offset: pick whichever candidate yields a real-looking name
+            // for the most controllers.
+            if (c_.ctrl_ok && !c_.name_ok) {
+                static const uintptr_t name_c[] = {
+                    0x6F4, 0x6E8, 0x700, 0x6E0, 0x6C8, 0x708, 0x710, 0x6D8,
+                };
+                int best_v = 0;
+                for (uintptr_t off : name_c) {
+                    int score = 0;
+                    for (uintptr_t s : slots) {
+                        const uint32_t h = mem.read<uint32_t>(s + c_.ctrl_link);
+                        if (!h || h == 0xFFFFFFFFu) continue;
+                        const uintptr_t ctrl = resolve_handle(
+                            mem, el, c_.chunk_off, c_.slot_stride, h);
+                        if (!ctrl) continue;
+                        char raw[32] = {};
+                        if (!mem.read_bytes(ctrl + off, raw, sizeof(raw)))
+                            continue;
+                        if (name_looks_ok(raw)) ++score;
+                    }
+                    if (score > best_v) { best_v = score; c_.name_off = off; }
+                }
+                c_.name_ok = best_v >= 2;
+            }
+
+            // weapon chain: services ptr -> active weapon handle -> defindex.
+            // Graded by whether the id is a real weapon, so a wrong candidate
+            // can't win.
             if (!c_.weapon_ok && pawns.size() >= 2) {
                 static const uintptr_t svc_c[] = {
-                    0x11E0, 0x11D8, 0x11E8, 0x13D8, 0x13E0, 0x13D0, 0x1200
+                    0x13F0, 0x11E0, 0x11D8, 0x11E8, 0x13D8, 0x13E0, 0x1200,
                 };
+                static const uintptr_t act_c[] = { 0x58, 0x60, 0x50 };
                 static const uintptr_t attr_c[] = { 0x1180, 0x1378, 0x1370 };
 
-                int best = 0;
+                int best_v = 0;
                 for (uintptr_t so : svc_c) {
-                    for (uintptr_t ao : attr_c) {
-                        int score = 0;
-                        for (uintptr_t p : pawns) {
-                            const uintptr_t svc = mem.read<uintptr_t>(p + so);
-                            if (!valid_ptr(svc)) continue;
-                            const uint32_t h =
-                                mem.read<uint32_t>(svc + offsets::m_hActiveWeapon);
-                            const uintptr_t w = resolve_handle(
-                                mem, el, c_.chunk_off, c_.slot_stride, h);
-                            if (!valid_ptr(w)) continue;
-                            const uint16_t id = mem.read<uint16_t>(
-                                w + ao + offsets::m_AttributeItem +
-                                offsets::m_iItemDefinitionIndex);
-                            const bool plausible =
-                                (id >= 1 && id <= 90) || (id >= 500 && id <= 600);
-                            if (plausible) ++score;
-                        }
-                        if (score > best) {
-                            best = score;
-                            c_.wservices = so;
-                            c_.attrmgr   = ao;
+                    for (uintptr_t ao : act_c) {
+                        for (uintptr_t at : attr_c) {
+                            int score = 0;
+                            for (uintptr_t p : pawns) {
+                                const uintptr_t svc = mem.read<uintptr_t>(p + so);
+                                if (!valid_ptr(svc)) continue;
+                                const uint32_t h =
+                                    mem.read<uint32_t>(svc + ao);
+                                const uintptr_t w = resolve_handle(
+                                    mem, el, c_.chunk_off, c_.slot_stride, h);
+                                if (!valid_ptr(w)) continue;
+                                const uint16_t id = mem.read<uint16_t>(
+                                    w + at + 0x50 + 0x1BA);
+                                const bool plausible =
+                                    (id >= 1 && id <= 90) ||
+                                    (id >= 500 && id <= 600);
+                                if (plausible) ++score;
+                            }
+                            if (score > best_v) {
+                                best_v = score;
+                                c_.wservices = so;
+                                c_.wactive   = ao;
+                                c_.attrmgr   = at;
+                            }
                         }
                     }
                 }
-                c_.weapon_ok = best >= 1;
+                c_.weapon_ok = best_v >= 1;
             }
 
+            // pull name + weapon per pawn
             for (uintptr_t p : pawns) {
                 for (Track& t : tracks_) {
                     if (t.pawn != p) continue;
-                    t.last_info = now;
 
-                    if (c_.ctrl_ok) {
+                    if (c_.ctrl_ok && c_.name_ok) {
                         for (uintptr_t s : slots) {
                             const uint32_t h =
                                 mem.read<uint32_t>(s + c_.ctrl_link);
@@ -429,12 +478,11 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                             const uintptr_t ctrl = resolve_handle(
                                 mem, el, c_.chunk_off, c_.slot_stride, h);
                             if (ctrl != p) continue;
-                            char raw[128] = {};
-                            if (mem.read_bytes(ctrl + offsets::m_iszPlayerName,
-                                               raw, sizeof(raw))) {
-                                raw[127] = '\0';
-                                sanitize(t.name, sizeof(t.name), raw);
-                            }
+                            char raw[32] = {};
+                            if (mem.read_bytes(ctrl + c_.name_off, raw,
+                                               sizeof(raw)))
+                                sanitize(t.name, sizeof(t.name), raw,
+                                         sizeof(raw));
                             break;
                         }
                     }
@@ -442,20 +490,17 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                     if (c_.weapon_ok) {
                         const uintptr_t svc = mem.read<uintptr_t>(p + c_.wservices);
                         if (valid_ptr(svc)) {
-                            const uint32_t h = mem.read<uint32_t>(
-                                svc + offsets::m_hActiveWeapon);
+                            const uint32_t h =
+                                mem.read<uint32_t>(svc + c_.wactive);
                             const uintptr_t w = resolve_handle(
                                 mem, el, c_.chunk_off, c_.slot_stride, h);
                             if (valid_ptr(w)) {
                                 const uint16_t id = mem.read<uint16_t>(
-                                    w + c_.attrmgr + offsets::m_AttributeItem +
-                                    offsets::m_iItemDefinitionIndex);
+                                    w + c_.attrmgr + 0x50 + 0x1BA);
                                 const char* nm = weapon_name(id);
                                 if (nm)
                                     std::snprintf(t.weapon, sizeof(t.weapon),
                                                   "%s", nm);
-                                else
-                                    t.weapon[0] = '\0';
                             }
                         }
                     }
@@ -494,8 +539,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     int bone_hits = 0;
 
     for (uintptr_t p : pawns) {
-        EntHead h;
-        if (!read_ent_head(mem, p, h)) continue;
+        const EntHead h = read_ent_head(mem, p);
         if (h.health <= 0 || h.health > 100) continue;
 
         const Vec3 origin = read_origin(mem, p);
@@ -527,7 +571,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         const float dy = origin.y - local_origin.y;
         const float dz = origin.z - local_origin.z;
 
-        Track moved = *dst;
+        Track moved = *dst;      // copies history + name + weapon
         moved.health    = h.health;
         moved.team      = h.team;
         moved.distance  = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
@@ -544,49 +588,47 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     Vec3  bomb_origin{};
     float bomb_timer = -1.0f;
 
-    if (offsets::dwPlantedC4) {
-        const uintptr_t planted = mem.read<uintptr_t>(
-            client_base + offsets::dwPlantedC4);
-        if (valid_ptr(planted)) {
-            const uintptr_t node = mem.read<uintptr_t>(
-                planted + offsets::m_pGameSceneNode);
-            if (valid_ptr(node)) {
-                if (!c_.origin_ok) {
-                    for (uintptr_t off = 0x40; off <= 0x180; off += 4) {
-                        Vec3 v{};
-                        v.x = mem.read<float>(node + off);
-                        v.y = mem.read<float>(node + off + 4);
-                        v.z = mem.read<float>(node + off + 8);
-                        if (!sane_vec(v)) continue;
-                        const float d = std::sqrt(
-                            (v.x - local_origin.x) * (v.x - local_origin.x) +
-                            (v.y - local_origin.y) * (v.y - local_origin.y) +
-                            (v.z - local_origin.z) * (v.z - local_origin.z));
-                        if (d > 8000.0f) continue;
-                        c_.node_origin = off;
-                        c_.origin_ok = true;
-                        break;
-                    }
+    const uintptr_t planted =
+        mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
+    if (valid_ptr(planted)) {
+        const uintptr_t node =
+            mem.read<uintptr_t>(planted + offsets::m_pGameSceneNode);
+        if (valid_ptr(node)) {
+            if (!c_.origin_ok) {
+                for (uintptr_t off = 0x40; off <= 0x180; off += 4) {
+                    Vec3 v{};
+                    v.x = mem.read<float>(node + off);
+                    v.y = mem.read<float>(node + off + 4);
+                    v.z = mem.read<float>(node + off + 8);
+                    if (!sane_vec(v)) continue;
+                    const float d = std::sqrt(
+                        (v.x - local_origin.x) * (v.x - local_origin.x) +
+                        (v.y - local_origin.y) * (v.y - local_origin.y) +
+                        (v.z - local_origin.z) * (v.z - local_origin.z));
+                    if (d > 8000.0f) continue;
+                    c_.node_origin = off;
+                    c_.origin_ok = true;
+                    break;
                 }
-                if (c_.origin_ok) {
-                    bomb_origin.x = mem.read<float>(node + c_.node_origin);
-                    bomb_origin.y = mem.read<float>(node + c_.node_origin + 4);
-                    bomb_origin.z = mem.read<float>(node + c_.node_origin + 8);
-                    if (sane_vec(bomb_origin)) {
-                        bomb_active = true;
-                        if (!c_.timer_ok) {
-                            for (uintptr_t off = 0x900; off <= 0x1400; off += 4) {
-                                const float v = mem.read<float>(planted + off);
-                                if (v > 0.1f && v <= 45.0f) {
-                                    c_.timer_off = off;
-                                    c_.timer_ok  = true;
-                                    break;
-                                }
+            }
+            if (c_.origin_ok) {
+                bomb_origin.x = mem.read<float>(node + c_.node_origin);
+                bomb_origin.y = mem.read<float>(node + c_.node_origin + 4);
+                bomb_origin.z = mem.read<float>(node + c_.node_origin + 8);
+                if (sane_vec(bomb_origin)) {
+                    bomb_active = true;
+                    if (!c_.timer_ok) {
+                        for (uintptr_t off = 0x900; off <= 0x1400; off += 4) {
+                            const float v = mem.read<float>(planted + off);
+                            if (v > 0.1f && v <= 45.0f) {
+                                c_.timer_off = off;
+                                c_.timer_ok  = true;
+                                break;
                             }
                         }
-                        if (c_.timer_ok)
-                            bomb_timer = mem.read<float>(planted + c_.timer_off);
                     }
+                    if (c_.timer_ok)
+                        bomb_timer = mem.read<float>(planted + c_.timer_off);
                 }
             }
         }
@@ -603,6 +645,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 // ── render thread ────────────────────────────────────────────────────────
 namespace {
 
+// Pick the two real frames bracketing `rt` and interpolate between them.
 bool sample_hist(const Track& t, double rt, Snap& out) {
     if (t.count == 0) return false;
 
@@ -619,8 +662,8 @@ bool sample_hist(const Track& t, double rt, Snap& out) {
     if (rt <= oldest.t) { out = oldest; return true; }
 
     for (int i = 0; i + 1 < t.count; ++i) {
-        const Snap a = at(i);
-        const Snap b = at(i + 1);
+        const Snap a = at(i);       // newer
+        const Snap b = at(i + 1);   // older
         if (rt >= b.t && rt <= a.t) {
             const double span = a.t - b.t;
             const float f = span > 0.0001
@@ -644,6 +687,7 @@ bool sample_hist(const Track& t, double rt, Snap& out) {
     return true;
 }
 
+// A teleport/respawn must snap, never smear across the map.
 bool jumped(const Snap& a, const Snap& b) {
     const float dx = a.origin.x - b.origin.x;
     const float dy = a.origin.y - b.origin.y;
