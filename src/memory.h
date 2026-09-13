@@ -1,67 +1,37 @@
-// --- src/memory.cpp ---
-#include "memory.h"
+// --- src/memory.h ---
+#pragma once
+#include <Windows.h>
+#include <TlHelp32.h>
+#include <cstdint>
+#include <string>
 
-Memory g_mem;
+class Memory {
+public:
+    HANDLE    process_handle = nullptr;
+    uintptr_t base_address   = 0;  // cs2.exe base (kept for compatibility)
+    uintptr_t client_dll     = 0;  // client.dll base — ALL game offsets live here
 
-bool Memory::attach(const std::wstring& process_name) {
-    DWORD pid = get_process_id(process_name);
-    if (!pid) return false;
+    bool attach(const std::wstring& process_name);
+    void detach();
 
-    process_handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!process_handle) return false;
-
-    // cs2.exe base
-    base_address = get_module_base(pid, process_name);
-
-    // client.dll base — this is where ALL offsets (dwEntityList, dwViewMatrix etc) live
-    client_dll = get_module_base(pid, L"client.dll");
-
-    return client_dll != 0;
-}
-
-void Memory::detach() {
-    if (process_handle) {
-        CloseHandle(process_handle);
-        process_handle = nullptr;
+    template<typename T>
+    T read(uintptr_t address) const {
+        T value{};
+        ReadProcessMemory(
+            process_handle,
+            reinterpret_cast<LPCVOID>(address),
+            &value, sizeof(T), nullptr);
+        return value;
     }
-    base_address = 0;
-    client_dll   = 0;
-}
 
-DWORD Memory::get_process_id(const std::wstring& process_name) const {
-    DWORD pid = 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Process32FirstW(snap, &entry)) {
-        do {
-            if (process_name == entry.szExeFile) {
-                pid = entry.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(snap, &entry));
+    bool is_valid() const {
+        return process_handle != nullptr && client_dll != 0;
     }
-    CloseHandle(snap);
-    return pid;
-}
 
-uintptr_t Memory::get_module_base(DWORD pid, const std::wstring& module_name) const {
-    uintptr_t base = 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    uintptr_t get_module_base(DWORD pid, const std::wstring& module_name) const;
 
-    MODULEENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Module32FirstW(snap, &entry)) {
-        do {
-            if (module_name == entry.szModule) {
-                base = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
-                break;
-            }
-        } while (Module32NextW(snap, &entry));
-    }
-    CloseHandle(snap);
-    return base;
-}
+private:
+    DWORD get_process_id(const std::wstring& process_name) const;
+};
+
+extern Memory g_mem;
