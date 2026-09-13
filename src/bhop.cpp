@@ -1,5 +1,5 @@
 // --- src/bhop.cpp ---
-// Bhop: either the CS2 jump button, or a synthesised spacebar.
+// Bhop on HOLD-SPACE. No auto-jump.
 //
 //   +jump = 65537 (0x10001)   -jump = 256 (0x00000100)
 //
@@ -8,13 +8,21 @@
 //   turnleft -0x3F0 turnright -0x360 forward -0x2D0 back -0x240
 //   left -0x1B0     right -0x120     use -0x090      JUMP   duck +0x090
 //
-// INPUT MODE is the default because it is offset-free. It auto-jumps while
-// grounded; it does NOT read the spacebar, precisely so its own injected
-// keystrokes can't feed back into that test.
+// ── THE SPACE GATE ───────────────────────────────────────────────────────
+// Input mode injects keypresses, and SendInput feeds back into
+// GetAsyncKeyState. So a naive "is space down?" check latches itself on the
+// moment we inject a press and can never observe your release -- which is what
+// made the old build auto-jump uncontrollably.
 //
-// MEMORY MODE never locks on a guess. A lock requires the candidate block to
-// validate against a key you are physically holding, so a region of zeros can
-// never masquerade as the button block.
+// The gate therefore reads PHYSICAL key state from a low-level keyboard hook.
+// Windows marks injected events with LLKHF_INJECTED, so ours are ignored and
+// only your real keypress counts.
+//
+// ── WHY INJECTING STILL WORKS WHILE YOU HOLD SPACE ───────────────────────
+// While space is physically held the game already has +jump down. The injected
+// release-then-press pair is what creates the press EDGE at the landing tick,
+// and an edge is what a jump actually needs. That is exactly the macro a bhop
+// script performs -- so holding space becomes "bhop while held".
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -41,7 +49,6 @@ constexpr intptr_t kRel[] = {
     -0x240, -0x1B0, -0x120, -0x090,  0x000,  0x090,
 };
 constexpr int kSlotCount = static_cast<int>(sizeof(kRel) / sizeof(kRel[0]));
-constexpr int kJumpSlot  = 11;
 
 // Only hints. A lock still has to be confirmed by a held key.
 constexpr uintptr_t kCandidates[] = {
@@ -54,9 +61,14 @@ std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
 std::atomic<bool>      g_dbg_ground{false};
 std::atomic<bool>      g_dbg_focused{false};
 std::atomic<int>       g_dbg_signals{0};
-std::atomic<int>       g_dbg_cands{0};
 
-std::thread g_bhop_thread, g_scan_thread;
+// Physical spacebar state, fed by the low-level hook.
+std::atomic<bool>  g_phys_space{false};
+std::atomic<bool>  g_hook_ok{false};
+std::atomic<DWORD> g_hook_tid{0};
+HHOOK g_hook = nullptr;
+
+std::thread g_bhop_thread, g_scan_thread, g_hook_thread;
 
 double now_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -84,24 +96,75 @@ void wait_ms(int ms) {
 bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
-bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-// Which button slots the user is physically holding, as a bitmask over kRel.
+// ── physical key state ───────────────────────────────────────────────────
+// A low-level hook sees every key event before it reaches any application, and
+// marks synthetic ones with LLKHF_INJECTED. Filtering those out gives the true
+// hardware state of the spacebar even while we are injecting our own presses.
+LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION) {
+        const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
+        if (k && k->vkCode == VK_SPACE && (k->flags & LLKHF_INJECTED) == 0) {
+            switch (wparam) {
+                case WM_KEYDOWN:
+                case WM_SYSKEYDOWN:
+                    g_phys_space.store(true);
+                    break;
+                case WM_KEYUP:
+                case WM_SYSKEYUP:
+                    g_phys_space.store(false);
+                    break;
+                default: break;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+void hook_thread_main() {
+    g_hook_tid.store(GetCurrentThreadId());
+
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, nullptr, 0);
+    g_hook_ok.store(g_hook != nullptr);
+
+    // A low-level hook is delivered on the thread that installed it, so this
+    // thread must pump messages for the callback to ever run.
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    g_hook_ok.store(false);
+}
+
+bool space_held() {
+    // The hook is the authoritative source. If it could not be installed, fall
+    // back to GetAsyncKeyState -- degraded (it can latch on our own injection)
+    // but better than no gate at all.
+    if (g_hook_ok.load()) return g_phys_space.load();
+    return (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+}
+
+// Read only by the scanner, to prove an address. Held movement keys are the
+// signal; our injected space is irrelevant there.
 int held_mask() {
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     int m = 0;
-    if (key_down(VK_SHIFT))   m |= 1 << 0;
-    if (key_down('R'))        m |= 1 << 1;
-    if (key_down(VK_LBUTTON)) m |= 1 << 2;
-    if (key_down(VK_RBUTTON)) m |= 1 << 3;
-    if (key_down('W'))        m |= 1 << 6;
-    if (key_down('S'))        m |= 1 << 7;
-    if (key_down('A'))        m |= 1 << 8;
-    if (key_down('D'))        m |= 1 << 9;
-    if (key_down('E'))        m |= 1 << 10;
-    if (key_down(VK_SPACE))   m |= 1 << 11;
-    if (key_down(VK_CONTROL)) m |= 1 << 12;
+    if (down(VK_SHIFT))   m |= 1 << 0;
+    if (down('R'))        m |= 1 << 1;
+    if (down(VK_LBUTTON)) m |= 1 << 2;
+    if (down(VK_RBUTTON)) m |= 1 << 3;
+    if (down('W'))        m |= 1 << 6;
+    if (down('S'))        m |= 1 << 7;
+    if (down('A'))        m |= 1 << 8;
+    if (down('D'))        m |= 1 << 9;
+    if (down('E'))        m |= 1 << 10;
     return m;
 }
+
+// ── jump-button scanner ──────────────────────────────────────────────────
 
 // Every button state is 0 when untouched, 256 after a release, 65537 while
 // pressed. Anything else means this is not the button block.
@@ -113,11 +176,6 @@ bool plausible_dw(uint32_t v) {
     }
 }
 
-// Validates the whole 13-slot block anchored at j.
-//   * a slot the user IS holding must have its down bit set
-//   * a slot the user is NOT holding must read exactly 0 or 256
-//   * require_evidence additionally demands two non-zero slots, so a long run
-//     of zeros cannot masquerade as a button block
 bool block_valid(uintptr_t j, int mask, bool require_evidence) {
     int pressed = 0, released_nonzero = 0;
     for (int i = 0; i < kSlotCount; ++i) {
@@ -136,8 +194,8 @@ bool block_valid(uintptr_t j, int mask, bool require_evidence) {
 }
 
 // Decisive path: find a dword with its down bit set, then work out where the
-// block's jump slot would have to be for the held key to explain it. This uses
-// YOUR key presses as proof, so it cannot lock onto a coincidence.
+// block's jump slot would have to be for a held key to explain it. Uses YOUR
+// key presses as proof, so it cannot lock onto a coincidence.
 uintptr_t scan_pressed(int mask) {
     const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
     const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
@@ -158,12 +216,9 @@ uintptr_t scan_pressed(int mask) {
             if (!plausible_dw(v)) continue;
 
             const uintptr_t p = a + k;
-
-            // If this dword is slot i of a block, the jump address is p-kRel[i].
             for (int i = 0; i < kSlotCount; ++i) {
                 if (!((mask >> i) & 1)) continue;
-                const uintptr_t jump =
-                    p - static_cast<uintptr_t>(kRel[i]);
+                const uintptr_t jump = p - static_cast<uintptr_t>(kRel[i]);
                 if (jump < g_mem.client_dll) continue;
                 if (!block_valid(jump, mask, false)) continue;
                 return jump;
@@ -173,46 +228,8 @@ uintptr_t scan_pressed(int mask) {
     return 0;
 }
 
-// Nothing held: collect candidates with a bitmap over the already-read page so
-// the sweep costs almost no syscalls. These are only candidates -- they still
-// need a held key to confirm.
-void collect_candidates(std::vector<uintptr_t>& out) {
-    out.clear();
-    const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
-    const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
-    constexpr size_t PIECE = 0x40000;
-
-    static std::vector<uint8_t> buf, flag;
-    if (buf.size() < PIECE) { buf.resize(PIECE); flag.resize(PIECE / 4); }
-
-    for (uintptr_t a = lo; a + PIECE <= hi; a += PIECE) {
-        if (g_stop.load()) return;
-        if (!g_mem.read_bytes(a, buf.data(), PIECE)) continue;
-
-        for (size_t k = 0; k + 4 <= PIECE; k += 4) {
-            uint32_t v = 0;
-            std::memcpy(&v, buf.data() + k, 4);
-            flag[k / 4] = plausible_dw(v) ? 1 : 0;
-        }
-
-        for (size_t off = 0x640; off + 0x94 <= PIECE; off += 4) {
-            bool ok = true;
-            for (int i = 0; i < kSlotCount && ok; ++i) {
-                const intptr_t pos = static_cast<intptr_t>(off) + kRel[i];
-                if (pos < 0 || pos + 4 > static_cast<intptr_t>(PIECE)) ok = false;
-                else if (!flag[pos / 4]) ok = false;
-            }
-            if (!ok) continue;
-            out.push_back(a + off);
-            if (out.size() >= 32) return;
-        }
-    }
-}
-
 void scan_thread_main() {
     for (int i = 0; i < 150 && !g_stop.load(); ++i) wait_ms(10);
-
-    std::vector<uintptr_t> candidates;
 
     while (!g_stop.load()) {
         if (g_locked.load()) { wait_ms(500); continue; }
@@ -222,26 +239,11 @@ void scan_thread_main() {
         const int mask = held_mask();
         uintptr_t hit = 0;
 
-        // 1. known hints, confirmed against held keys
         for (uintptr_t off : kCandidates) {
             const uintptr_t abs = g_mem.client_dll + off;
-            if (block_valid(abs, mask, mask == 0)) { hit = abs; break; }
+            if (block_valid(abs, mask, false)) { hit = abs; break; }
         }
-
-        // 2. decisive: a key you are holding proves the block
         if (!hit && mask) hit = scan_pressed(mask);
-
-        // 3. candidates gathered while idle, now confirmable
-        if (!hit && mask) {
-            for (uintptr_t c : candidates)
-                if (block_valid(c, mask, false)) { hit = c; break; }
-        }
-
-        // 4. refresh candidates (cheap, no per-candidate syscalls yet)
-        if (!hit && !mask) {
-            collect_candidates(candidates);
-            g_dbg_cands.store(static_cast<int>(candidates.size()));
-        }
 
         if (hit) {
             g_jump_offset.store(hit - g_mem.client_dll);
@@ -295,12 +297,10 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     g_dbg_signals.store(sig);
 
     // The flag is instance-accurate where the Z test needs a 22 ms window, so
-    // once it has proven itself it becomes the primary signal. That matters for
-    // bhop, where the grounded frame can be a single tick.
+    // once proven it becomes primary. The grounded frame can be a single tick.
     bool ground;
     if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
     else              ground = g_gw.z_ground;
-
     if (g_gw.hge_ok) ground = ground || (hge != 0xFFFFFFFFu);
 
     g_dbg_ground.store(ground);
@@ -308,12 +308,11 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
 }
 
 // ── input mode: no offsets, cannot go stale ──────────────────────────────
-// Hold the synthetic spacebar while grounded, release while airborne. That is
-// the macro a bhop script performs. Deliberately does NOT read the spacebar,
-// because SendInput feeds back into GetAsyncKeyState and would latch itself on.
+// Send only on a state CHANGE, so we produce clean edges rather than a stream
+// of redundant keystrokes.
 void inject_space(bool down) {
     static bool s_down = false;
-    if (down == s_down) return;      // only send on change
+    if (down == s_down) return;
     s_down = down;
 
     INPUT in{};
@@ -339,11 +338,18 @@ void bhop_thread_main() {
         const bool focused = cs2_focused();
         g_dbg_focused.store(focused);
 
-        // Outside the game, make sure nothing is left held down.
-        if (!focused) {
-            if (g_input_mode.load()) inject_space(false);
-            else g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
-                                      kJumpRelease);
+        // HOLD-SPACE GATE. Nothing happens unless you are physically holding
+        // space, so there is no auto-jump and no surprise input.
+        const bool active = focused && space_held();
+
+        if (!active) {
+            // Release whatever we injected, and park the button. Sending the
+            // release here (rather than skipping the update) is what guarantees
+            // you are never left with a stuck key.
+            inject_space(false);
+            if (g_mem.is_valid())
+                g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
+                                     kJumpRelease);
             continue;
         }
 
@@ -356,25 +362,26 @@ void bhop_thread_main() {
         if (!pawn) continue;
 
         // 2 ms sampling: the grounded frame can be a single 15.6 ms tick, so
-        // this needs to be comfortably faster than a tick.
+        // this has to be comfortably faster than a tick.
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
         if (g_input_mode.load()) {
-            // Grounded -> hold jump, which re-jumps on every landing.
-            // Airborne -> release, so the next landing is a fresh press edge.
+            // Airborne -> release, grounded -> press. Injected around the
+            // landing tick, this is the press EDGE the jump needs, and it works
+            // even though your physical key is still down.
             inject_space(ground);
         } else {
-            if (!g_locked.load()) continue;   // never write to an unconfirmed address
+            if (!g_locked.load()) continue;   // never write an unconfirmed address
             const uintptr_t jump_addr =
                 g_mem.client_dll + g_jump_offset.load();
             g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
         }
     }
 
-    if (g_input_mode.load()) inject_space(false);
+    inject_space(false);
 }
 
 } // namespace
@@ -387,25 +394,32 @@ void Bhop_Init() {
     g_stop.store(false);
     g_bhop_thread = std::thread(bhop_thread_main);
     g_scan_thread = std::thread(scan_thread_main);
+    g_hook_thread = std::thread(hook_thread_main);
 }
 
 void Bhop_Shutdown() {
     g_stop.store(true);
     inject_space(false);
+
+    if (g_hook_tid.load())
+        PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
+
     if (g_bhop_thread.joinable()) g_bhop_thread.join();
     if (g_scan_thread.joinable()) g_scan_thread.join();
+    if (g_hook_thread.joinable()) g_hook_thread.join();
     g_started.store(false);
 }
 
 BhopDebug Bhop_GetDebug() {
     BhopDebug d;
-    d.offset     = g_jump_offset.load();
-    d.on_ground  = g_dbg_ground.load();
-    d.focused    = g_dbg_focused.load();
-    d.signals    = g_dbg_signals.load();
-    d.locked     = g_locked.load();
-    d.scanning   = g_scanning.load();
-    d.candidates = g_dbg_cands.load();
+    d.offset    = g_jump_offset.load();
+    d.on_ground = g_dbg_ground.load();
+    d.focused   = g_dbg_focused.load();
+    d.space_held = g_phys_space.load();
+    d.hook_ok   = g_hook_ok.load();
+    d.signals   = g_dbg_signals.load();
+    d.locked    = g_locked.load();
+    d.scanning  = g_scanning.load();
     return d;
 }
 
