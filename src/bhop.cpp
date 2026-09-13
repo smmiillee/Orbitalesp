@@ -8,11 +8,11 @@
 //   turnleft -0x3F0  turnright -0x360  forward -0x2D0  back -0x240
 //   left -0x1B0  right -0x120  use -0x090  JUMP  duck +0x090
 //
-// WHY THE PREVIOUS SCANNER NEVER LOCKED: it walked every 4-byte-aligned dword
-// in a 512 KB window and, for each one holding 0 or 256 (i.e. essentially
-// every zero dword in memory), issued 13 SEPARATE syscalls to test the block.
-// That is ~1.7 million reads per sweep, so it never finished -- which is why
-// the menu sat on "[searching]" forever.
+// WHY THE OLD SCANNER NEVER LOCKED: it walked every 4-byte-aligned dword in a
+// 512 KB window and, for each one holding 0 or 256 (i.e. essentially every zero
+// dword in memory), issued 13 SEPARATE syscalls to test the block. That is
+// ~1.7 million reads per sweep, so it never finished -- which is why the menu
+// sat on "[searching]" forever.
 //
 // The rewrite filters with a bitmap over each already-read page, so the search
 // costs almost no syscalls, and candidates are then proven against the keys you
