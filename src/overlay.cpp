@@ -179,7 +179,7 @@ bool Overlay::resize_buffers(int width, int height) {
 
 void Overlay::update_visibility_and_input() {
     HWND fg = GetForegroundWindow();
-    bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
+    const bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
 
     if (!cs2_focused) {
         if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
@@ -187,18 +187,24 @@ void Overlay::update_visibility_and_input() {
     }
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
 
+    // The overlay NEVER activates. It keeps WS_EX_NOACTIVATE at all times and
+    // only toggles click-through, so CS2 retains keyboard focus even while the
+    // menu is open. The previous version called SetForegroundWindow(hwnd) and
+    // cleared WS_EX_NOACTIVATE when the menu opened, which took focus away from
+    // the game and never gave it back -- so the bhop's "is CS2 focused?" gate
+    // stayed false and bhop did nothing at all.
+    //
+    // WS_EX_NOACTIVATE still allows the window to receive mouse clicks, so the
+    // menu stays fully usable.
     LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if (g_menu_open) {
         ex &= ~WS_EX_TRANSPARENT;
-        ex &= ~WS_EX_NOACTIVATE;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
         SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
-        SetForegroundWindow(hwnd);
     } else {
         ex |= WS_EX_TRANSPARENT;
-        ex |= WS_EX_NOACTIVATE;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
     }
+    ex |= WS_EX_NOACTIVATE;
+    SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
 }
 
 bool Overlay::init_dx11(int width, int height) {
