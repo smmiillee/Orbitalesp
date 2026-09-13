@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <imgui.h>
 #include "memory.h"
 #include "esp.h"
@@ -52,7 +53,6 @@ void memory_thread() {
             if (local_pawn)
                 g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            // Pass actual screen resolution so projection is correct
             g_esp.update(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
             if (g_cfg.bhop_enabled) BhopTick();
@@ -62,7 +62,14 @@ void memory_thread() {
 }
 
 void render_esp(ImDrawList* dl) {
-    for (const auto& p : g_esp.players) {
+    // Lock while copying — prevents flicker from partial writes
+    std::vector<PlayerESP> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_esp.players_mutex);
+        snapshot = g_esp.players;
+    }
+
+    for (const auto& p : snapshot) {
         bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
         bool is_enemy    = !is_teammate;
 
@@ -111,8 +118,8 @@ void render_esp(ImDrawList* dl) {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 420.0f, 340.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 340.0f, 260.0f }, { 800.0f, 600.0f });
+    ImGui::SetNextWindowSize({ 420.0f, 300.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 300.0f, 220.0f }, { 800.0f, 600.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoScrollbar);
 
@@ -130,6 +137,7 @@ void render_menu() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
+    // LEFT — ESP
     ImGui::TextDisabled("[ ESP ]");
     ImGui::Checkbox("Boxes",        &g_cfg.esp_boxes);
     ImGui::Checkbox("Health Bar",   &g_cfg.esp_health);
@@ -149,18 +157,10 @@ void render_menu() {
     ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
 
+    // RIGHT — Misc
     ImGui::NextColumn();
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ Debug ]");
-    ImGui::Text("Controllers: %d", g_esp.debug_total_controllers);
-    ImGui::Text("Valid: %d off=0x%X str=%d", g_esp.debug_valid_pawns,
-        g_esp.debug_sample_health, g_esp.debug_sample_team);
-    ImGui::Text("Alive:      %d", g_esp.debug_alive);
-    ImGui::Text("Positioned: %d", g_esp.debug_positioned);
-    ImGui::Text("On screen:  %d", g_esp.debug_on_screen);
-    ImGui::Text("Drawing:    %d", (int)g_esp.players.size());
 
     ImGui::Columns(1);
     ImGui::Separator();
