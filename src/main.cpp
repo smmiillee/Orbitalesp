@@ -29,8 +29,9 @@ struct Config {
     bool  esp_health   = true;
     bool  esp_distance = true;
     bool  esp_bomb     = true;
+    // Teammates are OFF by default -- most people only want enemies.
     bool  esp_show_enemies = true;
-    bool  esp_show_team    = true;
+    bool  esp_show_team    = false;
     float box_thickness = 0.5f;
 
     // Colours -- one per visual.
@@ -44,9 +45,10 @@ struct Config {
     ImVec4 color_weapon = { 1.00f, 0.85f, 0.30f, 1.00f };
     ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
     ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
+    ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
     bool bhop_enabled    = true;
-    bool bhop_input_mode = false;
+    bool bhop_input_mode = true;   // offset-free by default
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -125,6 +127,7 @@ void memory_thread() {
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
     Bhop_Init();
+    Bhop_SetInputMode(g_cfg.bhop_input_mode);
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -207,14 +210,23 @@ void render_esp(ImDrawList* dl) {
 
         if (g_cfg.esp_name && p.name[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.name);
-            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
+            dl->AddText({ cx - sz.x * 0.5f, top - 30.0f },
                         pick(g_cfg.color_name), p.name);
         }
 
         if (g_cfg.esp_weapon && p.weapon[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
-            dl->AddText({ cx - sz.x * 0.5f, bot + 2.0f },
+            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
                         pick(g_cfg.color_weapon), p.weapon);
+        }
+
+        // Bomb carrier: shown right below the feet so it can never be confused
+        // with the weapon line.
+        if (g_cfg.esp_bomb && p.has_bomb) {
+            const char* tag = "C4";
+            const ImVec2 sz = ImGui::CalcTextSize(tag);
+            dl->AddText({ cx - sz.x * 0.5f, bot + 4.0f },
+                        col_of(g_cfg.color_carrier), tag);
         }
 
         if (g_cfg.esp_distance) {
@@ -238,12 +250,8 @@ void render_esp(ImDrawList* dl) {
                         g_cfg.box_thickness);
             dl->AddText({ b.screen.x - 7.0f, b.screen_top.y - 16.0f }, c, "C4");
 
-            char buf[48];
-            if (b.timer >= 0.0f)
-                std::snprintf(buf, sizeof(buf), "%.1fs  %.0fm",
-                              b.timer, b.distance);
-            else
-                std::snprintf(buf, sizeof(buf), "%.0fm", b.distance);
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "%.0fm", b.distance);
             dl->AddText({ b.screen.x - 14.0f, b.screen.y + 2.0f }, c, buf);
         }
     }
@@ -256,7 +264,7 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::Text("%s", label);
 }
 
-// ── menu tabs ────────────────────────────────────────────────────────────
+// ── tabs ─────────────────────────────────────────────────────────────────
 
 static void tab_esp() {
     const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
@@ -264,14 +272,14 @@ static void tab_esp() {
     ImGui::SetColumnWidth(0, col_w);
 
     ImGui::TextDisabled("[ Visuals ]");
-    ImGui::Checkbox("Boxes",       &g_cfg.esp_boxes);
-    ImGui::Checkbox("Skeleton",    &g_cfg.esp_skeleton);
-    ImGui::Checkbox("Head dot",    &g_cfg.esp_head_dot);
-    ImGui::Checkbox("Name",        &g_cfg.esp_name);
-    ImGui::Checkbox("Weapon",      &g_cfg.esp_weapon);
-    ImGui::Checkbox("Health bar",  &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",    &g_cfg.esp_distance);
-    ImGui::Checkbox("Bomb (C4)",   &g_cfg.esp_bomb);
+    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
+    ImGui::Checkbox("Skeleton",   &g_cfg.esp_skeleton);
+    ImGui::Checkbox("Head dot",   &g_cfg.esp_head_dot);
+    ImGui::Checkbox("Name",       &g_cfg.esp_name);
+    ImGui::Checkbox("Weapon",     &g_cfg.esp_weapon);
+    ImGui::Checkbox("Health bar", &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
+    ImGui::Checkbox("Bomb (C4)",  &g_cfg.esp_bomb);
 
     ImGui::Spacing();
     ImGui::Checkbox("Show enemies",   &g_cfg.esp_show_enemies);
@@ -287,12 +295,11 @@ static void tab_esp() {
     ImGui::Spacing();
     ImGui::TextDisabled("[ Smoothing ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f,
-                       "%.0f ms");
+    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f, "%.0f ms");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Snapshot interpolation delay.\n"
                           "Higher = smoother, a touch more latency.\n"
-                          "25-45 ms is the sweet spot; 0 disables it.");
+                          "30-45 ms is the sweet spot; 0 disables it.");
 
     ImGui::Columns(1);
 }
@@ -304,22 +311,24 @@ static void tab_misc() {
         Bhop_SetInputMode(g_cfg.bhop_input_mode);
 
     const BhopDebug bd = Bhop_GetDebug();
-    ImGui::Text("button: 0x%06llX  %s",
-        (unsigned long long)bd.offset,
-        bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[searching]"));
+
+    if (g_cfg.bhop_input_mode) {
+        ImGui::Text("mode: synthesised spacebar");
+        ImGui::TextDisabled("auto-jumps while grounded");
+    } else {
+        ImGui::Text("button: 0x%06llX  %s",
+            (unsigned long long)bd.offset,
+            bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
+        if (!bd.locked)
+            ImGui::TextDisabled("hold WASD or SPACE to confirm the address");
+    }
+
     ImGui::Text("ground: %s   focused: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
-
     ImGui::TextDisabled("signals: %s%s%s",
         (bd.signals & 1) ? "z " : "",
         (bd.signals & 2) ? "flag " : "",
         (bd.signals & 4) ? "hge" : "");
-    if ((bd.signals & 6) == 0)
-        ImGui::TextDisabled("jump around a bit to calibrate");
-
-    if (ImGui::Button("[Rescan button]")) Bhop_Rescan();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hold SPACE for a second if it will not lock.");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -331,9 +340,7 @@ static void tab_misc() {
     ImGui::Checkbox("V-Sync", &g_vsync);
 
     ImGui::Separator();
-    ImGui::TextDisabled("entities: %d slots, %d alive, %d team",
-                        g_esp.diag_slots, g_esp.diag_hp, g_esp.diag_team);
-    ImGui::TextDisabled("read: %s", g_esp.diag_bulk ? "bulk" : "per-slot");
+    ImGui::TextDisabled("entities: %d", g_esp.diag_slots);
 }
 
 static void tab_colors() {
@@ -344,24 +351,25 @@ static void tab_colors() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
-    color_row("##ce", "Enemy",    &g_cfg.color_enemy);
-    color_row("##ct", "Team",     &g_cfg.color_team);
-    color_row("##cb", "Boxes",    &g_cfg.color_box);
-    color_row("##cs", "Skeleton", &g_cfg.color_skel);
-    color_row("##ch", "Head dot", &g_cfg.color_head);
+    color_row("##ce", "Enemy",        &g_cfg.color_enemy);
+    color_row("##ct", "Team",         &g_cfg.color_team);
+    color_row("##cb", "Boxes",        &g_cfg.color_box);
+    color_row("##cs", "Skeleton",     &g_cfg.color_skel);
+    color_row("##ch", "Head dot",     &g_cfg.color_head);
 
     ImGui::NextColumn();
 
-    color_row("##cn", "Name",     &g_cfg.color_name);
-    color_row("##cw", "Weapon",   &g_cfg.color_weapon);
-    color_row("##cd", "Distance", &g_cfg.color_dist);
-    color_row("##cc", "Bomb",     &g_cfg.color_bomb);
+    color_row("##cn", "Name",         &g_cfg.color_name);
+    color_row("##cw", "Weapon",       &g_cfg.color_weapon);
+    color_row("##cd", "Distance",     &g_cfg.color_dist);
+    color_row("##cc", "Bomb",         &g_cfg.color_bomb);
+    color_row("##cr", "Bomb carrier", &g_cfg.color_carrier);
 
     ImGui::Columns(1);
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 540.0f, 400.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({ 560.0f, 420.0f }, ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
@@ -377,18 +385,9 @@ void render_menu() {
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("##orbital_tabs", ImGuiTabBarFlags_None)) {
-        if (ImGui::BeginTabItem("ESP")) {
-            tab_esp();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("MISC")) {
-            tab_misc();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("COLORS")) {
-            tab_colors();
-            ImGui::EndTabItem();
-        }
+        if (ImGui::BeginTabItem("ESP"))    { tab_esp();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("MISC"))   { tab_misc();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("COLORS")) { tab_colors(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
@@ -401,7 +400,7 @@ void render_menu() {
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
-        Bhop_SetInputMode(false);
+        Bhop_SetInputMode(g_cfg.bhop_input_mode);
     }
     ImGui::SameLine();
     if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
