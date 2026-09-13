@@ -1,4 +1,5 @@
 // --- src/esp.cpp ---
+// Entity traversal copied from working orbitalweb/src/memory_reader.cpp
 #include "esp.h"
 #include <cmath>
 
@@ -19,25 +20,6 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
-// CS2 entity list layout:
-//   dwEntityList -> CGameEntitySystem ptr
-//   CGameEntitySystem + 0x10 -> first list entry pointer
-//   entry + 8*((index>>9)+1) -> chunk ptr
-//   chunk + 0x78*(index&0x1FF) -> entity ptr
-uintptr_t ESP::get_entity(const Memory& mem, uintptr_t entity_list, int index) const {
-    uintptr_t list_entry = mem.read<uintptr_t>(entity_list + 0x10 + 8 * ((index >> 9) + 1));
-    if (!list_entry) return 0;
-    return mem.read<uintptr_t>(list_entry + 0x78 * (index & 0x1FF));
-}
-
-uintptr_t ESP::resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t handle) const {
-    if (!handle || handle == 0xFFFFFFFF) return 0;
-    int index = handle & 0x7FFF;
-    uintptr_t list_entry = mem.read<uintptr_t>(entity_list + 0x10 + 8 * ((index >> 9) + 1));
-    if (!list_entry) return 0;
-    return mem.read<uintptr_t>(list_entry + 0x78 * (index & 0x1FF));
-}
-
 void ESP::update(const Memory& mem, uintptr_t client_base) {
     players.clear();
     debug_total_controllers = 0;
@@ -51,50 +33,58 @@ void ESP::update(const Memory& mem, uintptr_t client_base) {
     uintptr_t local_pawn  = mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
     if (!entity_list || !local_pawn) return;
 
+    int local_team = mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
+
     constexpr int W = 1920, H = 1080;
 
-    for (int i = 0; i < offsets::max_entities; ++i) {
-        uintptr_t controller = get_entity(mem, entity_list, i);
-        if (!controller) continue;
-        debug_total_controllers++;
+    // Traversal from orbitalweb: chunkArrOff=0x10, stride=120 (0x78)
+    // Loop: entityList + 0x10 + 8*chunk -> chunkPtr
+    //       chunkPtr + 120*i -> entity (pawn directly)
+    for (int chunk = 0; chunk < 4; chunk++) {
+        uintptr_t chunk_ptr = mem.read<uintptr_t>(entity_list + 0x10 + 8 * chunk);
+        if (!chunk_ptr || chunk_ptr < 0x10000) continue;
 
-        uint32_t pawn_handle = mem.read<uint32_t>(controller + offsets::m_hPlayerPawn);
-        uintptr_t pawn = resolve_handle(mem, entity_list, pawn_handle);
-        if (!pawn || pawn == local_pawn) continue;
-        debug_valid_pawns++;
+        for (int i = 0; i < 512; i++) {
+            uintptr_t entity = mem.read<uintptr_t>(chunk_ptr + 120 * i);
+            if (!entity || entity < 0x10000) continue;
+            if (entity == local_pawn) continue;
+            debug_total_controllers++;
 
-        uint8_t life = mem.read<uint8_t>(pawn + offsets::m_lifeState);
-        if (life != 0) continue;
-        debug_alive++;
+            int health = mem.read<int>(entity + offsets::m_iHealth);
+            if (health <= 0 || health > 100) continue;
+            debug_valid_pawns++;
 
-        int health = mem.read<int>(pawn + offsets::m_iHealth);
-        if (health <= 0 || health > 100) continue;
+            int team = mem.read<int>(entity + offsets::m_iTeamNum) & 0xFF;
+            if (team != 2 && team != 3) continue;
+            debug_alive++;
 
-        int team = mem.read<int>(pawn + offsets::m_iTeamNum);
+            Vec3 origin;
+            origin.x = mem.read<float>(entity + offsets::m_vOldOrigin);
+            origin.y = mem.read<float>(entity + offsets::m_vOldOrigin + 4);
+            origin.z = mem.read<float>(entity + offsets::m_vOldOrigin + 8);
+            if (origin.x == 0.0f && origin.y == 0.0f) continue;
+            debug_positioned++;
 
-        Vec3 origin = mem.read<Vec3>(pawn + offsets::m_vOldOrigin);
-        if (origin.x == 0.0f && origin.y == 0.0f && origin.z == 0.0f) continue;
-        debug_positioned++;
+            Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
 
-        Vec3 head = { origin.x, origin.y, origin.z + 70.0f };
+            Vec2 screen_head, screen_feet;
+            if (!world_to_screen(head,   screen_head, vm, W, H)) continue;
+            if (!world_to_screen(origin, screen_feet, vm, W, H)) continue;
 
-        Vec2 screen_head, screen_feet;
-        if (!world_to_screen(head,   screen_head, vm, W, H)) continue;
-        if (!world_to_screen(origin, screen_feet, vm, W, H)) continue;
+            float box_h = screen_feet.y - screen_head.y;
+            if (box_h < 5.0f) continue;
+            debug_on_screen++;
 
-        float box_h = screen_feet.y - screen_head.y;
-        if (box_h < 5.0f) continue;
-        debug_on_screen++;
+            float dist = std::sqrt(
+                origin.x * origin.x +
+                origin.y * origin.y +
+                origin.z * origin.z) / 40.0f;
 
-        float dist = std::sqrt(
-            origin.x * origin.x +
-            origin.y * origin.y +
-            origin.z * origin.z) / 40.0f;
-
-        players.push_back({
-            origin, screen_head, screen_feet,
-            health, team, true, dist,
-            box_h, box_h * 0.45f
-        });
+            players.push_back({
+                origin, screen_head, screen_feet,
+                health, team, true, dist,
+                box_h, box_h * 0.45f
+            });
+        }
     }
 }
