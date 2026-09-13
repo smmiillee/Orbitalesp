@@ -1,33 +1,33 @@
 // --- src/offsets.h ---
-// Sourced from a2x/cs2-dumper — update after CS2 patches by re-running the dumper.
-// Last synced: September 2026 build.
+// Global offsets from user-supplied offsets.hpp (a2x/cs2-dumper 2026-09-11)
+// Schema offsets from a2x/cs2-dumper client_dll.hpp (confirmed live)
 #pragma once
 #include <cstdint>
 #include <cstddef>
 
 namespace offsets {
 
-    // ── client.dll ────────────────────────────────────────────────────────────
-    constexpr uintptr_t dwEntityList        = 0x2554050;
-    constexpr uintptr_t dwLocalPlayerPawn   = 0x23A9118;
-    constexpr uintptr_t dwLocalPlayerCtrl   = 0x2383DB0;
-    constexpr uintptr_t dwViewMatrix        = 0x23AE550;
+    // ── client.dll globals ────────────────────────────────────────────────────
+    constexpr uintptr_t dwEntityList      = 0x2577BE0;
+    constexpr uintptr_t dwLocalPlayerPawn = 0x23CCC08;
+    constexpr uintptr_t dwLocalPlayerCtrl = 0x23A78D0;
+    constexpr uintptr_t dwViewMatrix      = 0x23D21F0;
 
-    // ── C_CSPlayerPawn ────────────────────────────────────────────────────────
-    constexpr uintptr_t m_iHealth           = 0x344;
-    constexpr uintptr_t m_iTeamNum          = 0x3E3;
-    constexpr uintptr_t m_lifeState         = 0x348;
-    constexpr uintptr_t m_pGameSceneNode    = 0x328;
+    // ── C_BaseEntity ──────────────────────────────────────────────────────────
+    constexpr uintptr_t m_pGameSceneNode  = 0x330; // CGameSceneNode*
+    constexpr uintptr_t m_iHealth         = 0x34C; // int32
+    constexpr uintptr_t m_lifeState       = 0x354; // uint8  (0 = alive)
+    constexpr uintptr_t m_iTeamNum        = 0x3EB; // uint8  (2=CT, 3=T)
+
+    // ── CCSPlayerController ───────────────────────────────────────────────────
+    constexpr uintptr_t m_hPlayerPawn     = 0x90C; // handle -> pawn
 
     // ── CGameSceneNode ────────────────────────────────────────────────────────
-    // m_nodeToWorld is the world-space origin of the node (Vec3 at offset 0xE0)
-    constexpr uintptr_t m_nodeToWorld       = 0xE0;
+    // m_nodeToWorld: the node-to-world transform matrix starts at 0x10.
+    // The Vec3 origin sits at the first 12 bytes (x,y,z floats).
+    constexpr uintptr_t m_nodeToWorld     = 0x10;  // Vec3 origin
 
-    // ── controller -> pawn resolve ────────────────────────────────────────────
-    // CCSPlayerController::m_hPlayerPawn (index handle, needs entity list resolve)
-    constexpr uintptr_t m_hPlayerPawn       = 0x7E4;
-
-    // ── entity iteration cap ──────────────────────────────────────────────────
-    constexpr int max_entities              = 64;
+    // ── Entity iteration cap ──────────────────────────────────────────────────
+    constexpr int max_entities            = 64;
 
 } // namespace offsets
