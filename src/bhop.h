@@ -1,7 +1,8 @@
+// --- src/bhop.h ---
 #pragma once
-#include <Windows.h>
 
-// Bhop via CS2 button system write
-// Uses current working offsets - DO NOT CHANGE THESE
-void BhopTick();
+// Bhop via the CS2 button-system write.
+// Offsets (jump button 0xB3E00, m_hGroundEntity 0x50C) are verified working
+// for the current build — do not change.
 void Bhop_Init();
+void BhopTick();
