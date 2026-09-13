@@ -95,6 +95,7 @@ public:
     int       last_skeleton_count = 0;  // players with a skeleton drawn
     uintptr_t dbg_node_off  = 0;        // detected C_BaseEntity -> scene node
     uintptr_t dbg_array_off = 0;        // detected scene node -> bone array
+    int       dbg_pts       = 0;        // sane bone points in the detected array
     int       dbg_state     = 0;        // 0 = scanning, 1 = locked
 
 private:
