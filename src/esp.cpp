@@ -92,6 +92,7 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
     int best_score = 0;
     int best_pts   = 0;
     const int need = (test.size() >= 2) ? 2 : 1;
+    if (pt_pts_placeholder_unused(test)) return best;
 
     uint8_t node_buf[kNodeScanBytes];
 
@@ -143,7 +144,8 @@ BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test,
 
 // One bulk read for all 28 bones: one syscall per player, and a snapshot that
 // can't be torn mid-update.
-bool read_bones(const Memory& mem, uintptr_t pawn, const BoneChain& chain,
+bool read_bones(const Memory& mem, uintptr_t pawn, const Vec3& origin,
+                const BoneChain& chain,
                 std::array<Vec3, BONE_COUNT>& out,
                 std::array<bool, BONE_COUNT>& ok) {
     out.fill(Vec3{});
@@ -159,10 +161,23 @@ bool read_bones(const Memory& mem, uintptr_t pawn, const BoneChain& chain,
     BoneEntry raw[BONE_COUNT];
     if (!mem.read_bytes(arr, raw, sizeof(raw))) return false;
 
+    // Per-bone sanity, measured against the player's own feet. This is what
+    // stops a bone that maps to the wrong body part (or a stray model bone far
+    // from the body) from being drawn as a line across the map -- it is simply
+    // skipped instead. Tighter than the probe's box, since by now we know
+    // exactly which entity these bones belong to.
     int valid = 0;
     for (int i = 0; i < BONE_COUNT; ++i) {
-        if (!sane_pos(raw[i].pos)) continue;
-        out[i] = raw[i].pos;
+        const Vec3& p = raw[i].pos;
+        if (!sane_pos(p)) continue;
+
+        const float dx = p.x - origin.x;
+        const float dy = p.y - origin.y;
+        const float dz = p.z - origin.z;
+        if (std::fabs(dx) > 60.0f || std::fabs(dy) > 60.0f) continue;
+        if (dz < -25.0f || dz > 90.0f) continue;
+
+        out[i] = p;
         ok[i]  = true;
         ++valid;
     }
@@ -344,7 +359,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         pd.distance = r.distance;
 
         if (s_chain.valid)
-            pd.has_bones = read_bones(mem, r.pawn, s_chain, pd.bones, pd.bone_ok);
+                        pd.has_bones = read_bones(mem, r.pawn, r.origin, s_chain,
+                                      pd.bones, pd.bone_ok);
         if (pd.has_bones) ++bone_hits;
 
         pd.head = (pd.has_bones && pd.bone_ok[BONE_HEAD])
