@@ -9,7 +9,6 @@
 #include "offsets.h"
 #include "bhop.h"
 
-// g_mem defined in memory.cpp
 static ESP  g_esp;
 static bool g_running   = true;
 bool        g_menu_open = false;
@@ -48,15 +47,12 @@ void memory_thread() {
 
     while (g_running) {
         if (g_mem.is_valid()) {
-            // Read local team from client.dll base
             uintptr_t local_pawn = g_mem.read<uintptr_t>(
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             if (local_pawn)
                 g_local_team = g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
-            // Pass client_dll as the base — all offsets are relative to it
             g_esp.update(g_mem, g_mem.client_dll);
-
             if (g_cfg.bhop_enabled) BhopTick();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -113,13 +109,15 @@ void render_esp(ImDrawList* dl) {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 400.0f, 310.0f }, ImGuiCond_Always);
-    ImGui::SetNextWindowPos ({ 20.0f,  20.0f  }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr,
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse);
+    // Resizable — user can drag to fit their resolution
+    ImGui::SetNextWindowSize({ 420.0f, 340.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 340.0f, 260.0f }, { 800.0f, 600.0f });
+    ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
+    ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoScrollbar);
 
+    float win_w = ImGui::GetContentRegionAvail().x;
+
+    // Status
     if (!g_mem.is_valid())
         ImGui::TextColored({ 1.0f,0.5f,0.0f,1.0f }, "[ Waiting for CS2... ]");
     else
@@ -128,15 +126,17 @@ void render_menu() {
 
     ImGui::Separator();
 
+    float col_w = win_w / 2.0f;
     ImGui::Columns(2, nullptr, false);
-    ImGui::SetColumnWidth(0, 200.0f);
+    ImGui::SetColumnWidth(0, col_w);
 
+    // LEFT — ESP
     ImGui::TextDisabled("[ ESP ]");
-    ImGui::Checkbox("Boxes",         &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health Bar",    &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",      &g_cfg.esp_distance);
-    ImGui::Checkbox("Show Enemies",  &g_cfg.esp_show_enemies);
-    ImGui::Checkbox("Show Team",     &g_cfg.esp_show_team);
+    ImGui::Checkbox("Boxes",        &g_cfg.esp_boxes);
+    ImGui::Checkbox("Health Bar",   &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",     &g_cfg.esp_distance);
+    ImGui::Checkbox("Show Enemies", &g_cfg.esp_show_enemies);
+    ImGui::Checkbox("Show Team",    &g_cfg.esp_show_team);
     ImGui::Spacing();
     ImGui::TextDisabled("[ Colors ]");
     ImGui::ColorEdit4("##ec", &g_cfg.color_enemy.x,
@@ -146,9 +146,11 @@ void render_menu() {
         ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
     ImGui::SameLine(); ImGui::Text("Team");
     ImGui::Spacing();
-    ImGui::SetNextItemWidth(170.0f);
+    ImGui::TextDisabled("[ Style ]");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
     ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "%.1f px");
 
+    // RIGHT — Misc + Debug
     ImGui::NextColumn();
     ImGui::TextDisabled("[ Misc ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
@@ -164,15 +166,13 @@ void render_menu() {
     ImGui::Columns(1);
     ImGui::Separator();
 
-    float bw2 = (400.0f
-        - ImGui::GetStyle().WindowPadding.x * 2.0f
-        - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
-
-    if (ImGui::Button("[Apply]", { bw2, 0 })) {}
+    // Buttons — scale to window width
+    float btn_w = (win_w - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+    if (ImGui::Button("[Apply]", { btn_w, 0 })) {}
     ImGui::SameLine();
-    if (ImGui::Button("[Reset]", { bw2, 0 })) g_cfg = {};
+    if (ImGui::Button("[Reset]", { btn_w, 0 })) g_cfg = {};
     ImGui::SameLine();
-    if (ImGui::Button("[Exit]",  { bw2, 0 })) g_running = false;
+    if (ImGui::Button("[Exit]",  { btn_w, 0 })) g_running = false;
 
     ImGui::Spacing();
     ImGui::TextDisabled("INSERT - menu    F9 - exit");
