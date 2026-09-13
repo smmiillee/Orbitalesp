@@ -16,36 +16,45 @@
 static ESP g_esp;
 static bool g_running = true;
 bool g_menu_open = false;
-bool g_vsync = false;          // false = uncapped overlay (see end_frame)
+bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
 
 struct Config {
-    bool  esp_boxes        = true;
-    bool  esp_health       = true;
-    bool  esp_distance     = true;
-    bool  esp_show_enemies = true;
-    bool  esp_show_team    = true;
-    bool  esp_skeleton     = true;
-    bool  esp_head_dot     = true;
-    float box_thickness    = 0.5f;
-    ImVec4 color_enemy     = { 1.00f, 0.10f, 0.10f, 1.00f };
-    ImVec4 color_team      = { 0.10f, 1.00f, 0.20f, 1.00f };
-    ImVec4 color_skeleton  = { 1.00f, 1.00f, 1.00f, 0.90f };
-    bool  bhop_enabled     = true;
-    bool  bhop_input_mode  = false;
+    // visuals
+    bool  esp_boxes    = true;
+    bool  esp_health   = true;
+    bool  esp_distance = true;
+    bool  esp_name     = true;
+    bool  esp_weapon   = true;
+    bool  esp_skeleton = true;
+    bool  esp_head_dot = true;
+    bool  esp_bomb     = true;
+    bool  show_enemies = true;
+    bool  show_team    = true;
+    float box_thickness = 0.5f;
+
+    // colours -- per visual, as requested
+    bool   team_colors = false;
+    ImVec4 color_enemy  = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_team   = { 0.20f, 0.90f, 0.35f, 1.00f };
+    ImVec4 color_box    = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_skel   = { 0.95f, 0.95f, 0.95f, 0.90f };
+    ImVec4 color_head   = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_name   = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_weapon = { 1.00f, 0.85f, 0.30f, 1.00f };
+    ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
+    ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
+
+    bool bhop_enabled = true;
+    bool bhop_input_mode = false;
 } g_cfg;
 
-static int g_screen_w   = 1920;
-static int g_screen_h   = 1080;
+static int g_screen_w = 1920;
+static int g_screen_h = 1080;
 static int g_local_team = 0;
-
-// ── frame cap ─────────────────────────────────────────────────────────────
-// Hard-coding 240 Hz was wrong for everyone whose panel isn't 240 Hz. In
-// fullscreen CS2 switches the display mode, so ENUM_CURRENT_SETTINGS reports
-// the refresh rate the user actually picked in CS2's video settings.
-static int  g_detected_hz  = 0;
-static bool g_limit_fps    = true;
-static int  g_fps_override = 0;   // 0 = use the detected refresh rate
+static int g_detected_hz = 0;
+static bool g_limit_fps = true;
+static int  g_fps_override = 0;
 
 static int query_refresh_rate(HWND game) {
     if (!game) return 0;
@@ -59,13 +68,11 @@ static int query_refresh_rate(HWND game) {
     if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0;
 
     const int hz = static_cast<int>(dm.dmDisplayFrequency);
-    if (hz < 30 || hz > 1000) return 0;   // 0/1 means "hardware default"
-    return hz;
+    return (hz < 30 || hz > 1000) ? 0 : hz;
 }
 
-// sleep_for() on Windows goes through Sleep(), which quantises to the default
-// ~15.6 ms timer -- so sleep_for(4ms) actually sleeps ~15.6 ms and the overlay
-// silently ran at ~64 Hz instead of 240. Sleep the bulk, spin the last stretch.
+// sleep_for() on Windows quantises to the ~15.6 ms timer, so a 4 ms cap
+// silently ran at 64 Hz. Sleep the bulk, spin the last stretch.
 static void wait_until(std::chrono::steady_clock::time_point deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -78,28 +85,22 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
-// Skeleton bone connections, using the CURRENT (post animgraph_2_beta) map
-// from esp.h. Neck is the hub for both arms; spine runs pelvis -> chest -> neck.
+// Skeleton links, using the current (post animgraph_2_beta) bone map.
 static constexpr int kSkeleton[][2] = {
-    // spine
     { BONE_PELVIS,     BONE_SPINE_1    },
     { BONE_SPINE_1,    BONE_SPINE_2    },
     { BONE_SPINE_2,    BONE_CHEST      },
     { BONE_CHEST,      BONE_NECK       },
     { BONE_NECK,       BONE_HEAD       },
-    // left arm
     { BONE_NECK,       BONE_L_SHOULDER },
     { BONE_L_SHOULDER, BONE_L_ELBOW    },
     { BONE_L_ELBOW,    BONE_L_HAND     },
-    // right arm
     { BONE_NECK,       BONE_R_SHOULDER },
     { BONE_R_SHOULDER, BONE_R_ELBOW    },
     { BONE_R_ELBOW,    BONE_R_HAND     },
-    // left leg
     { BONE_PELVIS,     BONE_L_HIP      },
     { BONE_L_HIP,      BONE_L_KNEE     },
     { BONE_L_KNEE,     BONE_L_FOOT     },
-    // right leg
     { BONE_PELVIS,     BONE_R_HIP      },
     { BONE_R_HIP,      BONE_R_KNEE     },
     { BONE_R_KNEE,     BONE_R_FOOT     },
@@ -118,7 +119,7 @@ static bool find_cs2_window() {
     return true;
 }
 
-// Reader thread: world positions + bones. No view matrix, no bhop.
+// Reader thread: world samples only. The bhop owns its own thread.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -127,25 +128,27 @@ void memory_thread() {
 
     while (g_running) {
         if (g_mem.is_valid()) {
-            const uintptr_t local_pawn =
-                g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
+            const uintptr_t local_pawn = g_mem.read<uintptr_t>(
+                g_mem.client_dll + offsets::dwLocalPlayerPawn);
             if (local_pawn)
                 g_local_team =
                     g_mem.read<int>(local_pawn + offsets::m_iTeamNum) & 0xFF;
 
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
-        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(4));
+        // 8 ms (~125 Hz) is plenty: the game only writes positions at 64 Hz,
+        // and the render thread interpolates between samples anyway.
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
     }
 }
+
+static ImU32 col_of(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
 
 void render_esp(ImDrawList* dl) {
     if (!g_mem.is_valid()) return;
 
-    std::vector<PlayerESP> players =
+    const std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
-
-    int skel_drawn = 0;
 
     for (const auto& p : players) {
         const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
@@ -154,13 +157,14 @@ void render_esp(ImDrawList* dl) {
         if (is_enemy    && !g_cfg.esp_show_enemies) continue;
         if (is_teammate && !g_cfg.esp_show_team)    continue;
 
-        const ImU32 col = ImGui::ColorConvertFloat4ToU32(
-            is_enemy ? g_cfg.color_enemy : g_cfg.color_team);
-        const ImU32 skel_col =
-            ImGui::ColorConvertFloat4ToU32(g_cfg.color_skeleton);
+        // Per-visual colours, unless team colouring is switched on.
+        const ImVec4 team_col = is_enemy ? g_cfg.color_enemy : g_cfg.color_team;
+        auto pick = [&](const ImVec4& own) -> ImU32 {
+            return col_of(g_cfg.team_colors ? team_col : own);
+        };
 
         const float cx  = p.screen_head.x;
-        const float top = p.screen_top.y;   // head bone + headroom
+        const float top = p.screen_top.y;
         const float bot = p.screen_feet.y;
         const float bh  = p.box_h;
         const float bw  = p.box_w;
@@ -169,150 +173,182 @@ void render_esp(ImDrawList* dl) {
         if (bot < 0 || top > g_screen_h) continue;
 
         if (g_cfg.esp_boxes) {
-            dl->AddRect(
-                { cx - bw / 2.0f, top },
-                { cx + bw / 2.0f, bot },
-                col, 0.0f, 0, g_cfg.box_thickness);
+            dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
+                        pick(g_cfg.color_box), 0.0f, 0, g_cfg.box_thickness);
         }
 
         if (g_cfg.esp_skeleton && p.has_bones) {
+            const ImU32 sk = pick(g_cfg.color_skel);
             for (const auto& link : kSkeleton) {
-                const int a = link[0];
-                const int b = link[1];
+                const int a = link[0], b = link[1];
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
-                dl->AddLine(
-                    { p.bones[a].x, p.bones[a].y },
-                    { p.bones[b].x, p.bones[b].y },
-                    skel_col, g_cfg.box_thickness);
+                dl->AddLine({ p.bones[a].x, p.bones[a].y },
+                            { p.bones[b].x, p.bones[b].y },
+                            sk, g_cfg.box_thickness);
             }
-            ++skel_drawn;
         }
 
-        // Head dot sits on the actual head BONE, not on the box top.
         if (g_cfg.esp_head_dot) {
             float r = bh * 0.035f;
             if (r < 2.5f) r = 2.5f;
             if (r > 6.0f) r = 6.0f;
-            dl->AddCircleFilled({ p.screen_head.x, p.screen_head.y }, r, col, 16);
+            dl->AddCircleFilled({ p.screen_head.x, p.screen_head.y }, r,
+                                pick(g_cfg.color_head), 16);
         }
 
         if (g_cfg.esp_health) {
             const float bar_h = bh * (p.health / 100.0f);
             const float bar_x = cx - bw / 2.0f - 6.0f;
+            const ImU32 hp = IM_COL32((int)(255 * (1.0f - p.health / 100.0f)),
+                                      (int)(255 * (p.health / 100.0f)), 0, 255);
+            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp);
+            dl->AddRect({ bar_x, top }, { bar_x + 3.0f, bot },
+                        IM_COL32(0, 0, 0, 180));
+        }
 
-            const ImU32 hp_col = IM_COL32(
-                (int)(255 * (1.0f - p.health / 100.0f)),
-                (int)(255 * (p.health / 100.0f)),
-                0, 255);
+        if (g_cfg.esp_name && p.name[0]) {
+            const ImVec2 sz = ImGui::CalcTextSize(p.name);
+            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
+                        pick(g_cfg.color_name), p.name);
+        }
 
-            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
-            dl->AddRect     ({ bar_x, top },          { bar_x + 3.0f, bot },
-                             IM_COL32(0, 0, 0, 180));
+        if (g_cfg.esp_weapon && p.weapon[0]) {
+            const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
+            dl->AddText({ cx - sz.x * 0.5f, bot + 2.0f },
+                        pick(g_cfg.color_weapon), p.weapon);
         }
 
         if (g_cfg.esp_distance) {
-            char buf[32];
+            char buf[24];
             std::snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, top - 14.0f },
-                        IM_COL32(255, 255, 255, 220), buf);
+            dl->AddText({ cx + bw / 2.0f + 4.0f, top },
+                        col_of(g_cfg.color_dist), buf);
         }
     }
 
-    g_esp.last_skeleton_count = skel_drawn;
+    if (g_cfg.esp_bomb) {
+        const BombESP b =
+            g_esp.project_bomb(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+        if (b.active) {
+            const ImU32 c = col_of(g_cfg.color_bomb);
+            float h = std::fabs(b.screen_top.y - b.screen.y);
+            if (h < 6.0f) h = 6.0f;
+            const float w = h;
+
+            dl->AddRect({ b.screen.x - w / 2.0f, b.screen_top.y },
+                        { b.screen.x + w / 2.0f, b.screen.y }, c, 0.0f, 0,
+                        g_cfg.box_thickness);
+            dl->AddText({ b.screen.x - 7.0f, b.screen_top.y - 16.0f }, c, "C4");
+
+            char buf[48];
+            if (b.timer >= 0.0f)
+                std::snprintf(buf, sizeof(buf), "%.1fs  %.0fm",
+                              b.timer, b.distance);
+            else
+                std::snprintf(buf, sizeof(buf), "%.0fm", b.distance);
+            dl->AddText({ b.screen.x - 14.0f, b.screen.y + 2.0f }, c, buf);
+        }
+    }
+}
+
+static void color_row(const char* id, const char* label, ImVec4* c) {
+    ImGui::ColorEdit4(id, &c->x,
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+    ImGui::SameLine();
+    ImGui::Text("%s", label);
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 600.0f, 560.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 420.0f, 320.0f }, { 1100.0f, 900.0f });
+    ImGui::SetNextWindowSize({ 620.0f, 470.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 320.0f }, { 1100.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
-    const float win_w = ImGui::GetContentRegionAvail().x;
-
     if (!g_mem.is_valid()) {
-        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ Waiting for CS2... ]");
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
     } else {
         ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
-            "[ Attached | %dx%d | Team:%d ]", g_screen_w, g_screen_h, g_local_team);
-
-        // Skeleton chain diagnostic -- if bones stays 0, these two numbers are
-        // the whole story.
-        if (g_esp.dbg_state)
-            ImGui::Text("[ Skeleton: bone %d | pts %d | chain 0x%llX/0x%llX ]",
-                g_esp.last_skeleton_count, g_esp.dbg_pts,
-                (unsigned long long)g_esp.dbg_node_off,
-                (unsigned long long)g_esp.dbg_array_off);
-        else
-            ImGui::Text("[ Skeleton: bone %d | chain scanning... ]",
-                g_esp.last_skeleton_count);
+            "[ attached  %dx%d  %d Hz  %d players ]",
+            g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
     }
 
     ImGui::Separator();
 
+    const float win_w = ImGui::GetContentRegionAvail().x;
     const float col_w = win_w / 2.0f;
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
     ImGui::TextDisabled("[ ESP ]");
     ImGui::Checkbox("Boxes", &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health Bar", &g_cfg.esp_health);
-    ImGui::Checkbox("Distance", &g_cfg.esp_distance);
-    ImGui::Checkbox("Show Enemies", &g_cfg.esp_show_enemies);
-    ImGui::Checkbox("Show Team", &g_cfg.esp_show_team);
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ Skeleton ]");
     ImGui::Checkbox("Skeleton", &g_cfg.esp_skeleton);
-    ImGui::Checkbox("Head Dot", &g_cfg.esp_head_dot);
+    ImGui::Checkbox("Head dot", &g_cfg.esp_head_dot);
+    ImGui::Checkbox("Name", &g_cfg.esp_name);
+    ImGui::Checkbox("Weapon", &g_cfg.esp_weapon);
+    ImGui::Checkbox("Health bar", &g_cfg.esp_health);
+    ImGui::Checkbox("Distance", &g_cfg.esp_distance);
+    ImGui::Checkbox("Bomb (C4)", &g_cfg.esp_bomb);
 
     ImGui::Spacing();
-    ImGui::TextDisabled("[ Colors ]");
-    ImGui::ColorEdit4("##ec", &g_cfg.color_enemy.x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
-    ImGui::SameLine(); ImGui::Text("Enemy");
-
-    ImGui::ColorEdit4("##tc", &g_cfg.color_team.x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
-    ImGui::SameLine(); ImGui::Text("Team");
-
-    ImGui::ColorEdit4("##sc", &g_cfg.color_skeleton.x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
-    ImGui::SameLine(); ImGui::Text("Skeleton");
+    ImGui::Checkbox("Show enemies", &g_cfg.esp_show_enemies);
+    ImGui::Checkbox("Show teammates", &g_cfg.esp_show_team);
 
     ImGui::Spacing();
     ImGui::TextDisabled("[ Style ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 4.0f, "thick %.1f px");
+    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 3.0f,
+                       "thickness %.1f px");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##smooth", &g_esp.smoothing_ms, 0.0f, 80.0f,
-                       "smooth %.0f ms (player motion)");
+    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f,
+                       "smoothing %.0f ms");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Interpolation delay. Higher = smoother and a\n"
+                          "touch more latency; 25-45 ms is the sweet spot.");
 
     ImGui::NextColumn();
 
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
-    ImGui::Checkbox("V-Sync (off = less lag)", &g_vsync);
-
     if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
         Bhop_SetInputMode(g_cfg.bhop_input_mode);
 
     const BhopDebug bd = Bhop_GetDebug();
-    ImGui::Text("button: 0x%06llX  %s",
-        (unsigned long long)bd.offset,
-        bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[estimate]"));
-    ImGui::Text("live  : %u", bd.live_value);
-    ImGui::Text("ground: %s   flags=0x%X  ge=0x%X",
-        bd.on_ground ? "YES" : "no", bd.flags, bd.ground_entity);
-    ImGui::TextDisabled("auto-detects while you play");
-    if (ImGui::Button("[Rescan]")) Bhop_Rescan();
+    const bool sig_z    = (bd.signals & 1) != 0;
+    const bool sig_flag = (bd.signals & 2) != 0;
+    const bool sig_hge  = (bd.signals & 4) != 0;
+    ImGui::Text("ground: %s", bd.on_ground ? "YES" : "no");
+    ImGui::TextDisabled("signals: %s%s%s",
+        sig_z ? "z " : "", sig_flag ? "flag " : "", sig_hge ? "hge" : "");
+    if (!sig_flag && !sig_hge)
+        ImGui::TextDisabled("jump around a bit to calibrate");
 
     ImGui::Spacing();
-    ImGui::TextDisabled("[ Frame Rate ]");
-    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
+    ImGui::TextDisabled("[ Frame rate ]");
     ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderInt("##cap", &g_fps_override, 0, 600,
-        g_fps_override ? "manual cap %d fps" : "cap auto (refresh)");
+    ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
+        g_fps_override ? "cap %d fps" : "cap auto (refresh)");
+    ImGui::Checkbox("V-Sync", &g_vsync);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Colours ]");
+    ImGui::Checkbox("Use team colours", &g_cfg.team_colors);
+    color_row("##ce", "Enemy",    &g_cfg.color_enemy);
+    color_row("##ct", "Team",     &g_cfg.color_team);
+
+    ImGui::NextColumn();
+    ImGui::NextColumn();
+
+    color_row("##cb", "Boxes",    &g_cfg.color_box);
+    color_row("##cs", "Skeleton", &g_cfg.color_skel);
+    color_row("##ch", "Head dot", &g_cfg.color_head);
+
+    ImGui::NextColumn();
+
+    color_row("##cn", "Name",     &g_cfg.color_name);
+    color_row("##cw", "Weapon",   &g_cfg.color_weapon);
+    color_row("##cd", "Distance", &g_cfg.color_dist);
+    color_row("##cc", "Bomb",     &g_cfg.color_bomb);
 
     ImGui::Columns(1);
     ImGui::Separator();
@@ -324,10 +360,7 @@ void render_menu() {
     ImGui::SameLine();
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
-        g_esp.smoothing_ms = 20.0f;
-        g_esp.align_scale = 1.0f;
-        g_esp.align_offset_x = 0.0f;
-        g_esp.align_offset_y = 0.0f;
+        g_esp.interp_delay_ms = 35.0f;
         Bhop_SetInputMode(false);
     }
     ImGui::SameLine();
@@ -341,7 +374,6 @@ void render_menu() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // MUST be first: before any window exists in this process.
     Overlay::enable_dpi_awareness();
 
     while (!find_cs2_window())
@@ -364,11 +396,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
-        if (GetAsyncKeyState(VK_END) & 1)    g_running   = false;
 
-        // Re-read the game's client area every frame, then glue the overlay to
-        // it. This is the auto-resolution detection: no manual alignment needed
-        // and it survives a resolution change or the game being moved.
         if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
             RECT r{};
             if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
@@ -384,14 +412,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (g_menu_open) render_menu();
         overlay.end_frame();
 
-        // Re-check the panel's refresh rate occasionally (it changes when CS2
-        // switches display mode on a fullscreen transition).
-        static auto next_hz_check = std::chrono::steady_clock::now();
+        static auto next_hz = std::chrono::steady_clock::now();
         const auto now_tp = std::chrono::steady_clock::now();
-        if (now_tp >= next_hz_check) {
+        if (now_tp >= next_hz) {
             const int hz = query_refresh_rate(g_cs2_hwnd);
             if (hz) g_detected_hz = hz;
-            next_hz_check = now_tp + std::chrono::seconds(2);
+            next_hz = now_tp + std::chrono::seconds(2);
         }
 
         if (!g_vsync) {
