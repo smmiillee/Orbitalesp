@@ -1,7 +1,6 @@
 // --- src/overlay.h ---
 #pragma once
 #include <d3d11.h>
-#include <string>
 
 class Overlay {
 public:
@@ -11,18 +10,19 @@ public:
     IDXGISwapChain*         swapchain = nullptr;
     ID3D11RenderTargetView* rtv       = nullptr;
 
-    bool create(int width, int height);
-    void begin_frame();   // calls update_input_mode() internally
+    // cs2_hwnd: the SDL_app window we parent ourselves to.
+    // width/height: CS2 client rect dimensions.
+    bool create(HWND cs2_hwnd, int width, int height);
+
+    void begin_frame();
     void end_frame();
     void cleanup();
-    void update_input_mode(); // toggle click-through based on g_menu_open
-
-    bool is_running() const { return hwnd != nullptr; }
 
 private:
-    bool create_device();
-    bool create_render_target();
-    void release_render_target();
+    bool init_dx11(int width, int height);
+    bool create_rtv();
+    void release_rtv();
+    void update_input_mode();
 
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     WNDCLASSEXW wc{};
