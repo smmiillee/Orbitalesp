@@ -15,17 +15,25 @@ struct BoneEntry {
 static_assert(sizeof(BoneEntry) == offsets::m_boneStride,
               "CS2 bone stride must be 0x20");
 
+// Box top sits a few units above the head bone so the skull isn't clipped.
+// The head DOT uses the bone itself.
+constexpr float kHeadPad = 6.0f;
+
 // The bone chain is NOT stable across updates:
 //   pawn + sceneNodeOff  -> CGameSceneNode
 //   node + boneArrayOff  -> CBoneData[28]
 // sceneNodeOff has shipped as 0x310/0x328/0x330/0x338 and boneArrayOff
-// (= m_modelState + 0x80) as 0x1C0/0x1E0/0x210. So we scan for it once and
-// keep it only if it validates against real players.
+// (= m_modelState + 0x80) as 0x1C0/0x1E0/0x210. So BOTH are searched for at
+// runtime instead of guessed -- that is why the skeleton never drew before.
 struct BoneChain {
     uintptr_t scene_node_off = 0;
     uintptr_t bone_array_off = 0;
     bool valid = false;
 };
+
+bool valid_ptr(uintptr_t p) {
+    return p > 0x10000 && p < 0x00007FFFFFFF0000ULL && (p % 8) == 0;
+}
 
 bool sane_pos(const Vec3& v) {
     return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
@@ -35,67 +43,89 @@ bool sane_pos(const Vec3& v) {
            !(v.x == 0.0f && v.y == 0.0f && v.z == 0.0f);
 }
 
-// Does this candidate chain put a believable skeleton on this player?
-// Everything is checked relative to the player's own feet origin, so a random
-// pointer that happens to hold plausible floats will not pass.
-bool bone_geometry_ok(const Memory& mem, uintptr_t pawn, const Vec3& origin,
-                      uintptr_t scene_node_off, uintptr_t bone_array_off) {
-    const uintptr_t node = mem.read<uintptr_t>(pawn + scene_node_off);
-    if (!node || node < 0x10000) return false;
+// Is this a believable player skeleton?
+//
+// Deliberately mostly SELF-relative: head above neck above pelvis, arms-length
+// torso span, player-sized proportions. The origin is only used as a loose
+// sanity bound, so a m_vOldOrigin that isn't exactly at the feet can't make
+// detection fail.
+bool geometry_ok(const Vec3& pelvis, const Vec3& neck, const Vec3& head,
+                 const Vec3& origin) {
+    if (!sane_pos(pelvis) || !sane_pos(neck) || !sane_pos(head)) return false;
 
-    const uintptr_t arr = mem.read<uintptr_t>(node + bone_array_off);
-    if (!arr || arr < 0x10000) return false;
-
-    const Vec3 head   = mem.read<Vec3>(arr + BONE_HEAD   * offsets::m_boneStride);
-    const Vec3 neck   = mem.read<Vec3>(arr + BONE_NECK   * offsets::m_boneStride);
-    const Vec3 pelvis = mem.read<Vec3>(arr + BONE_PELVIS * offsets::m_boneStride);
-
-    if (!sane_pos(head) || !sane_pos(neck) || !sane_pos(pelvis)) return false;
-
-    // Bones must sit within a player-sized radius of the feet origin.
-    if (std::fabs(head.x - origin.x) > 60.0f) return false;
-    if (std::fabs(head.y - origin.y) > 60.0f) return false;
-    if (std::fabs(pelvis.x - origin.x) > 60.0f) return false;
-    if (std::fabs(pelvis.y - origin.y) > 60.0f) return false;
-
-    // ...and in a sane vertical order: head above neck above pelvis.
-    const float hz = head.z   - origin.z;
-    const float pz = pelvis.z - origin.z;
-    if (hz < 25.0f || hz > 100.0f) return false;
-    if (pz < -5.0f || pz > 70.0f)  return false;
     if (!(head.z > neck.z && neck.z > pelvis.z)) return false;
-    if (head.z - pelvis.z < 10.0f || head.z - pelvis.z > 60.0f) return false;
+
+    const float span = head.z - pelvis.z;      // ~26 units on a real player
+    if (span < 15.0f || span > 60.0f) return false;
+
+    const float dx = head.x - pelvis.x;
+    const float dy = head.y - pelvis.y;
+    if (dx * dx + dy * dy > 40.0f * 40.0f) return false;
+
+    // Loose check that the skeleton belongs to THIS entity.
+    if (std::fabs(head.x - origin.x) > 150.0f) return false;
+    if (std::fabs(head.y - origin.y) > 150.0f) return false;
+    if (std::fabs(head.z - origin.z) > 150.0f) return false;
+    if (std::fabs(pelvis.z - origin.z) > 150.0f) return false;
 
     return true;
 }
 
-BoneChain probe_bone_chain(const Memory& mem,
-                           const std::vector<std::pair<uintptr_t, Vec3>>& test) {
+struct TestPawn {
+    uintptr_t pawn;
+    Vec3      origin;
+};
+
+BoneChain probe_bone_chain(const Memory& mem, const std::vector<TestPawn>& test) {
     BoneChain best;
     int best_score = 0;
-    const int need = test.size() >= 2 ? 2 : 1;
+    const int need = (test.size() >= 2) ? 2 : 1;
+    if (test.empty()) return best;
+
+    static constexpr size_t kNodeQwords = 0x400 / 8;
+    uint64_t fields[kNodeQwords];
 
     for (uintptr_t node_off = offsets::kSceneNodeScanBegin;
          node_off <= offsets::kSceneNodeScanEnd;
          node_off += offsets::kScanStep) {
 
-        for (uintptr_t arr_off = offsets::kBoneArrayScanBegin;
-             arr_off <= offsets::kBoneArrayScanEnd;
-             arr_off += offsets::kScanStep) {
+        const uintptr_t node = mem.read<uintptr_t>(test[0].pawn + node_off);
+        if (!valid_ptr(node)) continue;
+
+        // ONE bulk read of the whole scene node. The inner loop then runs
+        // entirely in-process, which is what makes a two-level search cheap
+        // enough to run at all.
+        if (!mem.read_bytes(node, fields, sizeof(fields))) continue;
+
+        for (uintptr_t array_off = offsets::kBoneArrayScanBegin;
+             array_off <= offsets::kBoneArrayScanEnd;
+             array_off += 8) {
+
+            if (!valid_ptr(fields[array_off / 8])) continue;
 
             int score = 0;
-            for (const auto& t : test) {
-                if (bone_geometry_ok(mem, t.first, t.second, node_off, arr_off)) {
-                    ++score;
-                } else if (score == 0) {
-                    break; // fail fast: the first pawn already rejected this pair
+            for (size_t t = 0; t < test.size(); ++t) {
+                uintptr_t arr;
+                if (t == 0) {
+                    arr = fields[array_off / 8];
+                } else {
+                    const uintptr_t n = mem.read<uintptr_t>(test[t].pawn + node_off);
+                    if (!valid_ptr(n)) break;
+                    arr = mem.read<uintptr_t>(n + array_off);
+                    if (!valid_ptr(arr)) break;
                 }
+
+                BoneEntry b[7]; // bones 0..6 covers pelvis, neck and head
+                if (!mem.read_bytes(arr, b, sizeof(b))) break;
+                if (!geometry_ok(b[BONE_PELVIS].pos, b[BONE_NECK].pos,
+                                 b[BONE_HEAD].pos, test[t].origin)) break;
+                ++score;
             }
 
             if (score > best_score) {
                 best_score = score;
                 best.scene_node_off = node_off;
-                best.bone_array_off = arr_off;
+                best.bone_array_off = array_off;
             }
         }
     }
@@ -114,10 +144,10 @@ bool read_bones(const Memory& mem, uintptr_t pawn, const BoneChain& chain,
     if (!chain.valid || !pawn) return false;
 
     const uintptr_t node = mem.read<uintptr_t>(pawn + chain.scene_node_off);
-    if (!node || node < 0x10000) return false;
+    if (!valid_ptr(node)) return false;
 
     const uintptr_t arr = mem.read<uintptr_t>(node + chain.bone_array_off);
-    if (!arr || arr < 0x10000) return false;
+    if (!valid_ptr(arr)) return false;
 
     BoneEntry raw[BONE_COUNT];
     if (!mem.read_bytes(arr, raw, sizeof(raw))) return false;
@@ -188,7 +218,6 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
-// Manual alignment nudge, applied to every projected point.
 void ESP::align(Vec2& s, int screen_w, int screen_h) const {
     if (align_scale == 1.0f && align_offset_x == 0.0f && align_offset_y == 0.0f)
         return;
@@ -263,25 +292,34 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         }
     }
 
-    // ── pass 2: resolve the bone chain (once, then self-heal) ─────────────
+    // ── pass 2: resolve the bone chain ────────────────────────────────────
+    // Throttled: a failed probe costs a few ms, so retrying it every 4 ms
+    // would starve the reader thread (and it is what made the ESP hitch).
     static BoneChain s_chain{};
-    static int s_bone_fail = 0;
+    static int s_bone_fail    = 0;
+    static int s_probe_cooldown = 0;
 
     if (!s_chain.valid || s_bone_fail > 250) {
-        // The local pawn is the best reference: it always has a live
-        // skeleton. Enemies are added so a random match is very unlikely.
-        std::vector<std::pair<uintptr_t, Vec3>> test;
-        if (local_origin.x != 0.0f || local_origin.y != 0.0f)
-            test.emplace_back(local_pawn, local_origin);
-        for (const auto& r : raw) {
-            if (test.size() >= 4) break;
-            test.emplace_back(r.pawn, r.origin);
-        }
+        if (s_probe_cooldown > 0) {
+            --s_probe_cooldown;
+        } else {
+            std::vector<TestPawn> test;
+            if (local_origin.x != 0.0f || local_origin.y != 0.0f)
+                test.push_back({ local_pawn, local_origin });
+            for (const auto& r : raw) {
+                if (test.size() >= 4) break;
+                test.push_back({ r.pawn, r.origin });
+            }
 
-        const BoneChain found = probe_bone_chain(mem, test);
-        if (found.valid) {
-            s_chain = found;
-            s_bone_fail = 0;
+            const BoneChain found = probe_bone_chain(mem, test);
+            if (found.valid) {
+                s_chain = found;
+                s_bone_fail = 0;
+                dbg_node_off  = found.scene_node_off;
+                dbg_array_off = found.bone_array_off;
+                dbg_state     = 1;
+            }
+            s_probe_cooldown = 375; // ~1.5 s at 4 ms
         }
     }
 
@@ -310,7 +348,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     }
 
     // Losing every skeleton while players are visible means the offsets moved
-    // (game updated) -> force a re-probe on the next pass.
+    // (game updated) -> force a re-probe.
     if (s_chain.valid && !raw.empty() && bone_hits == 0) ++s_bone_fail;
     else                                               s_bone_fail = 0;
 
@@ -330,9 +368,9 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
     }
 
     // ── interpolation ─────────────────────────────────────────────────────
-    // CS2 writes entity positions at ~64 Hz, so sampling faster just re-reads
-    // the same value and then steps. Smoothing in the time domain (rather
-    // than reading harder) is what removes the staircase.
+    // CS2 writes entity positions at ~64 Hz. This only has a visible effect
+    // when the overlay actually renders faster than that -- see the spin-wait
+    // in main.cpp, because plain sleep_for() on Windows silences it.
     static auto last = std::chrono::steady_clock::now();
     const auto now_tp = std::chrono::steady_clock::now();
 
@@ -384,14 +422,18 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
             }
         }
 
+        const Vec3 box_top{ s.head.x, s.head.y, s.head.z + kHeadPad };
+
         PlayerESP e;
         if (!world_to_screen(s.head,   e.screen_head, vm, screen_w, screen_h)) continue;
+        if (!world_to_screen(box_top,  e.screen_top,  vm, screen_w, screen_h)) continue;
         if (!world_to_screen(s.origin, e.screen_feet, vm, screen_w, screen_h)) continue;
 
         align(e.screen_head, screen_w, screen_h);
+        align(e.screen_top,  screen_w, screen_h);
         align(e.screen_feet, screen_w, screen_h);
 
-        e.box_h = e.screen_feet.y - e.screen_head.y;
+        e.box_h = e.screen_feet.y - e.screen_top.y;
         if (e.box_h < 5.0f) continue;
 
         e.box_w     = e.box_h * 0.45f;
