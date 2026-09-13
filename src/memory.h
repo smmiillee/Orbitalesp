@@ -8,8 +8,8 @@
 class Memory {
 public:
     HANDLE    process_handle = nullptr;
-    uintptr_t base_address   = 0;  // cs2.exe base (kept for compatibility)
-    uintptr_t client_dll     = 0;  // client.dll base — ALL game offsets live here
+    uintptr_t base_address   = 0;
+    uintptr_t client_dll     = 0;
 
     bool attach(const std::wstring& process_name);
     void detach();
@@ -17,11 +17,17 @@ public:
     template<typename T>
     T read(uintptr_t address) const {
         T value{};
-        ReadProcessMemory(
-            process_handle,
+        ReadProcessMemory(process_handle,
             reinterpret_cast<LPCVOID>(address),
             &value, sizeof(T), nullptr);
         return value;
+    }
+
+    template<typename T>
+    void write(uintptr_t address, T value) const {
+        WriteProcessMemory(process_handle,
+            reinterpret_cast<LPVOID>(address),
+            &value, sizeof(T), nullptr);
     }
 
     bool is_valid() const {
