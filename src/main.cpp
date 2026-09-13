@@ -264,11 +264,11 @@ void render_menu() {
     ImGui::SameLine(); ImGui::Text("Enemy");
 
     ImGui::ColorEdit4("##tc", &g_cfg.color_team.x,
-        ImGui::ColorEditFlags_NoInputs | ImGui::ColorEditFlags_NoLabel);
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
     ImGui::SameLine(); ImGui::Text("Team");
 
     ImGui::ColorEdit4("##sc", &g_cfg.color_skeleton.x,
-        ImGui::ColorEdit4Flags_NoInputs | ImGuiColorEditFlags_NoLabel);
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
     ImGui::SameLine(); ImGui::Text("Skeleton");
 
     ImGui::Spacing();
