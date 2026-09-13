@@ -19,18 +19,23 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
+// CS2 entity list layout:
+//   dwEntityList -> CGameEntitySystem ptr
+//   CGameEntitySystem + 0x10 -> first list entry pointer
+//   entry + 8*((index>>9)+1) -> chunk ptr
+//   chunk + 0x78*(index&0x1FF) -> entity ptr
 uintptr_t ESP::get_entity(const Memory& mem, uintptr_t entity_list, int index) const {
-    uintptr_t chunk = mem.read<uintptr_t>(entity_list + 8 * ((index >> 9) + 1));
-    if (!chunk) return 0;
-    return mem.read<uintptr_t>(chunk + 0x78 * (index & 0x1FF));
+    uintptr_t list_entry = mem.read<uintptr_t>(entity_list + 0x10 + 8 * ((index >> 9) + 1));
+    if (!list_entry) return 0;
+    return mem.read<uintptr_t>(list_entry + 0x78 * (index & 0x1FF));
 }
 
 uintptr_t ESP::resolve_handle(const Memory& mem, uintptr_t entity_list, uint32_t handle) const {
     if (!handle || handle == 0xFFFFFFFF) return 0;
     int index = handle & 0x7FFF;
-    uintptr_t chunk = mem.read<uintptr_t>(entity_list + 8 * ((index >> 9) + 1));
-    if (!chunk) return 0;
-    return mem.read<uintptr_t>(chunk + 0x78 * (index & 0x1FF));
+    uintptr_t list_entry = mem.read<uintptr_t>(entity_list + 0x10 + 8 * ((index >> 9) + 1));
+    if (!list_entry) return 0;
+    return mem.read<uintptr_t>(list_entry + 0x78 * (index & 0x1FF));
 }
 
 void ESP::update(const Memory& mem, uintptr_t client_base) {
