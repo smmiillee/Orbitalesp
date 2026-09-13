@@ -116,6 +116,12 @@ public:
 
     int players_alive = 0;
 
+    // Diagnostics (temporary) -- which enumeration path is working, and how
+    // many entity-list slots it saw. If players is 0 and slots is 0, the chunk
+    // offset is wrong; if slots is large but players is 0, the filter is.
+    int  slots_found = 0;
+    bool enum_bulk   = false;
+
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
 
