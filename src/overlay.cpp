@@ -13,7 +13,7 @@ LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     // Eat WM_SETCURSOR so Windows never changes it to the loading arrow
-    if (msg == WM_SETCURSOR) { SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return TRUE; }
+    if (msg == WM_SETCURSOR) { SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW)); return TRUE; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -22,7 +22,7 @@ bool Overlay::create(int width, int height) {
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW); // arrow, never hourglass
+    wc.hCursor       = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW); // arrow, never hourglass
     wc.lpszClassName = L"OrbitalESP_Overlay";
     if (!RegisterClassExW(&wc)) return false;
 
@@ -88,8 +88,8 @@ bool Overlay::create(int width, int height) {
     c[ImGuiCol_MenuBarBg]          = { 0.75f, 0.75f, 0.75f, 1.00f };
     c[ImGuiCol_ScrollbarBg]        = { 0.75f, 0.75f, 0.75f, 1.00f };
     c[ImGuiCol_ScrollbarGrab]      = { 0.50f, 0.50f, 0.50f, 1.00f };
-    c[ImGuiCol_ScrollbarGrabHov]   = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_ScrollbarGrabAct]   = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_ScrollbarGrabHovered] = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_ScrollbarGrabActive]  = { 0.30f, 0.30f, 0.30f, 1.00f };
     c[ImGuiCol_CheckMark]          = { 0.00f, 0.00f, 0.00f, 1.00f }; // black checkmark
     c[ImGuiCol_SliderGrab]         = { 0.55f, 0.55f, 0.55f, 1.00f };
     c[ImGuiCol_SliderGrabActive]   = { 0.35f, 0.35f, 0.35f, 1.00f };
@@ -132,7 +132,7 @@ void Overlay::update_visibility_and_input() {
         ex &= ~WS_EX_TRANSPARENT;
         ex &= ~WS_EX_NOACTIVATE;
         SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
         SetForegroundWindow(hwnd);
     } else {
         ex |= WS_EX_TRANSPARENT;
