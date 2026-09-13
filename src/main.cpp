@@ -157,7 +157,7 @@ void render_menu() {
     ImGui::Spacing();
     ImGui::TextDisabled("[ Debug ]");
     ImGui::Text("Controllers: %d", g_esp.debug_total_controllers);
-    ImGui::Text("Valid pawns: %d", g_esp.debug_valid_pawns);
+    ImGui::Text("Valid pawns: %d (team%d hp%d)", g_esp.debug_valid_pawns, g_esp.debug_sample_team, g_esp.debug_sample_health);
     ImGui::Text("Alive:       %d", g_esp.debug_alive);
     ImGui::Text("Positioned:  %d", g_esp.debug_positioned);
     ImGui::Text("On screen:   %d", g_esp.debug_on_screen);
