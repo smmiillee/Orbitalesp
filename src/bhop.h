@@ -2,69 +2,65 @@
 #pragma once
 #include <cstdint>
 
-// ══ READ THIS: WHICH MODE WRITES TO CS2 ══════════════════════════════════
+// Bhop by KEYSTROKE INJECTION ONLY. Nothing in this file writes to cs2.exe.
 //
-//   BHOP_INJECT  ("Inject keys")      -> does NOT write to cs2.exe.
-//                                        Uses SendInput. Zero memory writes,
-//                                        but timing has OS jitter.
-//
-//   BHOP_MEMORY  ("Write jump button") -> WRITES to cs2.exe.
-//                                        Two int32 writes per jump. This is
-//                                        the precise mode: microsecond write
-//                                        latency instead of SendInput jitter.
-//
-// A bhop cannot be done with zero writes AND be precise: reading memory cannot
-// cause a jump, and the only offset-free way to cause one is keystroke
-// injection, which is inherently nondeterministic. So the choice is real:
-// what do you want, no writes or no misses?
+// Removing the memory-write bhop means the whole project now performs ZERO
+// writes to the game process -- it only reads memory and injects keystrokes.
 //
 // ══ HOW HOLD-SPACE WORKS ═════════════════════════════════════════════════
 // Holding the physical key is a GATE, not the input. While bhop is driving, the
-// keyboard hook swallows your physical spacebar so the game's jump input comes
-// only from us. Without that, auto-repeat re-asserts your held DOWN against our
-// release and the landing press edge never forms -- which is why holding space
-// used to behave randomly while auto-jump (no key held) was perfect.
+// keyboard hook swallows your physical spacebar, because holding it makes the
+// engine's +jump stay down -- and a jump needs a fresh PRESS edge, so a held key
+// means you can never re-jump on landing. With your key swallowed, the game's
+// jump input comes only from us and every landing gets its own clean edge.
 //
-// THE JUMP PATTERN (both modes), which is the pattern you observed timing
-// perfectly:
-//     airborne  -> release   (guarantees the next press is a fresh edge)
-//     grounded  -> press, and hold for ~2 ticks
-// The hold matters: the engine rewrites the button from input every tick, so a
-// press that lands just before the engine's own write would otherwise be
-// erased. Holding across two ticks survives that race.
+// ══ THE TWO OUTPUT MODES ═════════════════════════════════════════════════
+//  PLAIN      - press when the ground flag says you are grounded. Simple, and
+//               correct as far as it goes, but the flag is only written once
+//               per game tick (~15.6 ms), so by the time we see it the landing
+//               tick may already have passed.
 //
-// GROUND STATE is graded against the local player's Z (m_vOldOrigin, verified):
-//   z     - Z unchanged for ~22 ms -> standing. Works at any height, so a
-//           landing off a roof reads exactly like a landing on flat ground.
-//   flag  - once seen set while Z is static AND clear while Z moves it becomes
-//           primary, being instance-accurate where the Z test needs a window.
-//   hge   - same rule.
-enum BhopMode : int {
-    BHOP_OFF    = 0,
-    BHOP_INJECT = 1,   // synthesised keystrokes -- NO writes to cs2.exe
-    BHOP_MEMORY = 2,   // WRITES the jump button to cs2.exe (precise)
-};
-
+//  PREDICTIVE - instead of waiting to OBSERVE the landing, estimate when it
+//               will happen from your vertical velocity and press slightly
+//               early, so the press is already down when the engine samples
+//               input for the landing tick. The observed ground flag is still
+//               used as a fallback, so prediction can only help.
+//
+// ══ HONEST STATUS ════════════════════════════════════════════════════════
+// Prediction is an EXPERIMENT. There is no reference implementation to copy --
+// the cs2-bhop repo people cite for this is itself a memory-write bhop, and the
+// SendInput snippet circulating online is not from it. Whether early-pressing
+// lands inside the right input window depends on engine internals I cannot
+// inspect, so treat this as something to measure rather than something proven.
 struct BhopDebug {
-    int   mode        = BHOP_MEMORY;
-    uintptr_t offset  = 0;
+    // config
+    bool enabled      = true;
+    bool predict      = false;
+    bool separate_key = false;
+
+    // live state
     bool  on_ground   = false;
     bool  focused     = false;
     bool  space_held  = false;   // PHYSICAL spacebar state
     bool  hook_ok     = false;   // low-level keyboard hook installed
     bool  driving     = false;   // currently commanding the jump
     bool  suppressing = false;   // physical spacebar is being swallowed
+
     int   signals     = 0;       // bit0 z, bit1 flag, bit2 hge
-    int   presses     = 0;       // press edges generated this session
-    bool  locked      = false;   // MEMORY mode: address confirmed
-    bool  scanning    = false;
+    int   edges       = 0;       // press edges generated
+    int   predicted   = 0;       // of those, how many prediction armed
+
+    float vz          = 0.0f;    // vertical velocity, units/sec
+    float tti         = -1.0f;   // ms to predicted impact, -1 if unknown
 };
 
 void Bhop_Init();
 void Bhop_Shutdown();
 
 BhopDebug Bhop_GetDebug();
-void      Bhop_Rescan();          // MEMORY mode: forget the locked address
 
-void Bhop_SetMode(int mode);      // BhopMode
-int  Bhop_Mode();
+void  Bhop_SetEnabled(bool on);
+void  Bhop_SetPredict(bool on);
+void  Bhop_SetSeparateKey(bool on);
+void  Bhop_SetLead(float ms);   // prediction lead, ms
+float Bhop_Lead();
