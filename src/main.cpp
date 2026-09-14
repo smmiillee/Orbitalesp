@@ -122,18 +122,33 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
+#include <cwchar>   // wcsstr, for the window-title check below
+
 // ── game window lookup ───────────────────────────────────────────────────
-// FindWindowA("SDL_app") is the primary path, but if it returns nothing --
-// different window class, game restarting, exclusive fullscreen toggle -- we
-// enumerate instead and accept any sizeable SDL window. This is a FALLBACK,
-// not a replacement, and it never blocks: a missing window is now a state we
-// operate in rather than a hang.
-struct EnumCtx { HWND found; };
+// *** THIS WAS THE "NOTHING RENDERS" BUG ***
+// FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
+// keep the game window in front of its own detached console. The failing build's
+// log read "client 192x456" -- that is the console, not the game. The overlay
+// then glued itself to that tiny window, so every ESP coordinate was computed
+// against a 192x456 viewport and the 580x520 menu was larger than its own
+// window. Nothing visible on the game, process healthy, INSERT apparently dead.
+//
+// So we no longer take the first match. We enumerate every SDL window, log all
+// of them, and pick the best: titled ones first, then largest client area, with
+// anything too small to be a game viewport heavily penalised. A 192x456 console
+// can never outrank a real 1680x1024 game.
+struct WindowCand {
+    HWND hwnd;
+    int  w, h;
+    bool titled;
+};
 
 static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
-    auto* ctx = reinterpret_cast<EnumCtx*>(lp);
+    auto* list = reinterpret_cast<std::vector<WindowCand>*>(lp);
+    if (!list) return TRUE;
 
     if (!IsWindowVisible(h)) return TRUE;
+    if (IsIconic(h)) return TRUE;
 
     wchar_t cls[64]{};
     if (!GetClassNameW(h, cls, 63)) return TRUE;
@@ -141,22 +156,39 @@ static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
 
     RECT r{};
     if (!GetClientRect(h, &r)) return TRUE;
-    if (r.right < 320 || r.bottom < 240) return TRUE;
+    const int w  = r.right - r.left;
+    const int hh = r.bottom - r.top;
+    if (w <= 0 || hh <= 0) return TRUE;
 
-    ctx->found = h;
-    return FALSE;   // stop
+    wchar_t title[128]{};
+    GetWindowTextW(h, title, 127);
+    const bool titled = (std::wcsstr(title, L"Counter-Strike") != nullptr);
+
+    list->push_back(WindowCand{ h, w, hh, titled });
+    OrbitalLog("  sdl window 0x%p client %dx%d titled=%d", h, w, hh,
+               titled ? 1 : 0);
+    return TRUE;
 }
 
 static HWND locate_game_window() {
-    HWND h = FindWindowA("SDL_app", nullptr);
-    if (h && IsWindow(h)) {
-        RECT r{};
-        if (GetClientRect(h, &r) && r.right > 0 && r.bottom > 0) return h;
+    std::vector<WindowCand> cands;
+    EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&cands));
+
+    HWND best = nullptr;
+    long long best_score = -1;
+
+    for (const WindowCand& c : cands) {
+        long long score = static_cast<long long>(c.w) * c.h;
+        if (!c.titled)                     score /= 4;   // console, etc.
+        if (c.w < 640 || c.h < 480)        score /= 4;   // too small to be it
+        if (score > best_score) { best_score = score; best = c.hwnd; }
     }
 
-    EnumCtx ctx{ nullptr };
-    EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.found;
+    if (best) return best;
+
+    // Last resort: the old behaviour.
+    HWND h = FindWindowA("SDL_app", nullptr);
+    return (h && IsWindow(h)) ? h : nullptr;
 }
 
 // Refresh g_cs2_hwnd and the client size. Returns true if we have a live game
