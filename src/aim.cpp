@@ -1,4 +1,5 @@
 // --- src/aim.cpp ---
+// Triggerbot. Detection is read-only; firing injects a click.
 #include "aim.h"
 #include "esp.h"
 #include "memory.h"
@@ -16,9 +17,9 @@
 extern HWND g_cs2_hwnd;
 extern ESP g_esp;
 extern int g_local_team;
-// The overlay's viewport. Using GetSystemMetrics here was WRONG: that returns
-// the monitor size, which differs from the game's client area on a scaled
-// display, so the crosshair centre was in the wrong place and nothing matched.
+// The overlay's viewport. GetSystemMetrics would return the MONITOR size, which
+// differs from the game client area on a scaled display, putting the crosshair
+// centre in the wrong place.
 extern int g_screen_w;
 extern int g_screen_h;
 
@@ -30,14 +31,16 @@ constexpr Hit kHits[] = {
     {BONE_PELVIS,"pelvis"},{BONE_SPINE_1,"spine"},
 };
 
-std::atomic<bool> g_stop{false}, g_started{false};
-std::atomic<bool> g_on{false}, g_fire{true};
-std::atomic<int>  g_key{0};
-std::atomic<float> g_radius{1.4f};   // percent of height
+std::atomic<bool>  g_stop{false}, g_started{false};
+std::atomic<bool>  g_on{false}, g_fire{true};
+std::atomic<int>   g_key{0};
+std::atomic<float> g_radius{1.4f};
+std::atomic<int>   g_delay{0};
 
 std::atomic<bool>  g_dbg_firing{false}, g_dbg_on{false};
 std::atomic<float> g_dbg_dist{-1.0f};
 std::atomic<const char*> g_dbg_bone{"-"};
+std::atomic<int>   g_dbg_held{0};
 
 std::thread g_thread;
 
@@ -54,8 +57,10 @@ void wait_ms(double ms) {
     if (ms <= 0.0) return;
     const auto dl = std::chrono::steady_clock::now() +
         std::chrono::microseconds((long long)(ms * 1000.0));
-    while (std::chrono::steady_clock::now() < dl) {
-        const auto left = dl - std::chrono::steady_clock::now();
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= dl) return;
+        const auto left = dl - now;
         if (left > std::chrono::milliseconds(2))
             std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
         else
@@ -75,8 +80,10 @@ void mouse(bool down) {
 }
 
 void run_thread() {
-    bool down = false;
-    double down_at = 0.0, next = 0.0;
+    bool   down = false;
+    double down_at = 0.0;
+    double next_shot = 0.0;
+    double target_since = 0.0;   // when the current target was acquired
 
     while (!g_stop.load()) {
         wait_ms(2.0);
@@ -89,16 +96,19 @@ void run_thread() {
             if (down) { mouse(false); down = false; }
             g_dbg_firing.store(false);
             g_dbg_on.store(false);
+            g_dbg_held.store(0);
+            target_since = 0.0;
             continue;
         }
 
         if (down && now_ms() - down_at >= kClickMs) {
-            mouse(false); down = false;
+            mouse(false);
+            down = false;
             g_dbg_firing.store(false);
         }
 
         const double now = now_ms();
-        if (now < next) continue;
+        if (now < next_shot) continue;
 
         const int sw = g_screen_w, sh = g_screen_h;
         if (sw <= 0 || sh <= 0) continue;
@@ -130,10 +140,28 @@ void run_thread() {
         g_dbg_dist.store(found ? best : -1.0f);
         g_dbg_bone.store(found ? best_name : "-");
 
-        if (found && g_fire.load()) {
+        // ---- acquisition delay ----
+        // The target has to STAY acquired for `delay` ms before we shoot, which
+        // is what a triggerbot delay means: it damps instant reactions and
+        // makes the timing look less mechanical.
+        if (!found) {
+            target_since = 0.0;
+            g_dbg_held.store(0);
+            continue;
+        }
+
+        if (target_since <= 0.0) target_since = now;
+        const int held = (int)(now - target_since);
+        g_dbg_held.store(held);
+
+        if (held < g_delay.load()) continue;
+
+        if (g_fire.load()) {
             mouse(true);
-            down = true; down_at = now;
-            next = now + kCoolMs;
+            down = true;
+            down_at = now;
+            next_shot = now + kCoolMs;
+            target_since = 0.0;
             g_dbg_firing.store(true);
         }
     }
@@ -160,11 +188,13 @@ void Aim_Shutdown() {
 
 AimDebug Aim_GetDebug() {
     AimDebug d;
-    d.enabled = g_on.load();
-    d.firing = g_dbg_firing.load();
-    d.on_target = g_dbg_on.load();
+    d.enabled     = g_on.load();
+    d.firing      = g_dbg_firing.load();
+    d.on_target   = g_dbg_on.load();
     d.target_dist = g_dbg_dist.load();
     d.target_bone = g_dbg_bone.load();
+    d.delay_ms    = g_delay.load();
+    d.held_ms     = g_dbg_held.load();
     return d;
 }
 
@@ -174,9 +204,17 @@ void Aim_SetFire(bool on) { g_fire.store(on); }
 bool Aim_Fire() { return g_fire.load(); }
 void Aim_SetKey(int vk) { g_key.store(vk); }
 int  Aim_Key() { return g_key.load(); }
+
 void Aim_SetRadius(float pct) {
     if (pct < 0.2f) pct = 0.2f;
     if (pct > 10.0f) pct = 10.0f;
     g_radius.store(pct);
 }
 float Aim_Radius() { return g_radius.load(); }
+
+void Aim_SetDelay(int ms) {
+    if (ms < 0) ms = 0;
+    if (ms > 200) ms = 200;
+    g_delay.store(ms);
+}
+int Aim_Delay() { return g_delay.load(); }
