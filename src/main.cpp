@@ -135,11 +135,12 @@ struct Config {
     float aim_radius = 1.4f;
     bool  jb_enabled = false;
     int   jb_key = 0;
-    float jb_crouch_lead = 150.0f;
-    float jb_uncrouch_lead = 24.0f;
+    float jb_crouch_lead = 200.0f;
+    float jb_uncrouch_lead = 0.0f;   // 0 = release on landing
 
     int   aim_delay = 0;
     int   radar_port = 3000;
+    int   radar_sel = 0;
 } g_cfg;
 
 // ── config file ──────────────────────────────────────────────────────────
@@ -178,7 +179,7 @@ static void save_config() {
     W_B(aim_enabled); W_B(aim_fire); W_I(aim_key); W_F(aim_radius);
     W_B(jb_enabled); W_I(jb_key);
     W_F(jb_crouch_lead); W_F(jb_uncrouch_lead);
-    W_I(aim_delay); W_I(radar_port);
+    W_I(aim_delay); W_I(radar_port); W_I(radar_sel);
 
 #undef W_B
 #undef W_I
@@ -385,6 +386,7 @@ static void apply_feature_config() {
     Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
     Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
     Radar_SetPort(g_cfg.radar_port);
+    Radar_SetSelection(g_cfg.radar_sel);
 }
 
 void memory_thread() {
@@ -731,6 +733,30 @@ static void tab_esp() {
                           "30-45 ms is the sweet spot; 0 disables it.");
 
     ImGui::Columns(1);
+
+    // Status for the two features still being brought up. Bones drive the
+    // skeleton AND the triggerbot, so if this says scanning the trigger cannot
+    // work regardless of its own code.
+    ImGui::Separator();
+    if (g_esp.diag_bones_ok)
+        ImGui::TextDisabled("bones: ok 0x%llX/0x%llX",
+            (unsigned long long)g_esp.diag_bone_node,
+            (unsigned long long)g_esp.diag_bone_arr);
+    else
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "bones: scanning...");
+
+    if (g_esp.diag_wsvc_ok)
+        ImGui::TextDisabled("weapon svc: 0x%llX (verified)",
+            (unsigned long long)g_esp.diag_wsvc);
+    else
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+                           "weapon svc: not found");
+
+    if (g_esp.diag_c4_ent)
+        ImGui::TextDisabled("C4 ent: 0x%llX",
+            (unsigned long long)g_esp.diag_c4_ent);
+    else
+        ImGui::TextDisabled("C4 ent: none planted");
 }
 
 static void tab_aim() {
@@ -800,19 +826,25 @@ static void tab_movement() {
         ImGui::SetTooltip("How early in the fall to crouch.");
 
     ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##jbu", &g_cfg.jb_uncrouch_lead, 0.0f, 200.0f,
-                           "uncrouch %.0f ms before landing"))
+    if (ImGui::SliderFloat("##jbu", &g_cfg.jb_uncrouch_lead, 0.0f, 60.0f,
+                           g_cfg.jb_uncrouch_lead <= 0.0f
+                               ? "uncrouch on landing"
+                               : "uncrouch %.0f ms before landing"))
         Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("When to uncrouch. THIS is the bug window -- it is\n"
-                          "the release just before touchdown that matters.");
+        ImGui::SetTooltip("0 = release the crouch when the ground flag says we\n"
+                          "landed. That release AT touchdown is the jumpbug, so\n"
+                          "0 is the correct default. Raise it only to test\n"
+                          "releasing slightly early.");
 
     const MovementDebug md = Movement_GetDebug();
     ImGui::Separator();
-    ImGui::Text("ground: %s   crouching: %s",
-        md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no");
+    ImGui::Text("ground: %s   crouching: %s   armed: %s",
+        md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no",
+        md.armed ? "yes" : "no");
     ImGui::TextDisabled("vz %.0f   tti %.1f ms   jumpbugs %d",
         md.vz, md.tti, md.jumpbugs);
+    ImGui::TextDisabled("no effect? the crouch must still be HELD at landing");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Bhop ]");
@@ -834,18 +866,40 @@ static void tab_radar() {
     const RadarInfo ri = Radar_Get();
 
     ImGui::TextDisabled("[ Radar ]");
-    ImGui::TextDisabled("opens the radar server in your browser");
+    ImGui::TextDisabled("opens the dashboard in your browser");
     ImGui::Separator();
 
-    ImGui::Text("this machine: %s", ri.ipv4[0] ? ri.ipv4 : "not found");
-    ImGui::TextDisabled("url: %s", ri.url);
-    ImGui::TextDisabled("run the radar server on port %d first", ri.port);
+    // The radar is its OWN program: cs2_dashboard.exe, built from the
+    // orbitalweb repo (C++ / CMake, not Node). It must already be running.
+    ImGui::TextWrapped("Requires cs2_dashboard.exe from orbitalweb to be "
+                       "running. It serves the dashboard on port %d.", ri.port);
 
     ImGui::Spacing();
+    ImGui::TextDisabled("[ address ]");
+
+    // Pick-list instead of a guess. Entry 0 is always 127.0.0.1, which is
+    // correct when you are viewing the radar on the same PC as the server.
+    static const char* items[RadarInfo::kMaxAddr] = {};
+    for (int i = 0; i < ri.count && i < RadarInfo::kMaxAddr; ++i)
+        items[i] = ri.label[i];
+
+    ImGui::SetNextItemWidth(320.0f);
+    int sel = ri.selected;
+    if (ImGui::Combo("##raddr", &sel, items, ri.count)) {
+        g_cfg.radar_sel = sel;
+        Radar_SetSelection(sel);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("127.0.0.1 works when the browser is on THIS PC.\n"
+                          "Pick a LAN address for a phone or second PC.\n"
+                          "The dashboard shows the right IP in its console.");
+
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderInt("##rport", &g_cfg.radar_port, 1024, 65535,
                          "port %d"))
         Radar_SetPort(g_cfg.radar_port);
+
+    ImGui::Text("url: %s", ri.url);
 
     ImGui::Spacing();
     if (ImGui::Button("[Start Radar]", { 200.0f, 0.0f }))
@@ -857,11 +911,10 @@ static void tab_radar() {
         ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f }, "could not open browser");
 
     ImGui::Separator();
-    ImGui::TextDisabled("Open this URL on your phone or a second PC on the");
-    ImGui::TextDisabled("same network to use the radar as a second screen.");
-    if (!ri.ipv4[0])
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-            "no LAN IPv4 found - check your adapter is up");
+    ImGui::TextDisabled("If the page does not load:");
+    ImGui::TextDisabled(" - is cs2_dashboard.exe running?");
+    ImGui::TextDisabled(" - on another PC, is port %d allowed through", ri.port);
+    ImGui::TextDisabled("   Windows Firewall on the server PC?");
 }
 
 static void tab_colors() {
