@@ -1,24 +1,9 @@
 // --- src/bhop.cpp ---
 // One bhop engine. SPACE only. No memory writes.
 //
-// ══ THE BUG THIS FIXES ══════════════════════════════════════════════════
-// The old code did this:
-//
-//     INPUT in[2]{};  in[0] = down;  in[1] = up;
-//     SendInput(2, in, sizeof(INPUT));          // down+up, zero duration
-//
-// Both transitions land in the same call, so the key is down for ~0 us. CS2
-// samples keyboard state once per frame, so such a press is frequently never
-// seen by any frame sample. The input is not late -- it is invisible.
-//
-// ══ THE MODEL ═══════════════════════════════════════════════════════════
-//   * The server ticks (64/128). Subtick adds sub-tick timestamps on top.
-//   * The CLIENT computes those timestamps from its own per-frame input read.
-//   * Therefore the clock that limits us is FRAME time, not tick time.
-//
-// So a press must be HELD long enough to be sampled by at least one frame:
-// down -> hold_ms -> up. Then retry, because being grounded means the previous
-// hop failed and we need another attempt.
+// Press the key BEFORE the predicted landing (lead), hold it across the
+// touchdown so the landing sample sees it down, then fall back to retrying
+// while grounded if the prediction was wrong.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -37,17 +22,22 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
+// Above this the fall is too slow to be a real landing, so we don't predict.
+constexpr float kMinFallSpeed = 50.0f;   // units/sec
+
 std::atomic<bool>   g_stop{false}, g_started{false};
 std::atomic<bool>   g_enabled{false};
-std::atomic<double> g_hold_ms{10.0};    // spans a frame at up to ~100 fps
-std::atomic<double> g_retry_ms{16.0};   // about one 64-tick interval
+std::atomic<double> g_lead_ms{8.0};
+std::atomic<double> g_hold_ms{14.0};
+std::atomic<double> g_retry_ms{16.0};
 
 // Diagnostics.
 std::atomic<bool>   g_dbg_focus{false}, g_dbg_space{false};
 std::atomic<bool>   g_dbg_hook{false},  g_dbg_ground{false};
 std::atomic<bool>   g_dbg_suppress{false}, g_dbg_pressing{false};
-std::atomic<int>    g_dbg_signals{0},   g_dbg_inj{0};
-std::atomic<double> g_dbg_last{0.0},    g_dbg_hold_used{0.0};
+std::atomic<int>    g_dbg_inj{0}, g_dbg_pred{0};
+std::atomic<double> g_dbg_last{0.0};
+std::atomic<float>  g_dbg_vz{0.0f}, g_dbg_tti{-1.0f};
 
 // Keyboard hook.
 std::atomic<bool>  g_phys_space{false};
@@ -85,8 +75,7 @@ bool cs2_focused() {
 // ── keyboard hook ────────────────────────────────────────────────────────
 // Tracks the PHYSICAL spacebar (injected events carry LLKHF_INJECTED, so ours
 // are ignored) and swallows it while the engine drives. A held +jump cannot
-// produce a new press edge, so our injected edges must be the only ones the
-// game sees.
+// produce a new press edge, so our injected edges must be the only ones seen.
 LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
@@ -156,14 +145,8 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     if (!g_gw.flag_ok && g_gw.flag_g >= 6 && g_gw.flag_a >= 6) g_gw.flag_ok = true;
     if (!g_gw.hge_ok  && g_gw.hge_g  >= 6 && g_gw.hge_a  >= 6) g_gw.hge_ok  = true;
 
-    int sig = 1;
-    if (g_gw.flag_ok) sig |= 2;
-    if (g_gw.hge_ok)  sig |= 4;
-    g_dbg_signals.store(sig);
-
-    // Bitmask on the flag, never a whole-value comparison.
     bool ground;
-    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
+    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;   // bitmask, never whole-value
     else              ground = g_gw.z_ground;
     if (g_gw.hge_ok) ground = ground || (hge != 0xFFFFFFFFu);
 
@@ -171,9 +154,64 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     return ground;
 }
 
-// ── injection: SEPARATE down and up transitions ──────────────────────────
-// This is the whole fix. The key goes down, stays down for hold_ms so at least
-// one frame samples it, and only then goes up.
+// ── landing prediction ───────────────────────────────────────────────────
+// Velocity from finite differences of Z between DISTINCT samples. Z is written
+// once per tick, so sampling on change keeps the estimate clean instead of
+// showing stair-steps.
+struct Predict {
+    bool   have_z = false;
+    float  last_z = 0.0f;
+    double last_t = 0.0;
+    float  vz = 0.0f;          // units/sec, positive = rising
+    float  ground_z = 0.0f;    // height last stood at
+    bool   have_ground_z = false;
+};
+Predict g_pr;
+
+void predict_update(float z, bool ground) {
+    const double now = now_ms();
+
+    if (!g_pr.have_z) {
+        g_pr.have_z = true; g_pr.last_z = z; g_pr.last_t = now;
+    }
+
+    if (ground) {
+        // Reference height follows slopes and small steps.
+        g_pr.ground_z = z;
+        g_pr.have_ground_z = true;
+        g_pr.vz = 0.0f;
+        g_pr.last_z = z;
+        g_pr.last_t = now;
+        g_dbg_vz.store(0.0f);
+        g_dbg_tti.store(-1.0f);
+        return;
+    }
+
+    if (std::fabs(z - g_pr.last_z) >= 0.05f) {
+        const double dt = (now - g_pr.last_t) / 1000.0;
+        if (dt > 0.0005 && dt < 0.25) {
+            const float v = static_cast<float>((z - g_pr.last_z) / dt);
+            g_pr.vz = g_pr.vz * 0.4f + v * 0.6f;
+        }
+        g_pr.last_z = z;
+        g_pr.last_t = now;
+    }
+    g_dbg_vz.store(g_pr.vz);
+
+    if (!g_pr.have_ground_z || g_pr.vz >= -kMinFallSpeed) {
+        g_dbg_tti.store(-1.0f);
+        return;
+    }
+
+    const float dz = z - g_pr.ground_z;
+    if (dz <= 0.0f) { g_dbg_tti.store(0.0f); return; }
+
+    g_dbg_tti.store((dz / -g_pr.vz) * 1000.0f);
+}
+
+float predict_tti() { return g_dbg_tti.load(); }
+
+// ── injection: separate down / up so the press is actually sampled ───────
 void key_down() {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
@@ -198,11 +236,12 @@ void key_up() {
 void run_thread() {
     uintptr_t pawn = 0;
     double    pawn_at = 0.0, last_sample = 0.0;
-    bool      ground = false, prev_ground = false;
+    bool      ground = false;
 
-    bool   pressed   = false;
-    double press_at  = 0.0;
+    bool   pressed    = false;
+    double press_at   = 0.0;
     double next_press = 0.0;
+    bool   armed      = false;   // prediction already fired this airtime
 
     while (!g_stop.load()) {
         wait_ms(1.0);
@@ -217,11 +256,10 @@ void run_thread() {
         g_suppress.store(driving);
         g_dbg_suppress.store(driving);
 
-        // ── not driving: release cleanly and reset ───────────────────────
         if (!driving) {
             if (pressed) { key_up(); pressed = false; }
             next_press = 0.0;
-            prev_ground = false;
+            armed = false;
             g_dbg_pressing.store(false);
             continue;
         }
@@ -237,49 +275,63 @@ void run_thread() {
             continue;
         }
 
-        if (now - last_sample >= 2.0) {
+        // Sample every 1 ms. Prediction needs fine resolution: at 2 ms we lose
+        // up to 2 ms of the lead, which is a meaningful chunk of an 8 ms lead.
+        const float z = g_mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
+        if (now - last_sample >= 1.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
+        if (ground) armed = false;
+        predict_update(z, ground);
+
         const double hold_ms  = g_hold_ms.load();
         const double retry_ms = g_retry_ms.load();
+        const float  lead_ms  = static_cast<float>(g_lead_ms.load());
 
-        // ── release after the hold has elapsed ───────────────────────────
-        // Released as soon as the hold is up, regardless of ground state, so no
-        // matter what happens next the next press is a fresh edge.
+        // ── release as soon as the hold elapses ───────────────────────────
         if (pressed && (now - press_at) >= hold_ms) {
             key_up();
             pressed = false;
-            g_dbg_hold_used.store(now - press_at);
         }
 
-        if (!ground) {
-            // Airborne: make sure we are not holding into the landing, because
-            // the landing press must be a clean rising edge.
-            if (pressed) { key_up(); pressed = false; }
-            next_press = 0.0;
-            prev_ground = false;
-            g_dbg_pressing.store(false);
-            continue;
-        }
+        // ── decide whether to start a press ───────────────────────────────
+        bool start = false;
+        bool by_prediction = false;
 
-        // ── grounded: press, and keep retrying ───────────────────────────
-        // Retrying is what stops a missed hop from ending the chain: if we are
-        // still grounded, the previous attempt did not take, so try again.
-        if (!pressed) {
+        if (ground) {
+            // Fallback path: we can see we are grounded and no jump has
+            // happened, so press. Retrying is what stops a missed hop from
+            // ending the chain.
             if (next_press <= 0.0) next_press = now;
-            if (now >= next_press) {
-                key_down();
-                pressed  = true;
-                press_at = now;
-                next_press = now + retry_ms;
-                g_dbg_inj.fetch_add(1);
-                g_dbg_last.store(now);
+            if (now >= next_press) start = true;
+        } else {
+            // Prediction path: press early so the key is already down when the
+            // landing is sampled.
+            next_press = 0.0;   // so the landing retry is immediate
+            const float tti = predict_tti();
+            if (!armed && tti >= 0.0f && tti <= lead_ms) {
+                start = true;
+                by_prediction = true;
             }
         }
 
-        prev_ground = ground;
+        if (start && !pressed) {
+            key_down();
+            pressed  = true;
+            press_at = now;
+
+            if (by_prediction) {
+                armed = true;
+                g_dbg_pred.fetch_add(1);
+            } else {
+                next_press = now + retry_ms;
+            }
+            g_dbg_inj.fetch_add(1);
+            g_dbg_last.store(now);
+        }
+
         g_dbg_pressing.store(pressed);
     }
 
@@ -323,19 +375,25 @@ BhopDebug Bhop_GetDebug() {
     d.on_ground   = g_dbg_ground.load();
     d.suppressing = g_dbg_suppress.load();
     d.pressing    = g_dbg_pressing.load();
-    d.signals     = g_dbg_signals.load();
     d.injected    = g_dbg_inj.load();
+    d.pred_hits   = g_dbg_pred.load();
+    d.vz          = g_dbg_vz.load();
+    d.tti         = g_dbg_tti.load();
 
     const double last = g_dbg_last.load();
     d.age_ms = (last <= 0.0) ? -1 : static_cast<int>(now_ms() - last);
-
-    d.hold_ms  = static_cast<float>(g_dbg_hold_used.load());
-    d.retry_ms = static_cast<float>(g_retry_ms.load());
     return d;
 }
 
 void  Bhop_SetEnabled(bool on) { g_enabled.store(on); }
 bool  Bhop_Enabled()           { return g_enabled.load(); }
+
+void  Bhop_SetLeadMs(float ms) {
+    if (ms < 0.0f)  ms = 0.0f;
+    if (ms > 40.0f) ms = 40.0f;
+    g_lead_ms.store(static_cast<double>(ms));
+}
+float Bhop_LeadMs() { return static_cast<float>(g_lead_ms.load()); }
 
 void  Bhop_SetHoldMs(float ms) {
     if (ms < 1.0f)  ms = 1.0f;
