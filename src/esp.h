@@ -81,6 +81,13 @@ public:
 
     int players_alive = 0;
 
+    // Status for features still being brought up. Bones drive the skeleton AND
+    // the triggerbot, so this stays until both are confirmed.
+    bool      diag_bones_ok = false;
+    uintptr_t diag_bone_node = 0, diag_bone_arr = 0;
+    bool      diag_wsvc_ok = false;
+    uintptr_t diag_wsvc = 0;
+
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
 
@@ -91,11 +98,7 @@ private:
         uintptr_t bone_node = 0, bone_arr = 0;
         bool bones_ok = false;
         int  bone_fail = 0, probe_cd = 0;
-        // Weapon services offset, discovered at runtime.
-        uintptr_t wsvc = 0;
-        bool wsvc_ok = false;
-        double wsvc_try = 0.0;
-        // Planted C4 node offset, verified by a stable Z.
+        // Planted C4 node offset, verified by a long stable run.
         uintptr_t c4_off = 0;
         bool c4_ok = false;
         Vec3 c4_last{};
