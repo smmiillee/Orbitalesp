@@ -145,29 +145,164 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
     return out[0] != '\0';
 }
 
-// *** THE "#0" BUG ***
-// The def index was read only through the econ-item path:
-//     weapon + m_AttributeManager + m_Item + m_iItemDefinitionIndex
-// m_Item is an embedded C_EconItemView, and for a weapon ENTITY that path
-// returns a constant 0 -- which is exactly the "#0" you saw, for every weapon.
+// ---------------------------------------------------------------------------
+// DEF-INDEX SELF-CALIBRATION
 //
-// The direct field on the weapon is the correct primary read. The long path is
-// kept only as a fallback.
+// Some weapons render as "#0" and others as lowercase designer names ("ak47",
+// "hegrenade"). The lowercase ones prove the DESIGNER chain works, and that the
+// def-index read is returning 0. A wrong def index also breaks the bomb carrier
+// and the C4 entity scan, because both match on id 49.
 //
-//   0x1BA  m_iItemDefinitionIndex   (direct)
+// So rather than guess a fifth offset, we find it using the designer name as a
+// reference: if the designer says "ak47", the correct offset must read 7.
+// ---------------------------------------------------------------------------
+
+struct DMap { const char* designer; int id; const char* pretty; };
+
+constexpr DMap kDesigner[] = {
+    { "ak47",          7,  "AK-47" },
+    { "m4a1",          16, "M4A4" },
+    { "m4a1_silencer", 60, "M4A1" },
+    { "awp",           9,  "AWP" },
+    { "deagle",        1,  "Deagle" },
+    { "glock",         4,  "Glock" },
+    { "usp_silencer",  61, "Usp" },
+    { "hkp2000",       32, "P2K" },
+    { "p250",          36, "P250" },
+    { "fiveseven",     3,  "57" },
+    { "tec9",          30, "Tec 9" },
+    { "cz75a",         63, "CZ" },
+    { "revolver",      64, "R8" },
+    { "elite",         2,  "Dualies" },
+    { "ssg08",         40, "Scout" },
+    { "sg556",         39, "SG 553" },
+    { "aug",           8,  "AUG" },
+    { "famas",         10, "FAMAS" },
+    { "galilar",       13, "GALIL" },
+    { "g3sg1",         11, "Auto Sniper" },
+    { "scar20",        38, "Auto Sniper" },
+    { "mp9",           34, "MP9" },
+    { "mp7",           33, "MP7" },
+    { "mp5sd",         23, "MP5-SD" },
+    { "ump45",         24, "UMP-45" },
+    { "p90",           19, "P90" },
+    { "bizon",         26, "PP-Bizon" },
+    { "mac10",         17, "MAC-10" },
+    { "xm1014",        25, "XM" },
+    { "mag7",          27, "MAG-7" },
+    { "sawedoff",      29, "Sawed-Off" },
+    { "nova",          35, "Nova" },
+    { "negev",         28, "Negev" },
+    { "m249",          14, "M249" },
+    { "taser",         31, "Zeus" },
+    { "smokegrenade",  45, "Smoke" },
+    { "flashbang",     43, "Flashbang" },
+    { "hegrenade",     44, "HE Grenade" },
+    { "molotov",       46, "Molotov" },
+    { "incgrenade",    48, "Incendiary" },
+    { "decoy",         47, "Decoy" },
+    { "c4",            49, "C4" },
+};
+
+// Designer string to expected id, or 0 if unknown.
+int designer_id(const char* dn) {
+    for (const DMap& d : kDesigner)
+        if (std::strcmp(dn, d.designer) == 0) return d.id;
+    if (std::strncmp(dn, "knife", 5) == 0) return 500;
+    if (std::strncmp(dn, "bayonet", 7) == 0) return 500;
+    return 0;
+}
+
+// Designer string to pretty display name, or nullptr.
+const char* pretty_from_designer(const char* dn) {
+    for (const DMap& d : kDesigner)
+        if (std::strcmp(dn, d.designer) == 0) return d.pretty;
+    if (std::strncmp(dn, "knife", 5) == 0) return "Knife";
+    if (std::strncmp(dn, "bayonet", 7) == 0) return "Knife";
+    return nullptr;
+}
+
+bool plausible_id_val(int id) {
+    return weapon_name(id) != nullptr ||
+           (id >= 1 && id <= 90) ||
+           (id >= 500 && id <= 600);
+}
+
+// Discovered def-index offset. 0 = not found yet.
+uintptr_t g_defidx_off = 0;
+
 uint16_t item_def_index(const Memory& mem, uintptr_t w) {
-    // Primary: direct field.
+    if (g_defidx_off) return mem.read<uint16_t>(w + g_defidx_off);
+
     const uint16_t direct =
         mem.read<uint16_t>(w + offsets::m_iItemDefinitionIndex);
     if (direct >= 1 && direct <= 700) return direct;
 
-    // Fallback: the econ-item path.
     const uint16_t via_item = mem.read<uint16_t>(
         w + offsets::m_AttributeManager + offsets::m_Item +
         offsets::m_iItemDefinitionIndex);
     if (via_item >= 1 && via_item <= 700) return via_item;
 
     return direct;
+}
+
+// Find the def-index offset by requiring agreement with the designer name.
+// Scores each uint16 candidate across the weapon entity:
+//   +1  value is a plausible id at all
+//   +2  value matches what the designer name says it must be
+// The best candidate that matches at least one reference wins, so we cannot
+// latch onto a field that merely happens to hold a small number.
+uintptr_t calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                           uintptr_t stride,
+                           const std::vector<uintptr_t>& pawns) {
+    struct Sample { uintptr_t w; int expect; };
+    std::vector<Sample> samples;
+
+    for (uintptr_t p : pawns) {
+        if (samples.size() >= 6) break;
+
+        const uintptr_t ws = mem.read<uintptr_t>(p + offsets::m_pWeaponServices);
+        if (!valid_ptr(ws)) continue;
+
+        const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
+        if (!h || h == 0xFFFFFFFFu) continue;
+
+        const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
+        if (!valid_ptr(w)) continue;
+
+        char dn[24] = {};
+        if (!read_designer(mem, w, dn, sizeof(dn))) continue;
+
+        samples.push_back({ w, designer_id(dn) });
+    }
+
+    if (samples.empty()) return 0;
+
+    uintptr_t best_off = 0;
+    int best_score = 0;
+    int best_matches = 0;
+
+    for (uintptr_t off = 0x1000; off <= 0x1800; off += 2) {
+        int score = 0;
+        int matches = 0;
+
+        for (const Sample& s : samples) {
+            const int id = mem.read<uint16_t>(s.w + off);
+            if (!plausible_id_val(id)) continue;
+            ++score;
+            if (s.expect && id == s.expect) { ++matches; score += 2; }
+        }
+
+        if (matches >= 1 && score > best_score) {
+            best_score = score;
+            best_matches = matches;
+            best_off = off;
+        }
+    }
+
+    // Require real agreement, not just plausible numbers.
+    if (best_matches < 1) return 0;
+    return best_off;
 }
 
 struct BE { Vec3 pos; float pad[5]; };
@@ -259,6 +394,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static double info_at  = -1e9;
     static bool   layout_locked = false;
 
+    // ---- pawn list ----
     if (now - slots_at > 100.0) {
         slots_at = now;
 
@@ -301,6 +437,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         else           pawns.clear();
     }
 
+    // ---- weapon services ----
     if (!c_.wsvc_ok && now - c_.wsvc_try > 1000.0) {
         c_.wsvc_try = now;
 
@@ -346,6 +483,18 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_wsvc_ok = c_.wsvc_ok;
     diag_wsvc = c_.wsvc;
 
+    // ---- def-index offset, calibrated from designer names ----
+    // One offset feeds weapons, the bomb carrier AND the C4 entity scan, so this
+    // is the highest-value thing to get right.
+    if (!g_defidx_off && c_.wsvc_ok && !pawns.empty() &&
+        now - c_.defidx_try > 2000.0) {
+        c_.defidx_try = now;
+        g_defidx_off = calibrate_defidx(mem, el, c_.chunk_off,
+                                        c_.slot_stride, pawns);
+        diag_defidx = (int)g_defidx_off;
+    }
+
+    // ---- bone chain: seeds, then bounded scan ----
     if (!c_.bones_ok || c_.bone_fail > 250) {
         if (c_.probe_cd > 0) {
             --c_.probe_cd;
@@ -410,6 +559,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_bone_node = c_.bone_node;
     diag_bone_arr  = c_.bone_arr;
 
+    // ---- sample every live pawn ----
     std::vector<Track> fresh;
     fresh.reserve(pawns.size());
     int bone_hits = 0;
@@ -478,6 +628,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
+    // ---- names, weapons, carrier ----
     if (now - info_at > 300.0) {
         info_at = now;
 
@@ -520,23 +671,30 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 continue;
             }
 
+            // Display order: pretty name from the id, then the pretty name for
+            // the designer string, then the raw designer string, then the id.
+            // The designer path is the one we KNOW works, so it is a real
+            // fallback rather than a last resort.
             const char* nm = weapon_name(id);
             if (nm) {
                 std::snprintf(t.weapon, sizeof(t.weapon), "%s", nm);
             } else {
                 char dn[24] = {};
-                if (read_designer(mem, w, dn, sizeof(dn)))
-                    std::snprintf(t.weapon, sizeof(t.weapon), "%s", dn);
-                else
+                if (read_designer(mem, w, dn, sizeof(dn))) {
+                    const char* pretty = pretty_from_designer(dn);
+                    std::snprintf(t.weapon, sizeof(t.weapon), "%s",
+                                  pretty ? pretty : dn);
+                } else {
                     std::snprintf(t.weapon, sizeof(t.weapon), "#%d", id);
+                }
             }
         }
     }
 
     // ---- planted C4 ----
-    // dwPlantedC4 is UNVERIFIED, so instead of trusting it we check whether the
-    // pointer leads to a live entity; if not, we look for a C4 entity in the
-    // entity list instead, which needs no C4-specific offset at all.
+    // dwPlantedC4 is unverified, so instead of trusting it we check whether the
+    // pointer leads to a live entity; if not, we find the C4 by scanning the
+    // entity list for id 49, which needs no C4-specific global at all.
     bool bomb_on = false;
     Vec3 bomb{};
 
@@ -551,10 +709,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         if (looks_like_entity(mem, inner)) c4 = inner;
     }
 
-    // Fallback: scan the entity list for a C4. We already have the slots and a
-    // working def-index read, so this costs almost nothing and removes the
-    // dependency on dwPlantedC4 entirely.
-    if (!c4 && c_.wsvc_ok && !pawns.empty()) {
+    if (!c4 && g_defidx_off && !pawns.empty()) {
         static std::vector<uintptr_t> c4_slots;
         static double c4_scan_at = -1e9;
 
