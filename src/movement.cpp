@@ -15,25 +15,26 @@
 #pragma comment(lib, "winmm.lib")
 
 extern HWND g_cs2_hwnd;
-extern int g_screen_w;
 
 namespace {
 
-// *** THE TIMING ***
-// The uncrouch fires on ENTERING the documented 9-11 unit window, i.e. when the
-// height above the last standing position first drops to <= 11. Triggering on
-// entry rather than in the middle gives our input the whole window to land in,
-// which matters because at typical fall speeds 2 units lasts only ~7 ms -- less
-// than one frame at 144 fps. This is genuinely frame-perfect, as the source
-// notes, so catching it every time is not guaranteed from outside the process.
+// The documented jumpbug window, in units above the ground. Triggered on ENTRY
+// (<=) so the input has the whole window to land in.
 constexpr float kUncrouchHeight = 11.0f;
 
-// Crouch two ticks before the predicted landing, matching the reference jumpbug.
+// Crouch two ticks before the predicted landing, matching the reference.
 constexpr float kDefaultCrouchLeadMs = 31.0f;
 
 constexpr float kMinFallSpeed = 40.0f;
 constexpr float kMaxTtiMs     = 1500.0f;
 constexpr double kJumpHoldMs  = 12.0;
+
+// How long Z must be motionless before we even consider "on ground".
+constexpr double kStillMs = 22.0;
+// ...and how close to the last ground height Z must be, which is what excludes
+// the APEX of a jump. At apex Z is barely moving, so a stillness test alone
+// reads it as grounded.
+constexpr float kGroundBand = 3.0f;
 
 std::atomic<bool>  g_stop{false}, g_started{false};
 std::atomic<bool>  g_on{false};
@@ -97,11 +98,19 @@ struct Watch {
     double prev_t = 0.0;
     double still_since = 0.0;
     float  vz = 0.0f;
-    float  ground_z = 0.0f;
-    bool   have_ground_z = false;
+
+    // Running ground reference. Drops immediately if we end up lower, rises
+    // only when we are confidently standing.
+    float  ground_ref = 0.0f;
+    bool   have_ref = false;
+
     bool   on_ground = false;
     float  height = -1.0f;
     float  tti = -1.0f;
+
+    // Grading for the flag, so it is only trusted once it has PROVEN itself.
+    int    flag_g = 0, flag_a = 0;
+    bool   flag_ok = false;
 };
 Watch g_w;
 
@@ -110,15 +119,19 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
 
     const float z = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
     const uint32_t flags = mem.read<uint32_t>(pawn + offsets::m_fFlags);
+    const uint32_t hge   = mem.read<uint32_t>(pawn + offsets::m_hGroundEntity);
 
-    const bool flag_ground = (flags & 1u) != 0u;   // FL_ONGROUND
-    g_dbg_ducked.store((flags & 4u) != 0u);        // FL_DUCKING
+    const bool flag_bit = (flags & offsets::kFlagOnGround) != 0u;
+
+    g_dbg_ducked.store((flags & offsets::kFlagDucking) != 0u);
 
     if (!g_w.has_prev) {
         g_w.has_prev = true;
         g_w.prev_z = z;
         g_w.prev_t = now;
         g_w.still_since = now;
+        g_w.ground_ref = z;
+        g_w.have_ref = true;
         return;
     }
 
@@ -126,8 +139,9 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     const double dt = (now - g_w.prev_t) / 1000.0;
 
     if (std::fabs(dz) >= 0.5f) g_w.still_since = now;
-    const bool z_still = (now - g_w.still_since) > 22.0;
+    const bool z_still = (now - g_w.still_since) > kStillMs;
 
+    // Velocity from distinct samples only, so the estimate does not spike.
     if (!g_w.on_ground && dt > 0.0005 && dt < 0.25 &&
         std::fabs(dz) >= 0.05f) {
         const float v = (float)(dz / dt);
@@ -137,18 +151,46 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     g_w.prev_z = z;
     g_w.prev_t = now;
 
-    const bool slow = std::fabs(g_w.vz) < 30.0f;
-    g_w.on_ground = flag_ground || (z_still && slow);
+    // *** GROUND DETECTION, AND WHY THE OLD ONE NEVER FIRED ***
+    // The previous version trusted m_fFlags bit 0 directly:
+    //     ground = (flags & 1) || (z_still && slow)
+    // But bit 0 is NOT FL_ONGROUND on the local predicted pawn (it reads
+    // 0x10000 while standing). If that bit happened to read SET while airborne,
+    // ground was permanently true -- so the crouch never fired and the jump
+    // never fired, which is exactly "crouch isn't working either".
+    //
+    // Now: Z-based primary, with a band test that excludes the APEX (where Z is
+    // briefly motionless but we are ~55 units up), and the flag used only after
+    // it has been observed BOTH set while grounded and clear while airborne.
+    if (z < g_w.ground_ref) g_w.ground_ref = z;   // fell to a lower level
 
-    if (g_w.on_ground && slow) {
-        // Reference height follows slopes and steps.
-        g_w.ground_z = z;
-        g_w.have_ground_z = true;
+    const bool near_ref = (z - g_w.ground_ref) <= kGroundBand;
+    const bool z_ground = z_still && near_ref;
+
+    if (z_ground) {
+        if (flag_bit) ++g_w.flag_g;
+    } else {
+        if (!flag_bit) ++g_w.flag_a;
+    }
+    if (!g_w.flag_ok && g_w.flag_g >= 8 && g_w.flag_a >= 8) g_w.flag_ok = true;
+
+    const bool hge_ground = (hge != offsets::kGroundEntityNone) &&
+                            (hge == 0x8000u);
+
+    bool ground;
+    if (g_w.flag_ok) ground = flag_bit;
+    else             ground = z_ground;
+    if (!ground && hge_ground) ground = true;
+
+    g_w.on_ground = ground;
+
+    if (ground) {
+        g_w.ground_ref = z;      // reference follows the surface we stand on
         g_w.vz = 0.0f;
         g_w.height = 0.0f;
         g_w.tti = -1.0f;
-    } else if (g_w.have_ground_z) {
-        g_w.height = z - g_w.ground_z;
+    } else {
+        g_w.height = z - g_w.ground_ref;
         if (g_w.vz < -kMinFallSpeed && g_w.height > 0.0f) {
             const float t = (g_w.height / -g_w.vz) * 1000.0f;
             g_w.tti = (t > kMaxTtiMs) ? -1.0f : t;
@@ -168,7 +210,7 @@ void run_thread() {
     double pawn_at = 0.0;
 
     bool crouching = false;
-    bool fired = false;        // uncrouch+jump already done this airtime
+    bool fired = false;
     bool jump_down = false;
     double jump_at = 0.0;
 
@@ -177,9 +219,7 @@ void run_thread() {
 
         const int key = g_key.load();
 
-        // *** UNBOUND MEANS OFF ***
-        // key == 0 is deliberately NOT "always on". The feature only runs while
-        // a bound key is physically held.
+        // UNBOUND MEANS OFF: the feature runs only while a bound key is held.
         const bool gate = g_on.load() && cs2_focused() && key != 0 &&
                           ((GetAsyncKeyState(key) & 0x8000) != 0);
 
@@ -208,7 +248,6 @@ void run_thread() {
             jump_down = false;
         }
 
-        // On the ground: release everything and re-arm for the next fall.
         if (g_w.on_ground) {
             if (crouching) { key_up(VK_CONTROL); crouching = false; }
             fired = false;
@@ -221,7 +260,7 @@ void run_thread() {
         const float tti    = g_w.tti;
         const bool  falling = (g_w.vz < -kMinFallSpeed);
 
-        // ---- 1. crouch ~2 ticks before landing ----
+        // 1. crouch ~2 ticks before landing
         if (!crouching && !fired && falling &&
             tti >= 0.0f && tti <= g_crouch_lead.load()) {
             key_down(VK_CONTROL);
@@ -229,26 +268,22 @@ void run_thread() {
             g_dbg_n.fetch_add(1);
         }
 
-        // ---- 2. uncrouch + jump inside the 9-11 unit window ----
-        // Triggered on ENTERING the window (<= threshold) so our input has the
-        // whole window to land in. Order is uncrouch THEN jump, matching the
-        // reference implementations.
+        // 2. uncrouch + jump on entering the 9-11 unit window.
+        //    Order is uncrouch THEN jump, per the reference implementations.
         if (crouching && !fired && falling &&
             height >= 0.0f && height <= g_uncrouch_h.load()) {
-            key_up(VK_CONTROL);          // -duck
+            key_up(VK_CONTROL);
             crouching = false;
-            key_down(VK_SPACE);          // +jump
+            key_down(VK_SPACE);
             jump_down = true;
             jump_at = now;
             fired = true;
             g_dbg_jumping.store(true);
         }
 
-        // ---- fallback: if the window was missed, still try at touchdown ----
-        // Catching a sub-frame window is not guaranteed externally, so if we are
-        // still crouched when the height goes negative we fire anyway. That is
-        // usually too late to gain height, but it preserves the crouch-release
-        // which is what negates fall damage.
+        // 3. fallback: if the window was missed, still release and jump at
+        //    touchdown. Usually too late for the height gain, but it preserves
+        //    the crouch release that negates fall damage.
         if (crouching && !fired && height < 0.0f) {
             key_up(VK_CONTROL);
             crouching = false;
