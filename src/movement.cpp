@@ -1,16 +1,5 @@
 // --- src/movement.cpp ---
 // Jumpbug. CTRL injection only, no memory writes.
-//
-// Uses the SAME prediction as the bhop: vertical velocity from distinct Z
-// samples, and time-to-impact. Two timings are added on top:
-//
-//   crouch   - press CTRL when tti drops below kCrouchLeadMs
-//   uncrouch - release CTRL when tti drops below kUncrouchLeadMs
-//
-// The uncrouch just before touchdown is the part that produces the bug. Both
-// are constants at the top of this file, so they are easy to move.
-//
-// Independent of bhop: the Bhop toggle does not need to be on.
 #include "movement.h"
 #include "memory.h"
 #include "offsets.h"
@@ -28,17 +17,16 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
-// ---- timing, same style as bhop.cpp ----
-constexpr double kCrouchLeadMs   = 150.0;  // crouch this early in the fall
-constexpr double kUncrouchLeadMs = 24.0;   // uncrouch this close to touchdown
-constexpr float  kMinFallSpeed   = 40.0f;  // units/sec
-constexpr float  kMaxTtiMs       = 900.0f;
+std::atomic<bool>   g_stop{false}, g_started{false};
+std::atomic<bool>   g_on{false};
+std::atomic<int>    g_key{0};
+std::atomic<float>  g_crouch_lead{150.0f};
+std::atomic<float>  g_uncrouch_lead{24.0f};
 
-std::atomic<bool> g_stop{false}, g_started{false};
-std::atomic<bool> g_on{false};
-std::atomic<int>  g_key{0};
+constexpr float kMinFallSpeed = 40.0f;   // units/sec
+constexpr float kMaxTtiMs     = 900.0f;
 
-std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false};
+std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false}, g_dbg_armed{false};
 std::atomic<float> g_dbg_vz{0.0f}, g_dbg_tti{-1.0f};
 std::atomic<int>   g_dbg_n{0};
 
@@ -69,7 +57,6 @@ bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
-// Separate down/up calls so the key is genuinely held, not a zero-width pulse.
 void ctrl_down() {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
@@ -105,7 +92,7 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     const double now = now_ms();
 
     const float z = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
-    const bool flag_ground =
+    const bool  flag_ground =
         (mem.read<uint32_t>(pawn + offsets::m_fFlags) & 1u) != 0u;
 
     if (!g_w.has_prev) {
@@ -120,8 +107,7 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     const double dt = (now - g_w.prev_t) / 1000.0;
 
     if (std::fabs(dz) >= 0.5f) g_w.still_since = now;
-    const bool z_ground = (now - g_w.still_since) > 22.0;
-    g_w.on_ground = z_ground || flag_ground;
+    const bool z_still = (now - g_w.still_since) > 22.0;
 
     if (!g_w.on_ground && dt > 0.0005 && dt < 0.25 &&
         std::fabs(dz) >= 0.05f) {
@@ -132,7 +118,15 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     g_w.prev_z = z;
     g_w.prev_t = now;
 
-    if (g_w.on_ground) {
+    // *** THE FIX ***
+    // The flag is the primary signal. The Z test is only accepted as a
+    // fallback when velocity is ALSO near zero -- otherwise the apex of a jump
+    // (where Z barely moves) reads as grounded, which overwrites ground_z with
+    // the apex height and collapses tti to zero.
+    const bool slow = std::fabs(g_w.vz) < 30.0f;
+    g_w.on_ground = flag_ground || (z_still && slow);
+
+    if (g_w.on_ground && slow) {
         g_w.ground_z = z;
         g_w.have_ground_z = true;
         g_w.vz = 0.0f;
@@ -155,7 +149,7 @@ void run_thread() {
     double pawn_at = 0.0;
 
     bool crouching = false;
-    bool done = false;    // one crouch/uncrouch per airtime
+    bool armed = false;
 
     while (!g_stop.load()) {
         wait_ms(1.0);
@@ -166,8 +160,9 @@ void run_thread() {
 
         if (!g_mem.is_valid() || !gate) {
             if (crouching) { ctrl_up(); crouching = false; }
-            done = false;
+            armed = false;
             g_dbg_crouch.store(false);
+            g_dbg_armed.store(false);
             continue;
         }
 
@@ -181,31 +176,33 @@ void run_thread() {
 
         update_watch(g_mem, pawn);
 
-        // Re-arm once safely on the ground.
         if (g_w.on_ground) {
             if (crouching) { ctrl_up(); crouching = false; }
-            done = false;
+            armed = false;
             g_dbg_crouch.store(false);
+            g_dbg_armed.store(false);
             continue;
         }
 
         const float tti = g_w.tti;
 
-        // ---- crouch early in the fall ----
-        if (!done && !crouching && tti >= 0.0f && tti <= kCrouchLeadMs) {
+        // crouch early in the fall
+        if (!armed && !crouching && tti >= 0.0f &&
+            tti <= g_crouch_lead.load()) {
             ctrl_down();
             crouching = true;
+            armed = true;
             g_dbg_n.fetch_add(1);
         }
 
-        // ---- uncrouch just before touchdown: this is the bug ----
-        if (crouching && tti >= 0.0f && tti <= kUncrouchLeadMs) {
+        // uncrouch just before touchdown -- this is the bug window
+        if (crouching && tti >= 0.0f && tti <= g_uncrouch_lead.load()) {
             ctrl_up();
             crouching = false;
-            done = true;
         }
 
         g_dbg_crouch.store(crouching);
+        g_dbg_armed.store(armed);
     }
 
     if (crouching) ctrl_up();
@@ -234,7 +231,7 @@ MovementDebug Movement_GetDebug() {
     d.enabled   = g_on.load();
     d.on_ground = g_dbg_ground.load();
     d.crouching = g_dbg_crouch.load();
-    d.armed     = g_dbg_crouch.load();
+    d.armed     = g_dbg_armed.load();
     d.vz        = g_dbg_vz.load();
     d.tti       = g_dbg_tti.load();
     d.jumpbugs  = g_dbg_n.load();
@@ -245,3 +242,17 @@ void Movement_SetJumpbug(bool on) { g_on.store(on); }
 bool Movement_Jumpbug() { return g_on.load(); }
 void Movement_SetKey(int vk) { g_key.store(vk); }
 int  Movement_Key() { return g_key.load(); }
+
+void Movement_SetCrouchLead(float ms) {
+    if (ms < 10.0f)  ms = 10.0f;
+    if (ms > 400.0f) ms = 400.0f;
+    g_crouch_lead.store(ms);
+}
+float Movement_CrouchLead() { return g_crouch_lead.load(); }
+
+void Movement_SetUncrouchLead(float ms) {
+    if (ms < 0.0f)  ms = 0.0f;
+    if (ms > 200.0f) ms = 200.0f;
+    g_uncrouch_lead.store(ms);
+}
+float Movement_UncrouchLead() { return g_uncrouch_lead.load(); }
