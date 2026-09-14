@@ -1,33 +1,24 @@
-// --- src/overlay.h ---
+// --- src/bhop.h ---
 #pragma once
-#include <d3d11.h>
+#include <cstdint>
 
-class Overlay {
-public:
-    HWND                    hwnd      = nullptr;
-    ID3D11Device*           device    = nullptr;
-    ID3D11DeviceContext*    context   = nullptr;
-    IDXGISwapChain*         swapchain = nullptr;
-    ID3D11RenderTargetView* rtv       = nullptr;
-
-    bool create(int width, int height);
-    void begin_frame();
-    void end_frame();
-    void cleanup();
-    void sync_to_game();
-
-    static void enable_dpi_awareness();
-
-private:
-    bool init_dx11(int width, int height);
-    bool create_rtv();
-    void release_rtv();
-    bool resize_buffers(int width, int height);
-    void update_visibility_and_input();
-
-    static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
-    WNDCLASSEXW wc{};
-
-    int width_  = 0;
-    int height_ = 0;
+struct BhopDebug {
+    uintptr_t offset    = 0;
+    bool  on_ground     = false;
+    bool  focused       = false;
+    int   signals       = 0;   // bit0 z, bit1 flag, bit2 hge
+    bool  locked        = false;
+    bool  scanning      = false;
+    int   candidates    = 0;
 };
+
+void Bhop_Init();
+void Bhop_Shutdown();
+
+BhopDebug Bhop_GetDebug();
+void      Bhop_Rescan();
+
+void Bhop_SetInputMode(bool enabled);
+bool Bhop_InputMode();
+
+void Bhop_SetEnabled(bool enabled);
