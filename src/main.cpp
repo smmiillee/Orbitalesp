@@ -20,6 +20,7 @@ bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
 
 struct Config {
+    // ESP visuals
     bool  esp_boxes    = true;
     bool  esp_skeleton = true;
     bool  esp_head_dot = true;
@@ -28,24 +29,29 @@ struct Config {
     bool  esp_health   = true;
     bool  esp_distance = true;
     bool  esp_bomb     = true;
+    // Teammates are OFF by default -- most people only want enemies.
     bool  esp_show_enemies = true;
     bool  esp_show_team    = false;
     float box_thickness = 0.5f;
 
-    bool   team_colors  = false;
-    ImVec4 color_enemy  = { 1.00f, 0.15f, 0.15f, 1.00f };
-    ImVec4 color_team   = { 0.20f, 0.90f, 0.35f, 1.00f };
-    ImVec4 color_box    = { 1.00f, 0.15f, 0.15f, 1.00f };
-    ImVec4 color_skel   = { 0.95f, 0.95f, 0.95f, 0.90f };
-    ImVec4 color_head   = { 1.00f, 1.00f, 1.00f, 1.00f };
-    ImVec4 color_name   = { 1.00f, 1.00f, 1.00f, 1.00f };
-    ImVec4 color_weapon = { 1.00f, 0.85f, 0.30f, 1.00f };
-    ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
-    ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
+    // Colours -- one per visual.
+    bool   team_colors   = false;
+    ImVec4 color_enemy   = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_team    = { 0.20f, 0.90f, 0.35f, 1.00f };
+    ImVec4 color_box     = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_skel    = { 0.95f, 0.95f, 0.95f, 0.90f };
+    ImVec4 color_head    = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_name    = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_weapon  = { 1.00f, 0.85f, 0.30f, 1.00f };
+    ImVec4 color_dist    = { 0.85f, 0.85f, 0.85f, 0.90f };
+    ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    bool bhop_enabled    = true;
-    bool bhop_input_mode = true;
+    // Bhop -- keystroke injection only, so nothing here writes to cs2.exe.
+    bool  bhop_enabled      = true;
+    bool  bhop_predict      = false;
+    bool  bhop_separate_key = false;
+    float bhop_lead_ms      = 16.0f;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -70,6 +76,9 @@ static int query_refresh_rate(HWND game) {
     return (hz < 30 || hz > 1000) ? 0 : hz;
 }
 
+// sleep_for() on Windows quantises to the timer resolution unless the process
+// raised it, which bhop does with timeBeginPeriod(1). Sleep the bulk, spin the
+// last stretch, so the frame cap is honest either way.
 static void wait_until(std::chrono::steady_clock::time_point deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -82,6 +91,7 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
+// Skeleton links, using the current (post animgraph_2_beta) bone map.
 static constexpr int kSkeleton[][2] = {
     { BONE_PELVIS,     BONE_SPINE_1    },
     { BONE_SPINE_1,    BONE_SPINE_2    },
@@ -115,12 +125,22 @@ static bool find_cs2_window() {
     return true;
 }
 
+// Push the whole bhop config into the module. Called once at startup and by
+// [Reset], so the two can never drift apart.
+static void apply_bhop_config() {
+    Bhop_SetEnabled(g_cfg.bhop_enabled);
+    Bhop_SetPredict(g_cfg.bhop_predict);
+    Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
+    Bhop_SetLead(g_cfg.bhop_lead_ms);
+}
+
+// Reader thread: world samples. Bhop owns its own thread.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
     Bhop_Init();
-    Bhop_SetInputMode(g_cfg.bhop_input_mode);
+    apply_bhop_config();
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -132,6 +152,8 @@ void memory_thread() {
 
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
+        // 8 ms (~125 Hz): the game only writes positions at 64 Hz and the
+        // render thread interpolates, so faster sampling buys nothing.
         wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
     }
 }
@@ -143,6 +165,8 @@ void render_esp(ImDrawList* dl) {
 
     const std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+
+    const float lh = ImGui::GetTextLineHeight();
 
     for (const auto& p : players) {
         const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
@@ -164,6 +188,14 @@ void render_esp(ImDrawList* dl) {
 
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
+
+        // Text spacing scales with the box and is CLAMPED, so labels stay just
+        // outside the box at every distance. A fixed pixel offset put the name
+        // a whole body-height above distant players, because at range the box
+        // is only a few pixels tall while the offset stayed 30 px.
+        float gap = bh * 0.06f;
+        if (gap < 2.0f) gap = 2.0f;
+        if (gap > 8.0f) gap = 8.0f;
 
         if (g_cfg.esp_boxes) {
             dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
@@ -199,22 +231,27 @@ void render_esp(ImDrawList* dl) {
                         IM_COL32(0, 0, 0, 180));
         }
 
+        // Name: bottom edge sits `gap` above the box top.
         if (g_cfg.esp_name && p.name[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.name);
-            dl->AddText({ cx - sz.x * 0.5f, top - 30.0f },
+            dl->AddText({ cx - sz.x * 0.5f, top - gap - lh },
                         pick(g_cfg.color_name), p.name);
         }
 
+        // Weapon: directly under the box.
         if (g_cfg.esp_weapon && p.weapon[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
-            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
+            dl->AddText({ cx - sz.x * 0.5f, bot + gap },
                         pick(g_cfg.color_weapon), p.weapon);
         }
 
+        // Bomb carrier: its own line, so it is never confused with the weapon.
         if (g_cfg.esp_bomb && p.has_bomb) {
-            const char* tag = "C4";
+            const char* tag = "C4 CARRIER";
             const ImVec2 sz = ImGui::CalcTextSize(tag);
-            dl->AddText({ cx - sz.x * 0.5f, bot + 4.0f },
+            const float y = bot + gap + (g_cfg.esp_weapon && p.weapon[0]
+                                             ? lh + gap : 0.0f);
+            dl->AddText({ cx - sz.x * 0.5f, y },
                         col_of(g_cfg.color_carrier), tag);
         }
 
@@ -252,6 +289,8 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::SameLine();
     ImGui::Text("%s", label);
 }
+
+// ── tabs ─────────────────────────────────────────────────────────────────
 
 static void tab_esp() {
     const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
@@ -293,29 +332,50 @@ static void tab_esp() {
 
 static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
-    ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
-    if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
-        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+    ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
+    ImGui::TextDisabled("keystroke injection only - no writes to CS2");
+
+    if (ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled))
+        Bhop_SetEnabled(g_cfg.bhop_enabled);
+
+    if (ImGui::Checkbox("Predictive (press before landing)", &g_cfg.bhop_predict))
+        Bhop_SetPredict(g_cfg.bhop_predict);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Estimates the landing from your vertical velocity and\n"
+                          "presses early, so the press is already down when the\n"
+                          "engine samples input for the landing tick.\n"
+                          "The ground flag is still used as a fallback.");
+
+    ImGui::SetNextItemWidth(200.0f);
+    if (ImGui::SliderFloat("##lead", &g_cfg.bhop_lead_ms, 0.0f, 40.0f,
+                           "lead %.0f ms"))
+        Bhop_SetLead(g_cfg.bhop_lead_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How early prediction presses.\n"
+                          "One game tick is ~16 ms. 12-20 ms is the usual range.");
+
+    if (ImGui::Checkbox("Use Right Arrow (bind +jump)", &g_cfg.bhop_separate_key))
+        Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Injects RIGHT instead of SPACE.\n"
+                          "In-game: bind \";\" \"+jump\" on the right arrow, so\n"
+                          "the physical key we inject is never the one held.");
 
     const BhopDebug bd = Bhop_GetDebug();
 
-    if (g_cfg.bhop_input_mode) {
-        ImGui::Text("mode: synthesised spacebar");
-        ImGui::TextDisabled("auto-jumps while grounded");
-    } else {
-        ImGui::Text("button: 0x%06llX  %s",
-            (unsigned long long)bd.offset,
-            bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
-        if (!bd.locked)
-            ImGui::TextDisabled("hold WASD or SPACE to confirm the address");
-    }
+    ImGui::Text("ground: %s   focused: %s   space: %s",
+        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
+        bd.space_held ? "held" : "-");
+    ImGui::TextDisabled("edges %d   predicted %d   %s%s",
+        bd.edges, bd.predicted,
+        bd.driving ? "[driving] " : "",
+        bd.suppressing ? "[space swallowed]" : "");
+    if (g_cfg.bhop_predict)
+        ImGui::TextDisabled("vz %.0f   tti %.1f ms", bd.vz, bd.tti);
 
-    ImGui::Text("ground: %s   focused: %s",
-        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
-    ImGui::TextDisabled("signals: %s%s%s",
-        (bd.signals & 1) ? "z " : "",
-        (bd.signals & 2) ? "flag " : "",
-        (bd.signals & 4) ? "hge" : "");
+    if (!bd.hook_ok)
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
+                           "key hook failed - space gate may misbehave");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -327,7 +387,15 @@ static void tab_misc() {
     ImGui::Checkbox("V-Sync", &g_vsync);
 
     ImGui::Separator();
-    ImGui::TextDisabled("entities: %d", g_esp.diag_slots);
+    ImGui::TextDisabled("entities: %d slots", g_esp.diag_slots);
+    ImGui::TextDisabled("weapon defIdx chain: %s (mine=%d)",
+                        g_esp.diag_defidx ? "ok" : "not detected",
+                        g_esp.diag_defidx);
+    if (g_esp.diag_carrier)
+        ImGui::TextDisabled("C4 owner: 0x%llX",
+                            (unsigned long long)g_esp.diag_carrier);
+    else
+        ImGui::TextDisabled("C4 owner: not found");
 }
 
 static void tab_colors() {
@@ -356,8 +424,8 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 560.0f, 420.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
+    ImGui::SetNextWindowSize({ 580.0f, 480.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 780.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
@@ -381,16 +449,14 @@ void render_menu() {
     ImGui::Separator();
 
     const float btn_w =
-        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f)
-        / 3.0f;
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x)
+        / 2.0f;
 
     if (ImGui::Button("[Reset]", { btn_w, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
-        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+        apply_bhop_config();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
 
