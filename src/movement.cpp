@@ -17,14 +17,14 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
-std::atomic<bool>   g_stop{false}, g_started{false};
-std::atomic<bool>   g_on{false};
-std::atomic<int>    g_key{0};
-std::atomic<float>  g_crouch_lead{150.0f};
-std::atomic<float>  g_uncrouch_lead{24.0f};
+std::atomic<bool>  g_stop{false}, g_started{false};
+std::atomic<bool>  g_on{false};
+std::atomic<int>   g_key{0};
+std::atomic<float> g_crouch_lead{200.0f};
+std::atomic<float> g_uncrouch_lead{0.0f};   // 0 == release on landing
 
-constexpr float kMinFallSpeed = 40.0f;   // units/sec
-constexpr float kMaxTtiMs     = 900.0f;
+constexpr float kMinFallSpeed = 40.0f;
+constexpr float kMaxTtiMs     = 1200.0f;
 
 std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false}, g_dbg_armed{false};
 std::atomic<float> g_dbg_vz{0.0f}, g_dbg_tti{-1.0f};
@@ -57,6 +57,8 @@ bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
+// Separate down/up calls, so the key is genuinely held rather than a zero-width
+// pulse the game's per-frame sampling could miss.
 void ctrl_down() {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
@@ -74,7 +76,7 @@ void ctrl_up() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// ---- prediction, same structure as bhop.cpp ----
+// ---- prediction ----
 struct Watch {
     bool   has_prev = false;
     float  prev_z = 0.0f;
@@ -118,11 +120,10 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     g_w.prev_z = z;
     g_w.prev_t = now;
 
-    // *** THE FIX ***
-    // The flag is the primary signal. The Z test is only accepted as a
-    // fallback when velocity is ALSO near zero -- otherwise the apex of a jump
-    // (where Z barely moves) reads as grounded, which overwrites ground_z with
-    // the apex height and collapses tti to zero.
+    // The flag is the primary ground signal, because it is instance-accurate.
+    // A Z-stillness test alone reads the APEX of a jump as "grounded" (Z barely
+    // moves up there), which would overwrite ground_z with the apex height and
+    // collapse tti to zero -- so it is only accepted when velocity is also slow.
     const bool slow = std::fabs(g_w.vz) < 30.0f;
     g_w.on_ground = flag_ground || (z_still && slow);
 
@@ -176,17 +177,24 @@ void run_thread() {
 
         update_watch(g_mem, pawn);
 
+        const float tti    = g_w.tti;
+        const float release = g_uncrouch_lead.load();
+
+        // On the ground: release and re-arm. If we were still crouching when we
+        // landed, this release IS the jumpbug -- which is exactly what happens
+        // with the default uncrouch lead of 0.
         if (g_w.on_ground) {
-            if (crouching) { ctrl_up(); crouching = false; }
+            if (crouching) {
+                ctrl_up();
+                crouching = false;
+            }
             armed = false;
             g_dbg_crouch.store(false);
             g_dbg_armed.store(false);
             continue;
         }
 
-        const float tti = g_w.tti;
-
-        // crouch early in the fall
+        // Crouch once, early in the fall.
         if (!armed && !crouching && tti >= 0.0f &&
             tti <= g_crouch_lead.load()) {
             ctrl_down();
@@ -195,8 +203,9 @@ void run_thread() {
             g_dbg_n.fetch_add(1);
         }
 
-        // uncrouch just before touchdown -- this is the bug window
-        if (crouching && tti >= 0.0f && tti <= g_uncrouch_lead.load()) {
+        // Optional early release. With the default of 0 this never fires, and
+        // the release happens on the ground flag instead.
+        if (release > 0.0f && crouching && tti >= 0.0f && tti <= release) {
             ctrl_up();
             crouching = false;
         }
@@ -245,13 +254,13 @@ int  Movement_Key() { return g_key.load(); }
 
 void Movement_SetCrouchLead(float ms) {
     if (ms < 10.0f)  ms = 10.0f;
-    if (ms > 400.0f) ms = 400.0f;
+    if (ms > 500.0f) ms = 500.0f;
     g_crouch_lead.store(ms);
 }
 float Movement_CrouchLead() { return g_crouch_lead.load(); }
 
 void Movement_SetUncrouchLead(float ms) {
-    if (ms < 0.0f)  ms = 0.0f;
+    if (ms < 0.0f)   ms = 0.0f;
     if (ms > 200.0f) ms = 200.0f;
     g_uncrouch_lead.store(ms);
 }
