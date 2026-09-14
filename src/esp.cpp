@@ -102,29 +102,30 @@ void sanitize(char* dst, size_t cap, const char* src, size_t len) {
 struct WeaponName { int id; const char* name; };
 
 constexpr WeaponName kWeapons[] = {
-    { 1, "Deagle" },      { 2, "Dualies" },     { 3, "57" },
-    { 4, "Glock" },       { 5, "Bowie" },       { 7, "AK-47" },
-    { 8, "AUG" },         { 9, "AWP" },         { 10, "FAMAS" },
-    { 11, "Auto Sniper" },{ 12, "Butterfly" },  { 13, "GALIL" },
-    { 14, "M249" },       { 16, "M4A4" },       { 17, "MAC-10" },
-    { 19, "P90" },        { 20, "Mag-7" },      { 23, "MP5-SD" },
-    { 24, "UMP-45" },     { 25, "XM" },         { 26, "PP-Bizon" },
-    { 27, "MAG-7" },      { 28, "Negev" },      { 29, "Sawed-Off" },
-    { 30, "Tec 9" },      { 31, "Zeus" },       { 32, "P2K" },
-    { 33, "MP7" },        { 34, "MP9" },        { 35, "Nova" },
-    { 36, "P250" },       { 38, "Auto Sniper" },{ 39, "SG 553" },
-    { 40, "Scout" },      { 43, "Flashbang" },  { 44, "HE Grenade" },
-    { 45, "Smoke" },      { 46, "Molotov" },    { 47, "Decoy" },
-    { 48, "Incendiary" }, { 49, "C4" },         { 57, "Health Shot" },
-    { 60, "M4A1" },       { 61, "Usp" },        { 63, "CZ" },
-    { 64, "R8" },         { 68, "Knife" },      { 80, "Knife" },
-    { 81, "Knife" },      { 82, "Knife" },      { 83, "Knife" },
+    { 1, "Deagle" },      { 2, "Dualies" },      { 3, "57" },
+    { 4, "Glock" },       { 5, "Bowie" },        { 7, "AK-47" },
+    { 8, "AUG" },         { 9, "AWP" },          { 10, "FAMAS" },
+    { 11, "Auto Sniper" },{ 12, "Butterfly" },   { 13, "GALIL" },
+    { 14, "M249" },       { 16, "M4A4" },        { 17, "MAC-10" },
+    { 19, "P90" },        { 20, "Mag-7" },       { 23, "MP5-SD" },
+    { 24, "UMP-45" },     { 25, "XM" },          { 26, "PP-Bizon" },
+    { 27, "MAG-7" },      { 28, "Negev" },       { 29, "Sawed-Off" },
+    { 30, "Tec 9" },      { 31, "Zeus" },        { 32, "P2K" },
+    { 33, "MP7" },        { 34, "MP9" },         { 35, "Nova" },
+    { 36, "P250" },       { 38, "Auto Sniper" }, { 39, "SG 553" },
+    { 40, "Scout" },      { 43, "Flashbang" },   { 44, "HE Grenade" },
+    { 45, "Smoke" },      { 46, "Molotov" },     { 47, "Decoy" },
+    { 48, "Incendiary" }, { 49, "C4" },          { 57, "Health Shot" },
+    { 60, "M4A1" },       { 61, "Usp" },         { 63, "CZ" },
+    { 64, "R8" },         { 68, "Knife" },       { 80, "Knife" },
+    { 81, "Knife" },      { 82, "Knife" },       { 83, "Knife" },
+    { 500, "Knife" },
 };
 
 const char* weapon_name(int id) {
     for (const WeaponName& w : kWeapons)
         if (w.id == id) return w.name;
-    if ((id >= 500 && id <= 600) || id == 42 || id == 59) return "Knife";
+    if ((id > 500 && id <= 600) || id == 42 || id == 59) return "Knife";
     return nullptr;
 }
 
@@ -151,54 +152,6 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
                               offsets::m_iItemDefinitionIndex);
 }
 
-bool plausible_def(uint16_t id) {
-    return weapon_name(id) != nullptr ||
-           (id >= 1 && id <= 90) ||
-           (id >= 500 && id <= 600);
-}
-
-struct WsvcProbe { uintptr_t off; bool ok; };
-
-// Weapon services offset is discovered at runtime. Both weapons and the bomb
-// carrier read through it, so a wrong hardcoded value made BOTH vanish.
-WsvcProbe find_weapon_services(const Memory& mem, uintptr_t el,
-                               uintptr_t chunk_off, uintptr_t stride,
-                               uintptr_t local_pawn,
-                               const std::vector<uintptr_t>& pawns) {
-    WsvcProbe res{ 0, false };
-
-    auto try_pawn = [&](uintptr_t p, uintptr_t off, bool need_name) -> bool {
-        const uintptr_t ws = mem.read<uintptr_t>(p + off);
-        if (!valid_ptr(ws)) return false;
-
-        const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
-        if (!h || h == 0xFFFFFFFFu) return false;
-
-        const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
-        if (!valid_ptr(w)) return false;
-        if (!plausible_def(item_def_index(mem, w))) return false;
-
-        if (need_name) {
-            char nm[24] = {};
-            if (!read_designer(mem, w, nm, sizeof(nm))) return false;
-        }
-        return true;
-    };
-
-    for (uintptr_t off = 0x1000; off <= 0x1500; off += 8) {
-        if (!try_pawn(local_pawn, off, true)) continue;
-        for (uintptr_t p : pawns) {
-            if (p == local_pawn) continue;
-            if (try_pawn(p, off, false)) {
-                res.off = off;
-                res.ok = true;
-                return res;
-            }
-        }
-    }
-    return res;
-}
-
 struct BE { Vec3 pos; float pad[5]; };
 
 int bone_points(const Memory& mem, uintptr_t arr, const Vec3& origin) {
@@ -218,10 +171,18 @@ int bone_points(const Memory& mem, uintptr_t arr, const Vec3& origin) {
     return good;
 }
 
+bool chain_hits(const Memory& mem, uintptr_t pawn, const Vec3& origin,
+                uintptr_t node_off, uintptr_t arr_off) {
+    const uintptr_t n = mem.read<uintptr_t>(pawn + node_off);
+    if (!valid_ptr(n)) return false;
+    const uintptr_t a = mem.read<uintptr_t>(n + arr_off);
+    if (!valid_ptr(a)) return false;
+    return bone_points(mem, a, origin) >= 20;
+}
+
 bool looks_like_entity(const Memory& mem, uintptr_t ent) {
     if (!valid_ptr(ent)) return false;
-    return valid_ptr(
-        mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode));
+    return valid_ptr(mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode));
 }
 
 } // namespace
@@ -266,7 +227,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static double info_at  = -1e9;
     static bool   layout_locked = false;
 
-    // ---- pawn list, about 10x per second ----
+    // ---- pawn list ----
     if (now - slots_at > 100.0) {
         slots_at = now;
 
@@ -279,10 +240,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         int bestn = -1;
 
         auto try_layout = [&](const L& l, int chunks) {
-            std::vector<uintptr_t> all;
-            std::vector<uintptr_t> got;
+            std::vector<uintptr_t> all, got;
             enumerate_slots(mem, el, l.off, l.stride, chunks, all);
-
             for (uintptr_t e : all) {
                 if (e == local_pawn) continue;
                 const EntHead h = read_ent_head(mem, e);
@@ -311,26 +270,28 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         else           pawns.clear();
     }
 
-    // ---- weapon services, discovered once ----
-    if (!c_.wsvc_ok && now - c_.wsvc_try > 1500.0) {
-        c_.wsvc_try = now;
+    // Weapon services: the radar-verified offset, used directly. A runtime scan
+    // was tried here and found nothing, which is why weapons and the bomb
+    // carrier both disappeared -- they share this pointer.
+    c_.wsvc_ok = true;
+    c_.wsvc = offsets::m_pWeaponServices;
 
-        std::vector<uintptr_t> probe = pawns;
-        if (probe.empty()) probe.push_back(local_pawn);
-
-        const WsvcProbe r = find_weapon_services(
-            mem, el, c_.chunk_off, c_.slot_stride, local_pawn, probe);
-        if (r.ok) {
-            c_.wsvc    = r.off;
-            c_.wsvc_ok = true;
-        }
-    }
-
-    // ---- bone chain ----
+    // ---- bone chain: known seeds, then a bounded scan ----
     if (!c_.bones_ok || c_.bone_fail > 250) {
         if (c_.probe_cd > 0) {
             --c_.probe_cd;
         } else {
+            std::vector<std::pair<uintptr_t, Vec3>> test;
+            if (sane_vec(local_origin))
+                test.push_back({ local_pawn, local_origin });
+            for (uintptr_t p : pawns) {
+                if (test.size() >= 4) break;
+                test.push_back({ p, read_origin(mem, p) });
+            }
+            const int need = (test.size() >= 2) ? 2 : 1;
+
+            bool found = false;
+
             struct Seed { uintptr_t n; uintptr_t a; };
             static const Seed kSeeds[] = {
                 { 0x330, 0x240 }, { 0x338, 0x240 },
@@ -338,36 +299,59 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 { 0x330, 0x1E0 }, { 0x338, 0x1E0 },
             };
 
-            std::vector<std::pair<uintptr_t, Vec3>> test;
-            if (sane_vec(local_origin))
-                test.push_back({ local_pawn, local_origin });
-            for (uintptr_t p : pawns) {
-                if (test.size() >= 3) break;
-                test.push_back({ p, read_origin(mem, p) });
-            }
-
             for (const Seed& s : kSeeds) {
                 int hits = 0;
                 for (const auto& t : test) {
-                    const uintptr_t n = mem.read<uintptr_t>(t.first + s.n);
-                    if (!valid_ptr(n)) break;
-                    const uintptr_t a = mem.read<uintptr_t>(n + s.a);
-                    if (!valid_ptr(a)) break;
-                    if (bone_points(mem, a, t.second) < 20) break;
+                    if (!chain_hits(mem, t.first, t.second, s.n, s.a)) continue;
                     ++hits;
                 }
-                const int need = (test.size() >= 2) ? 2 : 1;
                 if (hits >= need) {
                     c_.bone_node = s.n;
                     c_.bone_arr  = s.a;
-                    c_.bones_ok  = true;
-                    c_.bone_fail = 0;
+                    found = true;
                     break;
                 }
             }
-            c_.probe_cd = 500;
+
+            if (!found) {
+                int best_hits = 0;
+                uintptr_t best_n = 0, best_a = 0;
+
+                for (uintptr_t no = 0x2C0; no <= 0x3A0; no += 8) {
+                    for (uintptr_t ao = 0x180; ao <= 0x300; ao += 8) {
+                        if (!chain_hits(mem, test[0].first, test[0].second,
+                                        no, ao))
+                            continue;
+                        int hits = 1;
+                        for (size_t i = 1; i < test.size(); ++i)
+                            if (chain_hits(mem, test[i].first, test[i].second,
+                                           no, ao))
+                                ++hits;
+                        if (hits > best_hits) {
+                            best_hits = hits;
+                            best_n = no;
+                            best_a = ao;
+                        }
+                    }
+                }
+                if (best_hits >= need) {
+                    c_.bone_node = best_n;
+                    c_.bone_arr  = best_a;
+                    found = true;
+                }
+            }
+
+            if (found) {
+                c_.bones_ok  = true;
+                c_.bone_fail = 0;
+            }
+            c_.probe_cd = 375;
         }
     }
+
+    diag_bones_ok  = c_.bones_ok;
+    diag_bone_node = c_.bone_node;
+    diag_bone_arr  = c_.bone_arr;
 
     // ---- sample every live pawn ----
     std::vector<Track> fresh;
@@ -400,7 +384,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                         if (std::fabs(q.y - origin.y) > 60.0f) continue;
                         const float dz = q.z - origin.z;
                         if (dz < -25.0f || dz > 90.0f) continue;
-                        s.bones[i]  = q;
+                        s.bones[i]   = q;
                         s.bone_ok[i] = true;
                         ++cnt;
                     }
@@ -439,7 +423,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ---- names, weapons, bomb carrier ----
+    // ---- names, weapons, carrier ----
     if (now - info_at > 300.0) {
         info_at = now;
 
@@ -461,8 +445,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                     }
                 }
             }
-
-            if (!c_.wsvc_ok) continue;
 
             const uintptr_t ws = mem.read<uintptr_t>(t.pawn + c_.wsvc);
             if (!valid_ptr(ws)) continue;
@@ -513,8 +495,13 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             mem.read<uintptr_t>(c4 + offsets::m_pGameSceneNode);
 
         if (valid_ptr(node)) {
+            // Candidate offsets. A candidate has to hold a near-constant Z for
+            // many samples before it is trusted: a planted bomb does not move,
+            // so anything that drifts is the wrong bytes. Nothing is drawn
+            // until one passes, because a box in a wall is worse than no box.
             static const uintptr_t kCand[] = {
-                offsets::m_vecAbsOrigin, 0xD0, 0xC8,
+                offsets::m_vecAbsOrigin, 0xD0, 0xC8, 0xD8, 0xE0,
+                0x1D0, 0x1D8, 0x3C, 0xE4,
             };
 
             auto accept = [&](const Vec3& v) {
@@ -548,16 +535,17 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                     if (!read_pos(off, v) || !accept(v)) continue;
 
                     if (c_.c4_off == off && c_.c4_last_t > 0.0 &&
-                        std::fabs(v.z - c_.c4_last.z) < 0.5f) {
+                        std::fabs(v.z - c_.c4_last.z) < 0.2f) {
                         ++c_.c4_stable;
-                    } else if (c_.c4_off != off) {
+                    } else {
                         c_.c4_off = off;
                         c_.c4_stable = 1;
                     }
                     c_.c4_last = v;
                     c_.c4_last_t = now;
 
-                    if (c_.c4_stable >= 3) {
+                    // 12 samples is roughly 100 ms of a motionless bomb.
+                    if (c_.c4_stable >= 12) {
                         c_.c4_ok = true;
                         bomb = v;
                         bomb_on = true;
