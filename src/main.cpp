@@ -18,7 +18,13 @@
 #include "aim.h"
 #include "movement.h"
 
-static ESP g_esp;
+// NOTE: g_esp and g_local_team must NOT be static. aim.cpp declares them
+// extern so the trigger can reuse the same ESP instance and the same local-team
+// value rather than keeping its own copies. A `static` at file scope gives
+// INTERNAL linkage, so the symbols would not exist for the linker at all --
+// which is exactly the LNK2019 pair this replaces.
+ESP g_esp;
+int  g_local_team = 0;
 static bool g_running = true;
 bool g_menu_open = false;
 bool g_vsync = false;
@@ -71,7 +77,6 @@ static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
 // g_screen_w and friends did not exist where the config code referenced them.
 static int  g_screen_w = 1920;
 static int  g_screen_h = 1080;
-static int  g_local_team = 0;
 static int  g_detected_hz = 0;
 static bool g_limit_fps = true;
 static int  g_fps_override = 0;
