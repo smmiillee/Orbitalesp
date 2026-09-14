@@ -66,11 +66,28 @@ namespace offsets {
     constexpr uintptr_t m_designerLvl1 = 0x10;
     constexpr uintptr_t m_designerPtr  = 0x20;
 
-    // ── ground signals for bhop ───────────────────────────────────────────
-    // Not verified for this build, so both are GRADED against the local
-    // player's Z (m_vOldOrigin) before being trusted.
+    // ── ground signals ────────────────────────────────────────────────────
+    // Not verified for this build, so both are GRADED against Z before being
+    // trusted. Bit 0 of m_fFlags does NOT report FL_ONGROUND on the local
+    // predicted pawn (it read 0x10000 while standing), which is why nothing
+    // here may trust it directly.
     constexpr uintptr_t m_fFlags        = 0x3F4;
     constexpr uintptr_t m_hGroundEntity = 0x530;
+    constexpr uint32_t  kFlagOnGround   = 1u << 0;
+    constexpr uint32_t  kFlagDucking    = 1u << 2;
+    constexpr uint32_t  kGroundEntityNone = 0xFFFFFFFFu;
+
+    // ── visibility (APPROXIMATE, see aim.cpp) ─────────────────────────────
+    // m_entitySpottedState is RADAR state, not line of sight. Schema-confirmed
+    // offset for a current build:
+    //   C_CSPlayerPawn::m_entitySpottedState   = 0x1C60
+    //   EntitySpottedState_t::m_bSpottedByMask = 0x0C  (uint32[2])
+    // So the mask sits at pawn + 0x1C6C.
+    //
+    // Older builds used 0x23D0. If the vis check reports unavailable every
+    // session, this offset has moved again.
+    constexpr uintptr_t m_entitySpottedState = 0x1C60;
+    constexpr uintptr_t m_bSpottedByMask     = 0x0C;
 
     // ── skeleton ──────────────────────────────────────────────────────────
     constexpr uintptr_t m_boneStride   = 0x20;
