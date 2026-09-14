@@ -1,30 +1,13 @@
 // --- src/bhop.cpp ---
-// Bhop by KEYSTROKE INJECTION ONLY. There is no memory write anywhere in this
-// file: the project no longer writes to cs2.exe at all.
+// Bhop by INPUT INJECTION ONLY. Nothing in this file writes to cs2.exe.
 //
-//   the injected key carries "+jump", and a jump needs a fresh PRESS edge, so
-//   what matters is generating exactly one clean edge per landing.
+//  SCROLL  - spam mouse-wheel events while the gate is held. Timing-agnostic:
+//            with ~2 events per 15.6 ms tick, one almost certainly falls in the
+//            landing window. This is the community-standard technique.
+//  KEY     - press/release a key on each observed landing, as a second chance.
 //
-// ── WHY YOUR HELD KEY IS SWALLOWED ───────────────────────────────────────
-// Holding space makes the engine's own +jump stay down, and a held button
-// cannot produce a new jump. So while bhop is driving, the low-level hook
-// swallows your physical spacebar and the game's jump input comes only from us.
-// Your held key becomes a gate; the edges come from here.
-//
-// ── THE TWO STRATEGIES ───────────────────────────────────────────────────
-// PLAIN: press when the ground flag reads grounded. The flag is written once
-// per tick (~15.6 ms), so detection can arrive after the landing tick.
-//
-// PREDICTIVE: estimate the landing from vertical velocity and press early, so
-// the press is already down when the engine samples input for that tick.
-//   tti = (z - ground_z) / (-vz)        time until the predicted impact
-//   press when tti <= lead              (lead defaults to one tick, ~16 ms)
-// ground_z is the height you were last standing at, and vz comes from finite
-// differences of Z between DISTINCT samples -- sampling only on change keeps the
-// velocity clean, since the game only writes Z once per tick.
-//
-// The observed ground flag always remains a fallback, so prediction can only
-// add presses, never remove them.
+// The physical spacebar is swallowed while driving, because a held +jump cannot
+// produce a new press edge and would block everything we inject.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -44,34 +27,31 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
-// Fallback lead, one tick at 64 Hz. Overridable from the menu.
-constexpr float kDefaultLeadMs = 16.0f;
+// One wheel event every 8 ms is ~125/s, i.e. ~2 per 64-tick, which is enough
+// coverage without flooding the input queue.
+constexpr double kDefaultScrollMs = 8.0;
 
-// How long a press is held once started. Long enough to span the landing tick,
+// How long a KEY-mode press is held. Long enough to span the landing tick,
 // short enough that the next landing still gets a fresh edge.
 constexpr double kPressHoldMs = 30.0;
 
-std::atomic<bool> g_stop{false}, g_started{false};
-std::atomic<bool> g_enabled{true};
-std::atomic<bool> g_predict{false};
-std::atomic<bool> g_separate_key{false};
-std::atomic<float> g_lead_ms{kDefaultLeadMs};
+std::atomic<bool>   g_stop{false}, g_started{false};
+std::atomic<bool>   g_enabled{true}, g_scroll{true}, g_key_inject{false};
+std::atomic<double> g_interval_ms{kDefaultScrollMs};
 
 // Diagnostics.
-std::atomic<bool>  g_dbg_ground{false}, g_dbg_focused{false};
-std::atomic<bool>  g_dbg_space{false},  g_dbg_driving{false};
-std::atomic<bool>  g_dbg_suppress{false};
-std::atomic<int>   g_dbg_signals{0},    g_dbg_edges{0}, g_dbg_predicted{0};
-std::atomic<float> g_dbg_vz{0.0f},      g_dbg_tti{-1.0f};
+std::atomic<bool> g_dbg_ground{false},  g_dbg_focused{false};
+std::atomic<bool> g_dbg_space{false},   g_dbg_driving{false};
+std::atomic<bool> g_dbg_suppress{false}, g_dbg_hook{false};
+std::atomic<int>  g_dbg_signals{0},     g_dbg_scrolls{0}, g_dbg_edges{0};
 
 // Keyboard hook.
 std::atomic<bool>  g_phys_space{false};   // physical (non-injected) spacebar
-std::atomic<bool>  g_hook_ok{false};
 std::atomic<bool>  g_suppress{false};     // swallow the physical spacebar
 std::atomic<DWORD> g_hook_tid{0};
 HHOOK g_hook = nullptr;
 
-std::thread g_bhop_thread, g_hook_thread;
+std::thread g_run_thread, g_hook_thread;
 
 double now_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -79,9 +59,8 @@ double now_ms() {
                std::chrono::steady_clock::now() - t0).count();
 }
 
-// ~1 ms sleep that actually works. timeBeginPeriod(1) is what makes this honest:
-// without it Windows quantises sleeps to ~15.6 ms, which is a whole game tick.
-// The spin covers the last fraction either way.
+// ~1 ms sleep that actually works. timeBeginPeriod(1) is what makes this honest;
+// without it Windows quantises sleeps to ~15.6 ms, a whole game tick.
 void wait_ms(int ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(ms);
@@ -102,9 +81,9 @@ bool cs2_focused() {
 
 // ── keyboard hook ────────────────────────────────────────────────────────
 //   1. track the PHYSICAL spacebar. Injected events carry LLKHF_INJECTED, so
-//      ours are ignored -- the only way to read your real key while injecting.
-//   2. while bhop is driving, swallow the physical spacebar so the engine's
-//      +jump cannot stay held and block our press edges.
+//      ours are ignored.
+//   2. while driving, SWALLOW the physical spacebar so the engine's +jump
+//      cannot stay held and block our injected edges.
 LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
@@ -132,7 +111,7 @@ void hook_thread_main() {
     g_hook_tid.store(GetCurrentThreadId());
 
     g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, nullptr, 0);
-    g_hook_ok.store(g_hook != nullptr);
+    g_dbg_hook.store(g_hook != nullptr);
 
     // A low-level hook is delivered on the thread that installed it, so this
     // must pump messages or the callback never runs.
@@ -143,19 +122,17 @@ void hook_thread_main() {
     }
 
     if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
-    g_hook_ok.store(false);
+    g_dbg_hook.store(false);
 }
 
+// Physical space state. The hook is authoritative; GetAsyncKeyState is only a
+// fallback if the hook could not be installed.
 bool space_held() {
-    if (g_hook_ok.load()) return g_phys_space.load();
+    if (g_dbg_hook.load()) return g_phys_space.load();
     return (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
 }
 
 // ── ground state ─────────────────────────────────────────────────────────
-// Z comes from m_vOldOrigin, which is verified working. m_fFlags and
-// m_hGroundEntity are not verified for this build, so each is only trusted
-// after it has been seen set while Z is static AND clear while Z is moving --
-// a wrong offset then degrades the verdict instead of breaking it.
 struct GroundWatch {
     bool   have_z = false;
     float  z = 0.0f;
@@ -185,6 +162,7 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
         if (hge == 0xFFFFFFFFu)  ++g_gw.hge_a;
     }
 
+    // A signal is trusted only after it has been seen in BOTH states.
     if (!g_gw.flag_ok && g_gw.flag_g >= 6 && g_gw.flag_a >= 6) g_gw.flag_ok = true;
     if (!g_gw.hge_ok  && g_gw.hge_g  >= 6 && g_gw.hge_a  >= 6) g_gw.hge_ok  = true;
 
@@ -193,126 +171,46 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
 
+    // The flag is instance-accurate where the Z test needs a 22 ms window.
     bool ground;
-    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;   // instance-accurate
-    else              ground = g_gw.z_ground;     // needs a 22 ms window
+    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
+    else              ground = g_gw.z_ground;
     if (g_gw.hge_ok) ground = ground || (hge != 0xFFFFFFFFu);
 
     g_dbg_ground.store(ground);
     return ground;
 }
 
-// ── landing prediction ───────────────────────────────────────────────────
-// Velocity is taken from finite differences of Z between DISTINCT samples.
-// The game only writes Z once per tick, so sampling on change keeps vz clean
-// instead of showing the stair-steps you would get from polling faster.
-struct Predict {
-    bool   have_z = false;
-    float  last_z = 0.0f;
-    double last_t = 0.0;
-    float  vz = 0.0f;           // units/sec, positive = rising
-    float  ground_z = 0.0f;     // height last stood at
-    bool   have_ground_z = false;
-    bool   armed = false;       // already pressed for this airtime
-};
-Predict g_pr;
+// ── injection ────────────────────────────────────────────────────────────
 
-// Returns true when we should press NOW because a landing is imminent.
-bool predict_step(const Memory& mem, uintptr_t pawn, float z, bool ground,
-                  float lead_ms) {
-    const double now = now_ms();
-
-    if (ground) {
-        // Refresh the reference height while standing, so slopes and small
-        // steps are tracked. Re-arming here is what allows the next airtime to
-        // press again.
-        g_pr.ground_z = z;
-        g_pr.have_ground_z = true;
-        g_pr.armed = false;
-        g_pr.vz = 0.0f;
-        g_pr.last_z = z;
-        g_pr.last_t = now;
-        g_pr.have_z = true;
-        g_dbg_vz.store(0.0f);
-        g_dbg_tti.store(-1.0f);
-        return false;
-    }
-
-    if (!g_pr.have_z) {
-        g_pr.have_z = true;
-        g_pr.last_z = z;
-        g_pr.last_t = now;
-        return false;
-    }
-
-    // Only recompute when Z actually moved, i.e. when a new tick's value
-    // arrived. Otherwise dt would shrink without new information and the
-    // velocity would spike.
-    if (std::fabs(z - g_pr.last_z) >= 0.05f) {
-        const double dt = (now - g_pr.last_t) / 1000.0;
-        if (dt > 0.0005 && dt < 0.25) {
-            const float v = static_cast<float>((z - g_pr.last_z) / dt);
-            // Light smoothing: enough to steady the estimate, not enough to lag
-            // a real landing.
-            g_pr.vz = g_pr.vz * 0.5f + v * 0.5f;
-        }
-        g_pr.last_z = z;
-        g_pr.last_t = now;
-    }
-
-    g_dbg_vz.store(g_pr.vz);
-
-    if (!g_pr.have_ground_z || g_pr.vz >= -1.0f) {
-        g_dbg_tti.store(-1.0f);
-        return false;
-    }
-
-    // Falling towards the height we last stood at.
-    const float dz = z - g_pr.ground_z;
-    if (dz <= 0.0f) {
-        // Already at or below the reference height -- landing is now.
-        g_dbg_tti.store(0.0f);
-        return true;
-    }
-
-    const float tti_ms = (dz / -g_pr.vz) * 1000.0f;
-    g_dbg_tti.store(tti_ms);
-
-    if (g_pr.armed) return false;          // one press per airtime
-    if (tti_ms <= lead_ms) {
-        g_pr.armed = true;
-        return true;
-    }
-    return false;
+// One wheel notch. WHEEL_DELTA (120) is one click; negative scrolls down.
+// With `bind mwheeldown +jh` in game this is a full press+release of +jump.
+void inject_wheel() {
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    in.mi.mouseData = static_cast<DWORD>(-WHEEL_DELTA);
+    SendInput(1, &in, sizeof(INPUT));
 }
 
-// ── output ───────────────────────────────────────────────────────────────
-// +jump is bound to SPACE by default. The separate-key option injects RIGHT
-// instead, for cases where re-injecting the key you are physically holding
-// behaves oddly. Either way the physical key stays swallowed, because a held
-// +jump cannot produce a new jump.
-int inject_vk() {
-    return g_separate_key.load() ? VK_RIGHT : VK_SPACE;
-}
-
-void inject(bool down) {
+// KEY mode. Send only on a state CHANGE so we produce clean edges.
+void inject_key(bool down) {
     static bool s_down = false;
     if (down == s_down) return;
     s_down = down;
 
     INPUT in{};
     in.type = INPUT_KEYBOARD;
-    in.ki.wVk = static_cast<WORD>(inject_vk());
-    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(inject_vk(), MAPVK_VK_TO_VSC));
+    in.ki.wVk = VK_SPACE;
+    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
     in.ki.dwFlags = down ? 0u : KEYEVENTF_KEYUP;
     SendInput(1, &in, sizeof(INPUT));
 }
 
 void run_thread() {
     uintptr_t pawn = 0;
-    double    pawn_at = 0.0, last_sample = 0.0;
-    bool      ground = false;
-    bool      out_down = false;
+    double    pawn_at = 0.0, last_sample = 0.0, next_scroll = 0.0;
+    bool      ground = false, out_down = false, prev_ground = false;
     double    press_until = 0.0;
 
     while (!g_stop.load()) {
@@ -326,16 +224,15 @@ void run_thread() {
         g_dbg_focused.store(focused);
         g_dbg_space.store(space);
 
-        // Swallow your physical key only while we are actually driving, so
-        // space behaves normally everywhere else.
-        const bool suppress = active;
-        g_suppress.store(suppress);
-        g_dbg_suppress.store(suppress);
+        // Swallow the physical key only while we are actually driving, so space
+        // behaves normally everywhere else.
+        g_suppress.store(active);
+        g_dbg_suppress.store(active);
 
         if (!active) {
-            if (out_down) { inject(false); out_down = false; }
+            if (out_down) { inject_key(false); out_down = false; }
             press_until = 0.0;
-            g_pr.armed = false;
+            prev_ground = false;
             g_dbg_driving.store(false);
             continue;
         }
@@ -346,53 +243,42 @@ void run_thread() {
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             pawn_at = now;
         }
-        if (!pawn) { if (out_down) { inject(false); out_down = false; } continue; }
+        if (!pawn) { if (out_down) { inject_key(false); out_down = false; } continue; }
 
-        // 2 ms sampling. Must be comfortably faster than a 15.6 ms tick for
-        // prediction to have any resolution at all.
-        const float z = g_mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
-        bool predicted_now = false;
-
+        // Sample faster than a tick so a landing is never missed by more than
+        // the tick itself.
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
-        // ── PREDICTION ───────────────────────────────────────────────────
-        if (g_predict.load()) {
-            predicted_now = predict_step(g_mem, pawn, z, ground,
-                                         g_lead_ms.load());
-        } else {
-            g_dbg_tti.store(-1.0f);
-            g_pr.armed = false;
-            // Keep the reference height fresh even when prediction is off, so
-            // enabling it later does not need a warm-up.
-            if (ground) { g_pr.ground_z = z; g_pr.have_ground_z = true; }
+        // ── SCROLL SPAM ──────────────────────────────────────────────────
+        // Continuous while the gate is held. This is what gives coverage: we
+        // are not trying to hit one tick, we are sweeping all of them.
+        if (g_scroll.load() && now >= next_scroll) {
+            next_scroll = now + g_interval_ms.load();
+            inject_wheel();
+            g_dbg_scrolls.fetch_add(1);
         }
 
-        // ── PRESS DECISIONS ──────────────────────────────────────────────
-        // A press window is opened by either a predicted imminent landing or by
-        // actually observing the ground flag. The window is what guarantees the
-        // press is still down when the engine samples input for that tick.
-        bool start = false;
-        if (predicted_now) { start = true; g_dbg_predicted.fetch_add(1); }
-        if (ground)        { start = true; }
+        // ── KEY EDGE (optional second chance) ────────────────────────────
+        if (g_key_inject.load()) {
+            if (ground && !prev_ground) {
+                press_until = now + kPressHoldMs;
+                g_dbg_edges.fetch_add(1);
+            }
+            prev_ground = ground;
 
-        if (start && now >= press_until)
-            press_until = now + kPressHoldMs;
-
-        const bool want = now < press_until;
-
-        if (want != out_down) {
-            inject(want);
-            if (want) g_dbg_edges.fetch_add(1);
+            const bool want = ground || (now < press_until);
+            if (want != out_down) inject_key(want);
+            out_down = want;
         }
-        out_down = want;
+
         g_dbg_driving.store(true);
     }
 
     g_suppress.store(false);
-    inject(false);
+    inject_key(false);
 }
 
 } // namespace
@@ -402,24 +288,23 @@ void Bhop_Init() {
     bool expected = false;
     if (!g_started.compare_exchange_strong(expected, true)) return;
 
-    // Ask Windows for a 1 ms timer so sleep(1) is 1 ms and not 15.6 ms. This is
-    // the one genuinely useful thing in the cs2-bhop reference.
+    // Ask Windows for a 1 ms timer so sleep(1) is 1 ms, not 15.6 ms.
     timeBeginPeriod(1);
 
     g_stop.store(false);
     g_hook_thread = std::thread(hook_thread_main);
-    g_bhop_thread = std::thread(run_thread);
+    g_run_thread  = std::thread(run_thread);
 }
 
 void Bhop_Shutdown() {
     g_stop.store(true);
     g_suppress.store(false);
-    inject(false);
+    inject_key(false);
 
     if (g_hook_tid.load())
         PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
 
-    if (g_bhop_thread.joinable()) g_bhop_thread.join();
+    if (g_run_thread.joinable())  g_run_thread.join();
     if (g_hook_thread.joinable()) g_hook_thread.join();
 
     timeEndPeriod(1);
@@ -428,25 +313,27 @@ void Bhop_Shutdown() {
 
 BhopDebug Bhop_GetDebug() {
     BhopDebug d;
-    d.enabled      = g_enabled.load();
-    d.predict      = g_predict.load();
-    d.separate_key = g_separate_key.load();
-    d.on_ground    = g_dbg_ground.load();
-    d.focused      = g_dbg_focused.load();
-    d.space_held   = g_dbg_space.load();
-    d.hook_ok      = g_hook_ok.load();
-    d.driving      = g_dbg_driving.load();
-    d.suppressing  = g_dbg_suppress.load();
-    d.signals      = g_dbg_signals.load();
-    d.edges        = g_dbg_edges.load();
-    d.predicted    = g_dbg_predicted.load();
-    d.vz           = g_dbg_vz.load();
-    d.tti          = g_dbg_tti.load();
+    d.enabled     = g_enabled.load();
+    d.scroll      = g_scroll.load();
+    d.key_inject  = g_key_inject.load();
+    d.on_ground   = g_dbg_ground.load();
+    d.focused     = g_dbg_focused.load();
+    d.space_held  = g_dbg_space.load();
+    d.hook_ok     = g_dbg_hook.load();
+    d.driving     = g_dbg_driving.load();
+    d.suppressing = g_dbg_suppress.load();
+    d.signals     = g_dbg_signals.load();
+    d.scrolls     = g_dbg_scrolls.load();
+    d.edges       = g_dbg_edges.load();
     return d;
 }
 
-void  Bhop_SetEnabled(bool on)     { g_enabled.store(on); if (!on) inject(false); }
-void  Bhop_SetPredict(bool on)     { g_predict.store(on); }
-void  Bhop_SetSeparateKey(bool on) { g_separate_key.store(on); inject(false); }
-void  Bhop_SetLead(float ms)       { g_lead_ms.store(ms); }
-float Bhop_Lead()                  { return g_lead_ms.load(); }
+void  Bhop_SetEnabled(bool on)      { g_enabled.store(on); if (!on) inject_key(false); }
+void  Bhop_SetScroll(bool on)       { g_scroll.store(on); }
+void  Bhop_SetKeyInject(bool on)    { g_key_inject.store(on); if (!on) inject_key(false); }
+void  Bhop_SetScrollInterval(float ms) {
+    if (ms < 2.0f)  ms = 2.0f;
+    if (ms > 50.0f) ms = 50.0f;
+    g_interval_ms.store(static_cast<double>(ms));
+}
+float Bhop_ScrollInterval() { return static_cast<float>(g_interval_ms.load()); }
