@@ -144,11 +144,15 @@ static void save_config() {
     _wfopen_s(&f, path, L"w");
     if (!f) { OrbitalLog("config save FAILED"); return; }
 
-#define W_B(f) fprintf(f, #f "=%d\n", g_cfg.f ? 1 : 0)
-#define W_I(f) fprintf(f, #f "=%d\n", g_cfg.f)
-#define W_F(f) fprintf(f, #f "=%.4f\n", g_cfg.f)
-#define W_C(f) fprintf(f, #f "=%.4f %.4f %.4f %.4f\n", \
-                       g_cfg.f.x, g_cfg.f.y, g_cfg.f.z, g_cfg.f.w)
+// The macro parameter is 'field', NOT 'f'. Using 'f' collides with the FILE*
+// argument, so fprintf(f, ...) expands to fprintf(esp_boxes, ...) and the field
+// name gets reported as an undeclared identifier.
+#define W_B(field) fprintf(f, #field "=%d\n", g_cfg.field ? 1 : 0)
+#define W_I(field) fprintf(f, #field "=%d\n", g_cfg.field)
+#define W_F(field) fprintf(f, #field "=%.4f\n", g_cfg.field)
+#define W_C(field) fprintf(f, #field "=%.4f %.4f %.4f %.4f\n", \
+                           g_cfg.field.x, g_cfg.field.y, \
+                           g_cfg.field.z, g_cfg.field.w)
 
     W_B(esp_boxes); W_B(esp_skeleton); W_B(esp_head_dot);
     W_B(esp_name); W_B(esp_weapon); W_B(esp_health);
