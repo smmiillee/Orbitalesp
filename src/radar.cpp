@@ -1,28 +1,51 @@
 // --- src/radar.cpp ---
-#include "radar.h"
+// Radar launcher.
+//
+// The radar is a separate app (orbitalweb) that runs its own local server on
+// port 3000. This does NOT embed it -- it finds this machine's LAN IPv4 and
+// opens a browser at http://<ip>:3000 so the radar is reachable from another
+// device on the same network.
+//
+// No injection, no memory access: this is a convenience button.
 
-#include <Windows.h>
+// *** HEADER ORDER MATTERS ***
+// winsock2.h MUST come before windows.h, otherwise windows.h pulls in the old
+// winsock.h and the two conflict. And shellapi.h must be included EXPLICITLY:
+// the build defines WIN32_LEAN_AND_MEAN, which makes windows.h skip it, so
+// ShellExecuteA would be undeclared.
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <Windows.h>
+#include <shellapi.h>
 #include <iphlpapi.h>
+
+#include "radar.h"
+
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <thread>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 namespace {
 
-std::atomic<int>  g_port{3000};
-std::atomic<bool> g_opened{false}, g_failed{false};
-std::atomic<bool> g_started{false};
+std::atomic<int>    g_port{3000};
+std::atomic<double> g_flash_until{0.0};   // ms timestamp
+std::atomic<bool>   g_flash_ok{false};
+std::atomic<bool>   g_started{false};
 
 char g_ipv4[64] = "";
 
-// Pick this machine's LAN IPv4: a non-loopback, non-APIPA IPv4 address. This is
-// the address another device on the same network can reach.
+double now_ms() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+}
+
+// This machine's LAN IPv4: a non-loopback, non-APIPA address. This is what
+// another device on the same network can reach.
 bool find_lan_ipv4(char* out, size_t cap) {
     out[0] = '\0';
 
@@ -44,15 +67,15 @@ bool find_lan_ipv4(char* out, size_t cap) {
 
     bool ok = false;
     if (ret == NO_ERROR) {
-        for (PIP_ADAPTER_ADDRESSES a = addrs; a; a = a->Next) {
+        for (PIP_ADAPTER_ADDRESSES a = addrs; a && !ok; a = a->Next) {
             if (a->OperStatus != IfOperStatusUp) continue;
+
             for (PIP_ADAPTER_UNICAST_ADDRESS ua = a->FirstUnicastAddress;
                  ua; ua = ua->Next) {
                 if (!ua->Address.lpSockaddr) continue;
                 if (ua->Address.lpSockaddr->sa_family != AF_INET) continue;
 
-                const auto* in4 =
-                    (sockaddr_in*)ua->Address.lpSockaddr;
+                const sockaddr_in* in4 = (const sockaddr_in*)ua->Address.lpSockaddr;
                 char buf[INET_ADDRSTRLEN] = "";
                 if (!inet_ntop(AF_INET, &in4->sin_addr, buf, sizeof(buf)))
                     continue;
@@ -65,7 +88,6 @@ bool find_lan_ipv4(char* out, size_t cap) {
                 ok = true;
                 break;
             }
-            if (ok) break;
         }
     }
 
@@ -75,25 +97,30 @@ bool find_lan_ipv4(char* out, size_t cap) {
 
 void refresh() {
     char ip[64] = "";
-    if (find_lan_ipv4(ip, sizeof(ip))) {
+    if (find_lan_ipv4(ip, sizeof(ip)))
         std::snprintf(g_ipv4, sizeof(g_ipv4), "%s", ip);
-    }
+}
+
+void build_url(char* out, size_t cap) {
+    const int port = g_port.load();
+    if (g_ipv4[0]) std::snprintf(out, cap, "http://%s:%d", g_ipv4, port);
+    else           std::snprintf(out, cap, "http://127.0.0.1:%d", port);
 }
 
 void open_url(const char* url) {
     HINSTANCE r = ShellExecuteA(nullptr, "open", url, nullptr, nullptr,
                                 SW_SHOWNORMAL);
     const bool ok = ((INT_PTR)r > 32);
-    g_opened.store(ok);
-    g_failed.store(!ok);
+
+    // Sticky for 2 seconds rather than one frame, so the message is readable.
+    g_flash_ok.store(ok);
+    g_flash_until.store(now_ms() + 2000.0);
 }
 
 } // namespace
 
 void Radar_Init() {
     if (g_started.exchange(true)) return;
-    // ShellExecuteA needs no explicit COM init; the resolver needs nothing
-    // either, so there is no background thread to own here.
     refresh();
 }
 
@@ -104,35 +131,20 @@ void Radar_Shutdown() {
 RadarInfo Radar_Get() {
     RadarInfo info;
     std::snprintf(info.ipv4, sizeof(info.ipv4), "%s", g_ipv4);
+    info.port = g_port.load();
+    build_url(info.url, sizeof(info.url));
 
-    const int port = g_port.load();
-    info.port = port;
-    if (g_ipv4[0])
-        std::snprintf(info.url, sizeof(info.url), "http://%s:%d",
-                      g_ipv4, port);
-    else
-        std::snprintf(info.url, sizeof(info.url), "http://127.0.0.1:%d", port);
-
-    info.opened = g_opened.load();
-    info.failed = g_failed.load();
+    const bool live = now_ms() < g_flash_until.load();
+    info.opened = live && g_flash_ok.load();
+    info.failed = live && !g_flash_ok.load();
     return info;
 }
 
 void Radar_Start() {
     refresh();
-    const int port = g_port.load();
     char url[128];
-    if (g_ipv4[0])
-        std::snprintf(url, sizeof(url), "http://%s:%d", g_ipv4, port);
-    else
-        std::snprintf(url, sizeof(url), "http://127.0.0.1:%d", port);
-
+    build_url(url, sizeof(url));
     open_url(url);
-
-    // The flash flags are one-shot, cleared on the next read.
-    std::thread([] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }).detach();
 }
 
 void Radar_SetPort(int port) {
