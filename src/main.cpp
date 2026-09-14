@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -53,8 +54,8 @@ void OrbitalLog(const char* fmt, ...) {
     fflush(g_log);
 }
 
-// Path helper: a file next to the exe, falling back to C:\ if that folder is
-// not writable (Program Files, for instance).
+// A file next to the exe, falling back to C:\ if that folder is not writable
+// (Program Files, for instance).
 static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
     out[0] = L'\0';
     wchar_t exe[MAX_PATH]{};
@@ -82,7 +83,7 @@ struct Config {
     bool  esp_show_team    = false;
     float box_thickness = 0.5f;
 
-    // Colours -- one per visual.
+    // ESP colours.
     bool   team_colors   = false;
     ImVec4 color_enemy   = { 1.00f, 0.15f, 0.15f, 1.00f };
     ImVec4 color_team    = { 0.20f, 0.90f, 0.35f, 1.00f };
@@ -95,18 +96,17 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- timing is locked in bhop.cpp, so only the toggle is configured.
-    bool  bh_enabled = false;
-
     // Menu skin.
     ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };  // the blue bar
     ImVec4 menu_button = { 0.88f, 0.80f, 0.55f, 1.00f };
     ImVec4 menu_slider = { 0.55f, 0.55f, 0.55f, 1.00f };
+
+    // Bhop -- timing is locked in bhop.cpp, so only the toggle is configured.
+    bool bh_enabled = false;
 } g_cfg;
 
 // ── config file ──────────────────────────────────────────────────────────
-// Plain key=value text next to the exe. Simple on purpose: it is trivial to
-// read, hand-edit and diff.
+// Plain key=value text next to the exe: trivial to read, hand-edit and diff.
 static void save_config() {
     wchar_t path[MAX_PATH]{};
     sidecar_path(path, MAX_PATH, L"orbital.cfg");
@@ -116,30 +116,28 @@ static void save_config() {
     if (!f) { OrbitalLog("config save FAILED"); return; }
 
 #define W_B(field) fprintf(f, #field "=%d\n", g_cfg.field ? 1 : 0)
-#define W_I(field) fprintf(f, #field "=%d\n", g_cfg.field)
 #define W_F(field) fprintf(f, #field "=%.4f\n", g_cfg.field)
 #define W_C(field) fprintf(f, #field "=%.4f %.4f %.4f %.4f\n", \
                            g_cfg.field.x, g_cfg.field.y, \
                            g_cfg.field.z, g_cfg.field.w)
 
-    W_B(esp_boxes);      W_B(esp_skeleton);  W_B(esp_head_dot);
-    W_B(esp_name);       W_B(esp_weapon);    W_B(esp_health);
-    W_B(esp_distance);   W_B(esp_bomb);
+    W_B(esp_boxes);        W_B(esp_skeleton);  W_B(esp_head_dot);
+    W_B(esp_name);         W_B(esp_weapon);    W_B(esp_health);
+    W_B(esp_distance);     W_B(esp_bomb);
     W_B(esp_show_enemies); W_B(esp_show_team);
     W_F(box_thickness);
 
     W_B(team_colors);
-    W_C(color_enemy);  W_C(color_team);    W_C(color_box);
-    W_C(color_skel);   W_C(color_head);    W_C(color_name);
-    W_C(color_weapon); W_C(color_dist);    W_C(color_bomb);
+    W_C(color_enemy);  W_C(color_team);   W_C(color_box);
+    W_C(color_skel);   W_C(color_head);   W_C(color_name);
+    W_C(color_weapon); W_C(color_dist);   W_C(color_bomb);
     W_C(color_carrier);
 
-    W_C(menu_title);   W_C(menu_button);   W_C(menu_slider);
+    W_C(menu_title);   W_C(menu_button);  W_C(menu_slider);
 
     W_B(bh_enabled);
 
 #undef W_B
-#undef W_I
 #undef W_F
 #undef W_C
 
@@ -164,7 +162,6 @@ static void load_config() {
         const char* val = eq + 1;
 
         auto b = [&](bool& field)  { field = (atoi(val) != 0); };
-        auto i = [&](int& field)   { field = atoi(val); };
         auto s = [&](float& field) { field = static_cast<float>(atof(val)); };
         auto c = [&](ImVec4& field) {
             float r = 0, g = 0, bl = 0, a = 1;
@@ -240,8 +237,9 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
 // ── game window lookup ───────────────────────────────────────────────────
 // FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
 // keep the game window in front of its own detached console -- taking the first
-// match landed us on a 192x456 console. So we enumerate every SDL window, log
-// them all, and pick the best: titled first, then largest client area.
+// match landed us on a 192x456 console window. So we enumerate every SDL
+// window, log them all, and pick the best: titled first, then largest client
+// area, with small windows penalised.
 struct WindowCand {
     HWND hwnd;
     int  w, h;
@@ -344,9 +342,6 @@ static constexpr int kSkeleton[][2] = {
 
 static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
-    Bhop_SetLeadMs(g_cfg.bh_lead_ms);
-    Bhop_SetHoldMs(g_cfg.bh_hold_ms);
-    Bhop_SetRetryMs(g_cfg.bh_retry_ms);
 }
 
 void memory_thread() {
@@ -403,6 +398,8 @@ void render_esp(ImDrawList* dl) {
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
 
+        // Text spacing scales with the box and is clamped, so labels stay just
+        // outside the box at every distance.
         float gap = bh * 0.06f;
         if (gap < 2.0f) gap = 2.0f;
         if (gap > 8.0f) gap = 8.0f;
@@ -538,7 +535,8 @@ static void tab_esp() {
 }
 
 static void tab_misc() {
-    ImGui::TextDisabled("[ Bhop ]  HOLD SPACE - no auto-jump, no keybind");
+    ImGui::TextDisabled("[ Bhop ]");
+    ImGui::TextDisabled("HOLD SPACE - no auto-jump, no keybind");
     ImGui::TextDisabled("injects SPACE; nothing is written to CS2");
     ImGui::Separator();
 
@@ -550,58 +548,15 @@ static void tab_misc() {
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
+    ImGui::TextDisabled("pressing: %s", bd.pressing ? "yes" : "no");
 
-    if (bd.age_ms < 0)
-        ImGui::TextDisabled("injected %d   never", bd.injected);
-    else
-        ImGui::TextDisabled("injected %d   %d ms ago", bd.injected, bd.age_ms);
-
-    if (bd.suppressing)
-        ImGui::TextDisabled("physical space is swallowed while driving");
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - gate may misbehave");
 
     ImGui::Separator();
-    ImGui::TextDisabled("[ Timing ]");
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##lead", &g_cfg.bh_lead_ms, 0.0f, 30.0f,
-                           "lead %.1f ms"))
-        Bhop_SetLeadMs(g_cfg.bh_lead_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How EARLY to press before the predicted landing.\n\n"
-                          "This is the main control now. Pressing after we see\n"
-                          "the ground flag is always late -- which is why manual\n"
-                          "bhop feels better. Acting before touchdown means the\n"
-                          "key is already down when the landing is sampled.\n\n"
-                          "Too small: still late. Too large: the press fires\n"
-                          "mid-air and is wasted. Sweep it.");
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##hold", &g_cfg.bh_hold_ms, 1.0f, 40.0f,
-                           "hold %.1f ms"))
-        Bhop_SetHoldMs(g_cfg.bh_hold_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How long the key stays DOWN per press.\n"
-                          "Must span at least one frame, or the game's\n"
-                          "per-frame input sample never sees the press.\n"
-                          "144 fps is 6.9 ms/frame, 60 fps is 16.7 ms.");
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##retry", &g_cfg.bh_retry_ms, 2.0f, 60.0f,
-                           "fallback every %.1f ms"))
-        Bhop_SetRetryMs(g_cfg.bh_retry_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("If prediction misses, this is how often we press\n"
-                          "once we can see we are grounded. Retrying is what\n"
-                          "stops a missed hop from ending the chain.");
-
-    ImGui::TextDisabled("vz %.0f   tti %.1f ms   predicted %d",
-        bd.vz, bd.tti, bd.pred_hits);
-
-    ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
+    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
     ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
     ImGui::SetNextItemWidth(180.0f);
     ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
@@ -632,13 +587,35 @@ static void tab_colors() {
     color_row("##cr", "Bomb carrier", &g_cfg.color_carrier);
 
     ImGui::Columns(1);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("[ Menu ]");
+    ImGui::Columns(2, nullptr, false);
+    ImGui::SetColumnWidth(0, col_w);
+
+    color_row("##mt", "Title bar",    &g_cfg.menu_title);
+    color_row("##mb", "Buttons",      &g_cfg.menu_button);
+
+    ImGui::NextColumn();
+    color_row("##ms", "Slider bg",    &g_cfg.menu_slider);
+
+    ImGui::Columns(1);
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 600.0f, 560.0f }, ImGuiCond_Once);
+    // Menu skin, reapplied every frame so the pickers take effect live.
+    {
+        ImGuiStyle& st = ImGui::GetStyle();
+        st.Colors[ImGuiCol_TitleBg]       = g_cfg.menu_title;
+        st.Colors[ImGuiCol_TitleBgActive] = g_cfg.menu_title;
+        st.Colors[ImGuiCol_Button]        = g_cfg.menu_button;
+        st.Colors[ImGuiCol_SliderGrab]    = g_cfg.menu_slider;
+    }
+
+    ImGui::SetNextWindowSize({ 600.0f, 520.0f }, ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints({ 500.0f, 320.0f }, { 1000.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr);
+    ImGui::Begin("Orbital - Mars", nullptr);
 
     if (!g_mem.is_valid()) {
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
@@ -659,19 +636,22 @@ void render_menu() {
 
     ImGui::Separator();
 
-    const float btn_w =
-        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x)
-        / 2.0f;
+    const float btn_w3 =
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f)
+        / 3.0f;
 
-    if (ImGui::Button("[Reset]", { btn_w, 0 })) {
+    if (ImGui::Button("[Save]", { btn_w3, 0 })) save_config();
+    ImGui::SameLine();
+    if (ImGui::Button("[Reset]", { btn_w3, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
         apply_bhop_config();
     }
     ImGui::SameLine();
-    if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
+    if (ImGui::Button("[Exit]", { btn_w3, 0 })) g_running = false;
 
-    ImGui::TextDisabled("INSERT - menu    F9 - exit");
+    ImGui::TextDisabled("INSERT - menu (in-game only)    F9 - exit");
+    ImGui::TextDisabled("config: orbital.cfg next to the exe");
 
     ImGui::End();
 }
@@ -681,6 +661,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     Overlay::enable_dpi_awareness();
     OrbitalLog("dpi awareness set");
+
+    load_config();
 
     bool have_game = false;
     for (int i = 0; i < 20 && !have_game; ++i) {
@@ -717,8 +699,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) g_running = false;
         }
 
-        if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
-        if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
+        // INSERT only acts while CS2 is the foreground window. Previously you
+        // could toggle the menu while alt-tabbed, which meant the overlay could
+        // appear over whatever you switched to. g_cs2_hwnd is the game's own
+        // handle, so this test is exact rather than a guess by process name.
+        const bool cs2_active =
+            (g_cs2_hwnd && IsWindow(g_cs2_hwnd) &&
+             GetForegroundWindow() == g_cs2_hwnd);
+
+        // Losing focus also closes the menu, so it can never be left sitting on
+        // top of another application.
+        if (!cs2_active && g_menu_open) g_menu_open = false;
+
+        if (cs2_active && (GetAsyncKeyState(VK_INSERT) & 1))
+            g_menu_open = !g_menu_open;
+        if (GetAsyncKeyState(VK_F9) & 1) g_running = false;
 
         refresh_game_window();
         overlay.sync_to_game();
@@ -754,6 +749,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     OrbitalLog("shutting down");
+    save_config();
     g_running = false;
     mem_t.join();
     Bhop_Shutdown();
