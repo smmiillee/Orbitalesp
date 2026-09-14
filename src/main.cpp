@@ -47,11 +47,11 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- keystroke injection only, so nothing here writes to cs2.exe.
-    bool  bhop_enabled      = true;
-    bool  bhop_predict      = false;
-    bool  bhop_separate_key = false;
-    float bhop_lead_ms      = 16.0f;
+    // Bhop -- injection only, so nothing here writes to cs2.exe.
+    bool  bhop_enabled     = true;
+    bool  bhop_scroll      = true;    // wheel spam (recommended)
+    bool  bhop_key_inject  = false;   // key edge (second chance)
+    float bhop_interval_ms = 8.0f;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -129,9 +129,9 @@ static bool find_cs2_window() {
 // [Reset], so the two can never drift apart.
 static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bhop_enabled);
-    Bhop_SetPredict(g_cfg.bhop_predict);
-    Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
-    Bhop_SetLead(g_cfg.bhop_lead_ms);
+    Bhop_SetScroll(g_cfg.bhop_scroll);
+    Bhop_SetKeyInject(g_cfg.bhop_key_inject);
+    Bhop_SetScrollInterval(g_cfg.bhop_interval_ms);
 }
 
 // Reader thread: world samples. Bhop owns its own thread.
@@ -333,49 +333,56 @@ static void tab_esp() {
 static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
-    ImGui::TextDisabled("keystroke injection only - no writes to CS2");
+    ImGui::TextDisabled("injection only - no writes to CS2");
 
     if (ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled))
         Bhop_SetEnabled(g_cfg.bhop_enabled);
 
-    if (ImGui::Checkbox("Predictive (press before landing)", &g_cfg.bhop_predict))
-        Bhop_SetPredict(g_cfg.bhop_predict);
+    if (ImGui::Checkbox("Scroll injection", &g_cfg.bhop_scroll))
+        Bhop_SetScroll(g_cfg.bhop_scroll);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Estimates the landing from your vertical velocity and\n"
-                          "presses early, so the press is already down when the\n"
-                          "engine samples input for the landing tick.\n"
-                          "The ground flag is still used as a fallback.");
+        ImGui::SetTooltip("Spams mouse-wheel events while you hold the gate.\n"
+                          "Timing-agnostic: several events per game tick, so\n"
+                          "one falls in the landing window. Needs mwheel bound\n"
+                          "to +jump in game - see the binds below.");
+
+    if (ImGui::Checkbox("Key edge (extra chance)", &g_cfg.bhop_key_inject))
+        Bhop_SetKeyInject(g_cfg.bhop_key_inject);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Also presses a key once per observed landing.\n"
+                          "Second chance alongside scroll spam.");
 
     ImGui::SetNextItemWidth(200.0f);
-    if (ImGui::SliderFloat("##lead", &g_cfg.bhop_lead_ms, 0.0f, 40.0f,
-                           "lead %.0f ms"))
-        Bhop_SetLead(g_cfg.bhop_lead_ms);
+    if (ImGui::SliderFloat("##scrollms", &g_cfg.bhop_interval_ms, 2.0f, 30.0f,
+                           "scroll every %.0f ms"))
+        Bhop_SetScrollInterval(g_cfg.bhop_interval_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How early prediction presses.\n"
-                          "One game tick is ~16 ms. 12-20 ms is the usual range.");
-
-    if (ImGui::Checkbox("Use Right Arrow (bind +jump)", &g_cfg.bhop_separate_key))
-        Bhop_SetSeparateKey(g_cfg.bhop_separate_key);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Injects RIGHT instead of SPACE.\n"
-                          "In-game: bind \";\" \"+jump\" on the right arrow, so\n"
-                          "the physical key we inject is never the one held.");
+        ImGui::SetTooltip("Wheel events per interval. 8 ms is ~2 per tick,\n"
+                          "which is the usual sweet spot. Lower = more events.");
 
     const BhopDebug bd = Bhop_GetDebug();
 
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("edges %d   predicted %d   %s%s",
-        bd.edges, bd.predicted,
+    ImGui::TextDisabled("scrolls %d   key edges %d   %s%s",
+        bd.scrolls, bd.edges,
         bd.driving ? "[driving] " : "",
         bd.suppressing ? "[space swallowed]" : "");
-    if (g_cfg.bhop_predict)
-        ImGui::TextDisabled("vz %.0f   tti %.1f ms", bd.vz, bd.tti);
 
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - space gate may misbehave");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ console binds - paste in CS2 console ]");
+    ImGui::TextDisabled("alias +jh \"+jump;+jump\"");
+    ImGui::TextDisabled("alias -jh \"-jump;-jump;-jump\"");
+    ImGui::TextDisabled("bind mwheelup +jh ; bind mwheeldown +jh");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The doubled +jump/-jump is the de-subtick trick:\n"
+                          "each wheel input sends the command several times,\n"
+                          "so the engine gets more chances to register an edge.");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -424,8 +431,8 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 580.0f, 480.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 780.0f });
+    ImGui::SetNextWindowSize({ 580.0f, 520.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 800.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
