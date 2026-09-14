@@ -81,7 +81,8 @@ struct Config {
 
     // Bhop -- single engine, SPACE only, no memory writes.
     bool  bh_enabled  = false;
-    float bh_hold_ms  = 10.0f;
+    float bh_lead_ms  = 8.0f;
+    float bh_hold_ms  = 14.0f;
     float bh_retry_ms = 16.0f;
 } g_cfg;
 
@@ -226,6 +227,7 @@ static constexpr int kSkeleton[][2] = {
 
 static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
+    Bhop_SetLeadMs(g_cfg.bh_lead_ms);
     Bhop_SetHoldMs(g_cfg.bh_hold_ms);
     Bhop_SetRetryMs(g_cfg.bh_retry_ms);
 }
@@ -447,51 +449,47 @@ static void tab_misc() {
     ImGui::TextDisabled("[ Timing ]");
 
     ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderFloat("##lead", &g_cfg.bh_lead_ms, 0.0f, 30.0f,
+                           "lead %.1f ms"))
+        Bhop_SetLeadMs(g_cfg.bh_lead_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How EARLY to press before the predicted landing.\n\n"
+                          "This is the main control now. Pressing after we see\n"
+                          "the ground flag is always late -- which is why manual\n"
+                          "bhop feels better. Acting before touchdown means the\n"
+                          "key is already down when the landing is sampled.\n\n"
+                          "Too small: still late. Too large: the press fires\n"
+                          "mid-air and is wasted. Sweep it.");
+
+    ImGui::SetNextItemWidth(240.0f);
     if (ImGui::SliderFloat("##hold", &g_cfg.bh_hold_ms, 1.0f, 40.0f,
-                           "hold key for %.1f ms"))
+                           "hold %.1f ms"))
         Bhop_SetHoldMs(g_cfg.bh_hold_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How long the key stays DOWN per press.\n\n"
-                          "This is the important one. The old code sent down and\n"
-                          "up together, so the key was never down during any\n"
-                          "frame sample -- the press was invisible, not mistimed.\n\n"
-                          "It must exceed one frame: 144 fps is 6.9 ms/frame,\n"
-                          "60 fps is 16.7 ms. Raise this if hops still miss.");
+        ImGui::SetTooltip("How long the key stays DOWN per press.\n"
+                          "Must span at least one frame, or the game's\n"
+                          "per-frame input sample never sees the press.\n"
+                          "144 fps is 6.9 ms/frame, 60 fps is 16.7 ms.");
 
     ImGui::SetNextItemWidth(240.0f);
     if (ImGui::SliderFloat("##retry", &g_cfg.bh_retry_ms, 2.0f, 60.0f,
-                           "retry every %.1f ms"))
+                           "fallback every %.1f ms"))
         Bhop_SetRetryMs(g_cfg.bh_retry_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Interval between presses while grounded.\n"
-                          "Retrying is what stops a missed hop from ending\n"
-                          "the chain. About one tick (15.6 ms) is a good start.\n"
-                          "Keep it comfortably larger than the hold.");
+        ImGui::SetTooltip("If prediction misses, this is how often we press\n"
+                          "once we can see we are grounded. Retrying is what\n"
+                          "stops a missed hop from ending the chain.");
 
-    ImGui::TextDisabled("pressing: %s   last hold %.1f ms",
-        bd.pressing ? "yes" : "no", bd.hold_ms);
+    ImGui::TextDisabled("vz %.0f   tti %.1f ms   predicted %d",
+        bd.vz, bd.tti, bd.pred_hits);
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
-    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
     ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
     ImGui::SetNextItemWidth(180.0f);
     ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
         g_fps_override ? "cap %d fps" : "cap auto (refresh)");
     ImGui::Checkbox("V-Sync", &g_vsync);
-
-    ImGui::Separator();
-    ImGui::TextDisabled("game window: %s",
-        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "found" : "NOT FOUND");
-    ImGui::TextDisabled("entities: %d slots", g_esp.diag_slots);
-    ImGui::TextDisabled("weapon defIdx chain: %s (mine=%d)",
-                        g_esp.diag_defidx ? "ok" : "not detected",
-                        g_esp.diag_defidx);
-    if (g_esp.diag_carrier)
-        ImGui::TextDisabled("C4 owner: 0x%llX",
-                            (unsigned long long)g_esp.diag_carrier);
-    else
-        ImGui::TextDisabled("C4 owner: not found");
 }
 
 static void tab_colors() {
@@ -610,23 +608,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-
-        {
-            const bool game_ok = (g_cs2_hwnd && IsWindow(g_cs2_hwnd));
-            char line1[192], line2[192];
-            std::snprintf(line1, sizeof(line1),
-                "Orbital | viewport %dx%d | game %s",
-                g_screen_w, g_screen_h, game_ok ? "ok" : "MISSING");
-            std::snprintf(line2, sizeof(line2),
-                "%d slots  %d players  |  INSERT menu  F9 exit",
-                g_esp.diag_slots, g_esp.players_alive);
-
-            const ImU32 c1 = game_ok ? IM_COL32(120, 255, 120, 255)
-                                     : IM_COL32(255, 170, 0, 255);
-            const float y0 = static_cast<float>(g_screen_h) - 30.0f;
-            dl->AddText({ 8.0f, y0 },        c1, line1);
-            dl->AddText({ 8.0f, y0 + 14.0f }, c1, line2);
-        }
 
         render_esp(dl);
         if (g_menu_open) render_menu();
