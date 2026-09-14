@@ -508,21 +508,24 @@ static void tab_misc() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("One tick is 15.625 ms.");
 
-    static const struct { const char* name; int vk; } kKeys[] = {
-        { "F20", VK_F20 }, { "F19", VK_F19 }, { "F18", VK_F18 },
-        { "APPS (menu key)", VK_APPS }, { "RIGHT", VK_RIGHT },
-        { "SPACE", VK_SPACE }, { "ALT", VK_MENU },
+    // Plain parallel arrays + the classic string-array Combo overload. The
+    // getter-based Combo (bool(*)(void*,int,const char**)) only exists in newer
+    // ImGui, so it is deliberately not used here.
+    static const char* const kKeyNames[] = {
+        "F20", "F19", "F18", "APPS (menu key)", "RIGHT", "SPACE", "ALT"
     };
+    static const int kKeyVks[] = {
+        VK_F20, VK_F19, VK_F18, VK_APPS, VK_RIGHT, VK_SPACE, VK_MENU
+    };
+    constexpr int kKeyCount = IM_ARRAYSIZE(kKeyNames);
+
     int cur = 0;
-    for (int i = 0; i < IM_ARRAYSIZE(kKeys); ++i)
-        if (kKeys[i].vk == g_cfg.bh_inject_key) cur = i;
+    for (int i = 0; i < kKeyCount; ++i)
+        if (kKeyVks[i] == g_cfg.bh_inject_key) cur = i;
 
     ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::Combo("##key", &cur, [](void* d, int i, const char** out) {
-            auto* arr = static_cast<decltype(kKeys)*>(d);
-            *out = arr[i].name; return true;
-        }, (void*)kKeys, IM_ARRAYSIZE(kKeys))) {
-        g_cfg.bh_inject_key = kKeys[cur].vk;
+    if (ImGui::Combo("##key", &cur, kKeyNames, kKeyCount)) {
+        g_cfg.bh_inject_key = kKeyVks[cur];
         Bhop_SetInjectKey(g_cfg.bh_inject_key);
     }
     if (ImGui::IsItemHovered())
