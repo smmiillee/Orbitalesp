@@ -611,11 +611,13 @@ static bool paste_color_from_clipboard(ImVec4* c) {
             while (*txt == ' ' || *txt == '\t' || *txt == '\r' || *txt == '\n')
                 ++txt;
 
+            // sscanf_s is a Microsoft extension, NOT a std:: member -- so it
+            // must be unqualified here.
             if (*txt == '#') {
-                std::sscanf_s(txt + 1, "%2x%2x%2x%2x", &r, &g, &b, &a);
+                sscanf_s(txt + 1, "%2x%2x%2x%2x", &r, &g, &b, &a);
                 got = (int)std::strlen(txt + 1) >= 8 ? 4 : 3;
             } else {
-                got = std::sscanf_s(txt, "%u,%u,%u,%u", &r, &g, &b, &a);
+                got = sscanf_s(txt, "%u,%u,%u,%u", &r, &g, &b, &a);
             }
             if (got < 3) { r = g = b = 0; a = 255; got = 0; }
 
