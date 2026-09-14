@@ -17,9 +17,6 @@
 extern HWND g_cs2_hwnd;
 extern ESP g_esp;
 extern int g_local_team;
-// The overlay's viewport. GetSystemMetrics would return the MONITOR size, which
-// differs from the game client area on a scaled display, putting the crosshair
-// centre in the wrong place.
 extern int g_screen_w;
 extern int g_screen_h;
 
@@ -33,7 +30,7 @@ constexpr Hit kHits[] = {
 
 std::atomic<bool>  g_stop{false}, g_started{false};
 std::atomic<bool>  g_on{false}, g_fire{true};
-std::atomic<int>   g_key{0};
+std::atomic<int>   g_key{0};          // 0 == unbound == OFF
 std::atomic<float> g_radius{1.4f};
 std::atomic<int>   g_delay{0};
 
@@ -83,14 +80,18 @@ void run_thread() {
     bool   down = false;
     double down_at = 0.0;
     double next_shot = 0.0;
-    double target_since = 0.0;   // when the current target was acquired
+    double target_since = 0.0;
 
     while (!g_stop.load()) {
         wait_ms(2.0);
 
         const int k = g_key.load();
+
+        // *** UNBOUND MEANS OFF ***
+        // key == 0 is NOT "always on". The trigger only runs while a bound key
+        // is physically held, so an unbound triggerbot does nothing at all.
         const bool gate = g_on.load() && g_mem.is_valid() && cs2_focused() &&
-                          (k == 0 || (GetAsyncKeyState(k) & 0x8000));
+                          k != 0 && ((GetAsyncKeyState(k) & 0x8000) != 0);
 
         if (!gate) {
             if (down) { mouse(false); down = false; }
@@ -101,13 +102,9 @@ void run_thread() {
             continue;
         }
 
-        // *** WHY THE DELAY FELT WEAK ***
-        // The cooldown used to SKIP this block, so the acquisition timer was
-        // never reset while waiting to be allowed to shoot again. On a target
-        // held continuously, the delay then appeared to count from the previous
-        // shot rather than from re-acquiring -- which reads as much shorter than
-        // the value set. The timer is now cleared during the cooldown, so the
-        // full delay elapses AFTER the cooldown ends.
+        // The cooldown clears the acquisition timer, so the full delay elapses
+        // AFTER the cooldown ends rather than appearing to count from the
+        // previous shot.
         if (down && now_ms() - down_at >= kClickMs) {
             mouse(false);
             down = false;
@@ -151,10 +148,6 @@ void run_thread() {
         g_dbg_dist.store(found ? best : -1.0f);
         g_dbg_bone.store(found ? best_name : "-");
 
-        // ---- acquisition delay ----
-        // The target has to STAY acquired for `delay` ms before we shoot, which
-        // is what a triggerbot delay means: it damps instant reactions and
-        // makes the timing look less mechanical.
         if (!found) {
             target_since = 0.0;
             g_dbg_held.store(0);
@@ -223,8 +216,6 @@ void Aim_SetRadius(float pct) {
 }
 float Aim_Radius() { return g_radius.load(); }
 
-// Range raised to 600 ms: at 200 the effect was visible but subtle, and a wider
-// range makes it obvious whether the value is being applied at all.
 void Aim_SetDelay(int ms) {
     if (ms < 0) ms = 0;
     if (ms > 600) ms = 600;
