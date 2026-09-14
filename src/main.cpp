@@ -84,7 +84,7 @@ void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
         }
     }
 
-    // Bomb carrier indicator
+    // Bomb
     BombESP bomb = g_esp.project_bomb(g_mem, g_mem.base_address, screen_w, screen_h);
     if (bomb.active) {
         dl->AddCircle({ bomb.screen.x, bomb.screen.y }, 8.0f,
@@ -143,11 +143,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     while (!g_mem.attach(L"cs2.exe"))
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Read actual CS2 window resolution
-    g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
-    if (g_cs2_hwnd) {
+    HWND cs2 = FindWindowA("SDL_app", nullptr);
+    if (cs2) {
         RECT r{};
-        if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0) {
+        if (GetClientRect(cs2, &r) && r.right > 0) {
             g_screen_w = r.right;
             g_screen_h = r.bottom;
         }
