@@ -42,8 +42,6 @@ enum BoneId : int {
     BONE_COUNT      = 32,
 };
 
-// One real frame from the game, timestamped. The render thread interpolates
-// between these, which is what removes the shake.
 struct Snap {
     double t = 0.0;
     Vec3   origin{}, head{};
@@ -53,7 +51,7 @@ struct Snap {
 };
 
 struct Track {
-    static constexpr int kHist = 24;   // ~190 ms at an 8 ms sample rate
+    static constexpr int kHist = 24;
 
     uintptr_t pawn = 0;
     char  name[32]{};
@@ -90,7 +88,7 @@ struct PlayerESP {
 };
 
 struct BombESP {
-    bool  active = false;      // a PLANTED C4 is in the world
+    bool  active = false;
     Vec2  screen{};
     Vec2  screen_top{};
     float distance = 0.0f;
@@ -98,24 +96,24 @@ struct BombESP {
 
 class ESP {
 public:
-    // Snapshot interpolation delay, ms. CS2 writes positions at ~64 Hz; drawing
-    // those raw steps at 144+ fps is the shake. The render thread draws a fixed
-    // time in the past, interpolating between two REAL frames, so the latency is
-    // constant -- constant lag is invisible where variable lag reads as shake.
     float interp_delay_ms = 35.0f;
 
-    std::mutex mtx;   // guards tracks_ / bomb state
+    std::mutex mtx;
 
     void update_world(const Memory& mem, uintptr_t client_base);
+
+    // interpolate = true  -> smooth motion for the ESP (default)
+    // interpolate = false -> newest sample, no delay. Used by the triggerbot,
+    //                        where a 35 ms-stale position would mean firing
+    //                        behind a moving target.
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
-                                   int screen_w, int screen_h);
+                                   int screen_w, int screen_h,
+                                   bool interpolate = true);
+
     BombESP project_bomb(const Memory& mem, uintptr_t client_base,
                          int screen_w, int screen_h);
 
     int players_alive = 0;
-    int  diag_slots   = 0;
-    int  diag_carrier = 0;   // 0 = not found, else the carrier's pawn
-    int  diag_defidx  = 0;   // local player's active weapon def index
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
@@ -129,21 +127,16 @@ private:
         bool      bones_ok = false;
         int       bone_fail = 0, probe_cd = 0;
 
-        // Item-definition chain self-test (radar's ValidateDefIdxChain).
-        bool defidx_ok = false;
-        bool defidx_checked = false;
-
-        // Cached C4 entity so the full scan isn't repeated every frame.
-        int  c4_chunk = -1;
-        int  c4_slot  = -1;
-
-        // Discovered C4 owner handle offset (radar's DiscoverCarrier).
-        uintptr_t carrier_off = 0;
-        bool      carrier_ok = false;
-        double    last_discover = -1e9;
+        // Planted-C4 position: found and then VERIFIED by requiring the Z to
+        // stay put, because a planted bomb does not move.
+        uintptr_t c4_node_off = 0;
+        bool      c4_pos_ok = false;
+        Vec3      c4_last{};
+        double    c4_last_t = 0.0;
+        int       c4_stable = 0;
     } c_;
 
     std::vector<Track> tracks_;
-    bool  bomb_active_ = false;
-    Vec3  bomb_origin_{};
+    bool   bomb_active_ = false;
+    Vec3   bomb_origin_{};
 };
