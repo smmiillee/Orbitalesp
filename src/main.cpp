@@ -15,6 +15,7 @@
 #include "overlay.h"
 #include "offsets.h"
 #include "bhop.h"
+#include "aim.h"
 
 static ESP g_esp;
 static bool g_running = true;
@@ -103,6 +104,12 @@ struct Config {
 
     // Bhop -- timing is locked in bhop.cpp, so only the toggle is configured.
     bool bh_enabled = false;
+
+    // Triggerbot. Detection is read-only; firing injects a click.
+    bool aim_enabled = false;
+    bool aim_fire    = true;
+    int  aim_key     = 0;   // 0 = always active
+    float aim_radius = 1.4f; // percent of screen height
 } g_cfg;
 
 // ── config file ──────────────────────────────────────────────────────────
@@ -116,6 +123,7 @@ static void save_config() {
     if (!f) { OrbitalLog("config save FAILED"); return; }
 
 #define W_B(field) fprintf(f, #field "=%d\n", g_cfg.field ? 1 : 0)
+#define W_I(field) fprintf(f, #field "=%d\n", g_cfg.field)
 #define W_F(field) fprintf(f, #field "=%.4f\n", g_cfg.field)
 #define W_C(field) fprintf(f, #field "=%.4f %.4f %.4f %.4f\n", \
                            g_cfg.field.x, g_cfg.field.y, \
@@ -136,8 +144,11 @@ static void save_config() {
     W_C(menu_title);   W_C(menu_button);  W_C(menu_slider);
 
     W_B(bh_enabled);
+    W_B(aim_enabled);      W_B(aim_fire);
+    W_I(aim_key);          W_F(aim_radius);
 
 #undef W_B
+#undef W_I
 #undef W_F
 #undef W_C
 
@@ -195,10 +206,16 @@ static void load_config() {
         else if (!strcmp(key, "menu_button"))      c(g_cfg.menu_button);
         else if (!strcmp(key, "menu_slider"))      c(g_cfg.menu_slider);
         else if (!strcmp(key, "bh_enabled"))       b(g_cfg.bh_enabled);
+        else if (!strcmp(key, "aim_enabled"))      b(g_cfg.aim_enabled);
+        else if (!strcmp(key, "aim_fire"))         b(g_cfg.aim_fire);
+        else if (!strcmp(key, "aim_key"))          i(g_cfg.aim_key);
+        else if (!strcmp(key, "aim_radius"))       s(g_cfg.aim_radius);
     }
     fclose(f);
     OrbitalLog("config loaded");
-}
+}</｜DSML｜ parameter>
+</invoke>
+
 
 static int  g_screen_w = 1920;
 static int  g_screen_h = 1080;
@@ -344,6 +361,12 @@ static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
 }
 
+static void apply_aim_config() {
+    Aim_SetEnabled(g_cfg.aim_enabled);
+    Aim_SetFire(g_cfg.aim_fire);
+    Aim_SetKey(g_cfg.aim_key);
+}
+
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -352,6 +375,8 @@ void memory_thread() {
 
     Bhop_Init();
     apply_bhop_config();
+    Aim_Init();
+    apply_aim_config();
 
     while (g_running) {
         if (g_mem.is_valid()) {
@@ -534,6 +559,80 @@ static void tab_esp() {
     ImGui::Columns(1);
 }
 
+// ── AIM tab: triggerbot ──────────────────────────────────────────────────
+// Detection is read-only. Firing injects a click -- there is no way for the
+// game to shoot from a read, so that part is input injection, same as bhop's
+// space. Unticking Firing leaves a detection-only indicator.
+static void tab_aim() {
+    ImGui::TextDisabled("[ Triggerbot ]");
+    ImGui::TextDisabled("detection: read-only     firing: injects a click");
+    ImGui::Separator();
+
+    if (ImGui::Checkbox("Triggerbot", &g_cfg.aim_enabled))
+        Aim_SetEnabled(g_cfg.aim_enabled);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Fires when the crosshair is within the radius of an\n"
+                          "enemy bone. Uses the NEWEST position, not the\n"
+                          "smoothed one, so it does not fire behind a mover.");
+
+    if (ImGui::Checkbox("Firing (injects left click)", &g_cfg.aim_fire))
+        Aim_SetFire(g_cfg.aim_fire);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Unticked: the trigger still detects and shows the\n"
+                          "indicator, but never clicks. That makes the whole\n"
+                          "feature read-only.");
+
+    static const char* const kKeyNames[] = {
+        "always on", "MOUSE5", "MOUSE4", "ALT", "SHIFT", "CTRL", "CAPS"
+    };
+    static const int kKeyVks[] = {
+        0, VK_XBUTTON2, VK_XBUTTON1, VK_MENU, VK_SHIFT, VK_CONTROL, VK_CAPITAL
+    };
+    constexpr int kKeyCount = IM_ARRAYSIZE(kKeyNames);
+
+    int cur = 0;
+    for (int i = 0; i < kKeyCount; ++i)
+        if (kKeyVks[i] == g_cfg.aim_key) cur = i;
+
+    ImGui::SetNextItemWidth(200.0f);
+    if (ImGui::Combo("##aimkey", &cur, kKeyNames, kKeyCount)) {
+        g_cfg.aim_key = kKeyVks[cur];
+        Aim_SetKey(g_cfg.aim_key);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hold this to arm the trigger.\n"
+                          "'always on' fires whenever the radius is met.");
+
+    if (ImGui::SliderFloat("radius %.2f%% of height", &g_cfg.aim_radius,
+                           0.4f, 5.0f, "%.2f%%")) {
+        // kept local until the aim module reads it; see note below
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How close to the crosshair a bone must be, as a\n"
+                          "percentage of screen height. ~1.4%% is head-sized.");
+
+    const AimDebug ad = Aim_GetDebug();
+    ImGui::Separator();
+    if (ad.on_target)
+        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f },
+                           "on target: %s  (%.0f px)", ad.target_bone,
+                           ad.target_dist);
+    else
+        ImGui::TextDisabled("on target: no");
+    ImGui::TextDisabled("firing: %s", ad.firing ? "yes" : "no");
+}
+
+// ── RADAR tab: placeholder ───────────────────────────────────────────────
+// Reserved for the radar from the other repo. Deliberately inert for now.
+static void tab_radar() {
+    ImGui::TextDisabled("[ Radar ]");
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("not implemented yet");
+    ImGui::Spacing();
+    ImGui::TextDisabled("This tab is reserved for the radar module.");
+}
+
 static void tab_misc() {
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::TextDisabled("HOLD SPACE - no auto-jump, no keybind");
@@ -629,8 +728,10 @@ void render_menu() {
 
     if (ImGui::BeginTabBar("##orbital_tabs", ImGuiTabBarFlags_None)) {
         if (ImGui::BeginTabItem("ESP"))    { tab_esp();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("MISC"))   { tab_misc();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("AIM"))    { tab_aim();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("RADAR"))  { tab_radar();  ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("COLORS")) { tab_colors(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("MISC"))   { tab_misc();   ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
@@ -646,6 +747,7 @@ void render_menu() {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
         apply_bhop_config();
+        apply_aim_config();
     }
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w3, 0 })) g_running = false;
@@ -753,6 +855,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_running = false;
     mem_t.join();
     Bhop_Shutdown();
+    Aim_Shutdown();
     overlay.cleanup();
     g_mem.detach();
 
