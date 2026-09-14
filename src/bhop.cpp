@@ -1,45 +1,77 @@
 // --- src/bhop.cpp ---
+// Bhop by KEYSTROKE INJECTION ONLY. There is no memory write anywhere in this
+// file: the project no longer writes to cs2.exe at all.
+//
+//   the injected key carries "+jump", and a jump needs a fresh PRESS edge, so
+//   what matters is generating exactly one clean edge per landing.
+//
+// ── WHY YOUR HELD KEY IS SWALLOWED ───────────────────────────────────────
+// Holding space makes the engine's own +jump stay down, and a held button
+// cannot produce a new jump. So while bhop is driving, the low-level hook
+// swallows your physical spacebar and the game's jump input comes only from us.
+// Your held key becomes a gate; the edges come from here.
+//
+// ── THE TWO STRATEGIES ───────────────────────────────────────────────────
+// PLAIN: press when the ground flag reads grounded. The flag is written once
+// per tick (~15.6 ms), so detection can arrive after the landing tick.
+//
+// PREDICTIVE: estimate the landing from vertical velocity and press early, so
+// the press is already down when the engine samples input for that tick.
+//   tti = (z - ground_z) / (-vz)        time until the predicted impact
+//   press when tti <= lead              (lead defaults to one tick, ~16 ms)
+// ground_z is the height you were last standing at, and vz comes from finite
+// differences of Z between DISTINCT samples -- sampling only on change keeps the
+// velocity clean, since the game only writes Z once per tick.
+//
+// The observed ground flag always remains a fallback, so prediction can only
+// add presses, never remove them.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
 
 #include <Windows.h>
+#include <mmsystem.h>      // timeBeginPeriod / timeEndPeriod
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <thread>
-#include <vector>
+
+// So the project links without anyone having to touch CMakeLists.
+#pragma comment(lib, "winmm.lib")
 
 extern HWND g_cs2_hwnd;
 
 namespace {
 
-constexpr int32_t kJumpPress   = 65537;
-constexpr int32_t kJumpRelease = 256;
+// Fallback lead, one tick at 64 Hz. Overridable from the menu.
+constexpr float kDefaultLeadMs = 16.0f;
 
-constexpr intptr_t kRel[] = {
-    -0x630, -0x5A0, -0x510, -0x480, -0x3F0, -0x360, -0x2D0,
-    -0x240, -0x1B0, -0x120, -0x090,  0x000,  0x090,
-};
-constexpr int kSlotCount = static_cast<int>(sizeof(kRel) / sizeof(kRel[0]));
+// How long a press is held once started. Long enough to span the landing tick,
+// short enough that the next landing still gets a fresh edge.
+constexpr double kPressHoldMs = 30.0;
 
-constexpr uintptr_t kCandidates[] = {
-    0x2095490, 0x2096490, 0x2094490, 0x2093490, 0x205BAF0,
-};
+std::atomic<bool> g_stop{false}, g_started{false};
+std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_predict{false};
+std::atomic<bool> g_separate_key{false};
+std::atomic<float> g_lead_ms{kDefaultLeadMs};
 
-std::atomic<bool>      g_stop{false}, g_started{false}, g_locked{false};
-std::atomic<bool>      g_scanning{false}, g_input_mode{true};
-std::atomic<bool>      g_enabled{true};
-std::atomic<uintptr_t> g_jump_offset{offsets::dwForceJump};
-std::atomic<bool>      g_dbg_ground{false};
-std::atomic<bool>      g_dbg_focused{false};
-std::atomic<int>       g_dbg_signals{0};
-std::atomic<int>       g_dbg_cands{0};
+// Diagnostics.
+std::atomic<bool>  g_dbg_ground{false}, g_dbg_focused{false};
+std::atomic<bool>  g_dbg_space{false},  g_dbg_driving{false};
+std::atomic<bool>  g_dbg_suppress{false};
+std::atomic<int>   g_dbg_signals{0},    g_dbg_edges{0}, g_dbg_predicted{0};
+std::atomic<float> g_dbg_vz{0.0f},      g_dbg_tti{-1.0f};
 
-std::thread g_bhop_thread, g_scan_thread;
+// Keyboard hook.
+std::atomic<bool>  g_phys_space{false};   // physical (non-injected) spacebar
+std::atomic<bool>  g_hook_ok{false};
+std::atomic<bool>  g_suppress{false};     // swallow the physical spacebar
+std::atomic<DWORD> g_hook_tid{0};
+HHOOK g_hook = nullptr;
+
+std::thread g_bhop_thread, g_hook_thread;
 
 double now_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -47,6 +79,9 @@ double now_ms() {
                std::chrono::steady_clock::now() - t0).count();
 }
 
+// ~1 ms sleep that actually works. timeBeginPeriod(1) is what makes this honest:
+// without it Windows quantises sleeps to ~15.6 ms, which is a whole game tick.
+// The spin covers the last fraction either way.
 void wait_ms(int ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(ms);
@@ -64,163 +99,69 @@ void wait_ms(int ms) {
 bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
-bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-int held_mask() {
-    int m = 0;
-    if (key_down(VK_SHIFT))   m |= 1 << 0;
-    if (key_down('R'))        m |= 1 << 1;
-    if (key_down(VK_LBUTTON)) m |= 1 << 2;
-    if (key_down(VK_RBUTTON)) m |= 1 << 3;
-    if (key_down('W'))        m |= 1 << 6;
-    if (key_down('S'))        m |= 1 << 7;
-    if (key_down('A'))        m |= 1 << 8;
-    if (key_down('D'))        m |= 1 << 9;
-    if (key_down('E'))        m |= 1 << 10;
-    if (key_down(VK_SPACE))   m |= 1 << 11;
-    if (key_down(VK_CONTROL)) m |= 1 << 12;
-    return m;
-}
-
-bool plausible_dw(uint32_t v) {
-    switch (v) {
-        case 0x0u: case 0x1u: case 0x100u:
-        case 0x101u: case 0x10000u: case 0x10001u: return true;
-        default: return false;
-    }
-}
-
-bool block_valid(uintptr_t j, int mask, bool require_evidence) {
-    int pressed = 0, released_nonzero = 0;
-    for (int i = 0; i < kSlotCount; ++i) {
-        const uint32_t v = g_mem.read<uint32_t>(j + kRel[i]);
-        if (!plausible_dw(v)) return false;
-        if ((mask >> i) & 1) {
-            if ((v & 1u) == 0u) return false;
-            ++pressed;
-        } else {
-            if (v & 1u) return false;
-            if (v) ++released_nonzero;
-        }
-    }
-    if (require_evidence && pressed == 0 && released_nonzero < 2) return false;
-    return true;
-}
-
-uintptr_t scan_pressed(int mask) {
-    const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
-    const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
-    constexpr size_t PIECE = 0x40000;
-
-    static std::vector<uint8_t> buf;
-    if (buf.size() < PIECE) buf.resize(PIECE);
-
-    for (uintptr_t a = lo; a + PIECE <= hi; a += PIECE) {
-        if (g_stop.load()) return 0;
-        if (held_mask() != mask) return 0;
-        if (!g_mem.read_bytes(a, buf.data(), PIECE)) continue;
-
-        for (size_t k = 0; k + 4 <= PIECE; k += 4) {
-            uint32_t v = 0;
-            std::memcpy(&v, buf.data() + k, 4);
-            if ((v & 1u) == 0u) continue;
-            if (!plausible_dw(v)) continue;
-
-            const uintptr_t p = a + k;
-
-            for (int i = 0; i < kSlotCount; ++i) {
-                if (!((mask >> i) & 1)) continue;
-                const uintptr_t jump =
-                    p - static_cast<uintptr_t>(kRel[i]);
-                if (jump < g_mem.client_dll) continue;
-                if (!block_valid(jump, mask, false)) continue;
-                return jump;
+// ── keyboard hook ────────────────────────────────────────────────────────
+//   1. track the PHYSICAL spacebar. Injected events carry LLKHF_INJECTED, so
+//      ours are ignored -- the only way to read your real key while injecting.
+//   2. while bhop is driving, swallow the physical spacebar so the engine's
+//      +jump cannot stay held and block our press edges.
+LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
+    if (code == HC_ACTION) {
+        const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
+        if (k && k->vkCode == VK_SPACE && (k->flags & LLKHF_INJECTED) == 0) {
+            switch (wparam) {
+                case WM_KEYDOWN:
+                case WM_SYSKEYDOWN:
+                    g_phys_space.store(true);
+                    break;
+                case WM_KEYUP:
+                case WM_SYSKEYUP:
+                    g_phys_space.store(false);
+                    break;
+                default:
+                    break;
             }
+            if (g_suppress.load())
+                return 1;
         }
     }
-    return 0;
+    return CallNextHookEx(nullptr, code, wparam, lparam);
 }
 
-void collect_candidates(std::vector<uintptr_t>& out) {
-    out.clear();
-    const uintptr_t lo = g_mem.client_dll + offsets::kJumpScanLo;
-    const uintptr_t hi = g_mem.client_dll + offsets::kJumpScanHi;
-    constexpr size_t PIECE = 0x40000;
+void hook_thread_main() {
+    g_hook_tid.store(GetCurrentThreadId());
 
-    static std::vector<uint8_t> buf, flag;
-    if (buf.size() < PIECE) { buf.resize(PIECE); flag.resize(PIECE / 4); }
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, kb_proc, nullptr, 0);
+    g_hook_ok.store(g_hook != nullptr);
 
-    for (uintptr_t a = lo; a + PIECE <= hi; a += PIECE) {
-        if (g_stop.load()) return;
-        if (!g_mem.read_bytes(a, buf.data(), PIECE)) continue;
-
-        for (size_t k = 0; k + 4 <= PIECE; k += 4) {
-            uint32_t v = 0;
-            std::memcpy(&v, buf.data() + k, 4);
-            flag[k / 4] = plausible_dw(v) ? 1 : 0;
-        }
-
-        for (size_t off = 0x640; off + 0x94 <= PIECE; off += 4) {
-            bool ok = true;
-            for (int i = 0; i < kSlotCount && ok; ++i) {
-                const intptr_t pos = static_cast<intptr_t>(off) + kRel[i];
-                if (pos < 0 || pos + 4 > static_cast<intptr_t>(PIECE)) ok = false;
-                else if (!flag[pos / 4]) ok = false;
-            }
-            if (!ok) continue;
-            out.push_back(a + off);
-            if (out.size() >= 32) return;
-        }
+    // A low-level hook is delivered on the thread that installed it, so this
+    // must pump messages or the callback never runs.
+    MSG msg{};
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
+
+    if (g_hook) { UnhookWindowsHookEx(g_hook); g_hook = nullptr; }
+    g_hook_ok.store(false);
 }
 
-void scan_thread_main() {
-    for (int i = 0; i < 150 && !g_stop.load(); ++i) wait_ms(10);
-
-    std::vector<uintptr_t> candidates;
-
-    while (!g_stop.load()) {
-        if (g_locked.load()) { wait_ms(500); continue; }
-
-        g_scanning.store(true);
-
-        const int mask = held_mask();
-        uintptr_t hit = 0;
-
-        for (uintptr_t off : kCandidates) {
-            const uintptr_t abs = g_mem.client_dll + off;
-            if (block_valid(abs, mask, mask == 0)) { hit = abs; break; }
-        }
-
-        if (!hit && mask) hit = scan_pressed(mask);
-
-        if (!hit && mask) {
-            for (uintptr_t c : candidates)
-                if (block_valid(c, mask, false)) { hit = c; break; }
-        }
-
-        if (!hit && !mask) {
-            collect_candidates(candidates);
-            g_dbg_cands.store(static_cast<int>(candidates.size()));
-        }
-
-        if (hit) {
-            g_jump_offset.store(hit - g_mem.client_dll);
-            g_locked.store(true);
-        }
-        g_scanning.store(false);
-
-        if (!g_locked.load()) wait_ms(mask ? 50 : 300);
-    }
+bool space_held() {
+    if (g_hook_ok.load()) return g_phys_space.load();
+    return (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
 }
 
+// ── ground state ─────────────────────────────────────────────────────────
+// Z comes from m_vOldOrigin, which is verified working. m_fFlags and
+// m_hGroundEntity are not verified for this build, so each is only trusted
+// after it has been seen set while Z is static AND clear while Z is moving --
+// a wrong offset then degrades the verdict instead of breaking it.
 struct GroundWatch {
     bool   have_z = false;
     float  z = 0.0f;
     double z_changed = 0.0;
     bool   z_ground = true;
-    int    flag_g = 0, flag_a = 0;
-    int    hge_g = 0, hge_a = 0;
+    int    flag_g = 0, flag_a = 0, hge_g = 0, hge_a = 0;
     bool   flag_ok = false, hge_ok = false;
 };
 GroundWatch g_gw;
@@ -253,47 +194,149 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     g_dbg_signals.store(sig);
 
     bool ground;
-    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
-    else              ground = g_gw.z_ground;
-
+    if (g_gw.flag_ok) ground = (fl & 1u) != 0u;   // instance-accurate
+    else              ground = g_gw.z_ground;     // needs a 22 ms window
     if (g_gw.hge_ok) ground = ground || (hge != 0xFFFFFFFFu);
 
     g_dbg_ground.store(ground);
     return ground;
 }
 
-void inject_space(bool down) {
+// ── landing prediction ───────────────────────────────────────────────────
+// Velocity is taken from finite differences of Z between DISTINCT samples.
+// The game only writes Z once per tick, so sampling on change keeps vz clean
+// instead of showing the stair-steps you would get from polling faster.
+struct Predict {
+    bool   have_z = false;
+    float  last_z = 0.0f;
+    double last_t = 0.0;
+    float  vz = 0.0f;           // units/sec, positive = rising
+    float  ground_z = 0.0f;     // height last stood at
+    bool   have_ground_z = false;
+    bool   armed = false;       // already pressed for this airtime
+};
+Predict g_pr;
+
+// Returns true when we should press NOW because a landing is imminent.
+bool predict_step(const Memory& mem, uintptr_t pawn, float z, bool ground,
+                  float lead_ms) {
+    const double now = now_ms();
+
+    if (ground) {
+        // Refresh the reference height while standing, so slopes and small
+        // steps are tracked. Re-arming here is what allows the next airtime to
+        // press again.
+        g_pr.ground_z = z;
+        g_pr.have_ground_z = true;
+        g_pr.armed = false;
+        g_pr.vz = 0.0f;
+        g_pr.last_z = z;
+        g_pr.last_t = now;
+        g_pr.have_z = true;
+        g_dbg_vz.store(0.0f);
+        g_dbg_tti.store(-1.0f);
+        return false;
+    }
+
+    if (!g_pr.have_z) {
+        g_pr.have_z = true;
+        g_pr.last_z = z;
+        g_pr.last_t = now;
+        return false;
+    }
+
+    // Only recompute when Z actually moved, i.e. when a new tick's value
+    // arrived. Otherwise dt would shrink without new information and the
+    // velocity would spike.
+    if (std::fabs(z - g_pr.last_z) >= 0.05f) {
+        const double dt = (now - g_pr.last_t) / 1000.0;
+        if (dt > 0.0005 && dt < 0.25) {
+            const float v = static_cast<float>((z - g_pr.last_z) / dt);
+            // Light smoothing: enough to steady the estimate, not enough to lag
+            // a real landing.
+            g_pr.vz = g_pr.vz * 0.5f + v * 0.5f;
+        }
+        g_pr.last_z = z;
+        g_pr.last_t = now;
+    }
+
+    g_dbg_vz.store(g_pr.vz);
+
+    if (!g_pr.have_ground_z || g_pr.vz >= -1.0f) {
+        g_dbg_tti.store(-1.0f);
+        return false;
+    }
+
+    // Falling towards the height we last stood at.
+    const float dz = z - g_pr.ground_z;
+    if (dz <= 0.0f) {
+        // Already at or below the reference height -- landing is now.
+        g_dbg_tti.store(0.0f);
+        return true;
+    }
+
+    const float tti_ms = (dz / -g_pr.vz) * 1000.0f;
+    g_dbg_tti.store(tti_ms);
+
+    if (g_pr.armed) return false;          // one press per airtime
+    if (tti_ms <= lead_ms) {
+        g_pr.armed = true;
+        return true;
+    }
+    return false;
+}
+
+// ── output ───────────────────────────────────────────────────────────────
+// +jump is bound to SPACE by default. The separate-key option injects RIGHT
+// instead, for cases where re-injecting the key you are physically holding
+// behaves oddly. Either way the physical key stays swallowed, because a held
+// +jump cannot produce a new jump.
+int inject_vk() {
+    return g_separate_key.load() ? VK_RIGHT : VK_SPACE;
+}
+
+void inject(bool down) {
     static bool s_down = false;
     if (down == s_down) return;
     s_down = down;
 
     INPUT in{};
     in.type = INPUT_KEYBOARD;
-    in.ki.wVk = VK_SPACE;
-    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
+    in.ki.wVk = static_cast<WORD>(inject_vk());
+    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(inject_vk(), MAPVK_VK_TO_VSC));
     in.ki.dwFlags = down ? 0u : KEYEVENTF_KEYUP;
     SendInput(1, &in, sizeof(INPUT));
 }
 
-void bhop_thread_main() {
-    if (g_mem.is_valid())
-        g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(), kJumpRelease);
-
+void run_thread() {
     uintptr_t pawn = 0;
     double    pawn_at = 0.0, last_sample = 0.0;
     bool      ground = false;
+    bool      out_down = false;
+    double    press_until = 0.0;
 
     while (!g_stop.load()) {
         wait_ms(1);
         if (!g_mem.is_valid()) continue;
 
         const bool focused = cs2_focused();
-        g_dbg_focused.store(focused);
+        const bool space   = space_held();
+        const bool active  = g_enabled.load() && focused && space;
 
-        if (!focused || !g_enabled.load()) {
-            if (g_input_mode.load()) inject_space(false);
-            else g_mem.write<int32_t>(g_mem.client_dll + g_jump_offset.load(),
-                                      kJumpRelease);
+        g_dbg_focused.store(focused);
+        g_dbg_space.store(space);
+
+        // Swallow your physical key only while we are actually driving, so
+        // space behaves normally everywhere else.
+        const bool suppress = active;
+        g_suppress.store(suppress);
+        g_dbg_suppress.store(suppress);
+
+        if (!active) {
+            if (out_down) { inject(false); out_down = false; }
+            press_until = 0.0;
+            g_pr.armed = false;
+            g_dbg_driving.store(false);
             continue;
         }
 
@@ -303,24 +346,53 @@ void bhop_thread_main() {
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             pawn_at = now;
         }
-        if (!pawn) continue;
+        if (!pawn) { if (out_down) { inject(false); out_down = false; } continue; }
+
+        // 2 ms sampling. Must be comfortably faster than a 15.6 ms tick for
+        // prediction to have any resolution at all.
+        const float z = g_mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
+        bool predicted_now = false;
 
         if (now - last_sample >= 2.0) {
             last_sample = now;
             ground = sample_ground(g_mem, pawn);
         }
 
-        if (g_input_mode.load()) {
-            inject_space(ground);
+        // ── PREDICTION ───────────────────────────────────────────────────
+        if (g_predict.load()) {
+            predicted_now = predict_step(g_mem, pawn, z, ground,
+                                         g_lead_ms.load());
         } else {
-            if (!g_locked.load()) continue;
-            const uintptr_t jump_addr =
-                g_mem.client_dll + g_jump_offset.load();
-            g_mem.write<int32_t>(jump_addr, ground ? kJumpPress : kJumpRelease);
+            g_dbg_tti.store(-1.0f);
+            g_pr.armed = false;
+            // Keep the reference height fresh even when prediction is off, so
+            // enabling it later does not need a warm-up.
+            if (ground) { g_pr.ground_z = z; g_pr.have_ground_z = true; }
         }
+
+        // ── PRESS DECISIONS ──────────────────────────────────────────────
+        // A press window is opened by either a predicted imminent landing or by
+        // actually observing the ground flag. The window is what guarantees the
+        // press is still down when the engine samples input for that tick.
+        bool start = false;
+        if (predicted_now) { start = true; g_dbg_predicted.fetch_add(1); }
+        if (ground)        { start = true; }
+
+        if (start && now >= press_until)
+            press_until = now + kPressHoldMs;
+
+        const bool want = now < press_until;
+
+        if (want != out_down) {
+            inject(want);
+            if (want) g_dbg_edges.fetch_add(1);
+        }
+        out_down = want;
+        g_dbg_driving.store(true);
     }
 
-    if (g_input_mode.load()) inject_space(false);
+    g_suppress.store(false);
+    inject(false);
 }
 
 } // namespace
@@ -330,38 +402,51 @@ void Bhop_Init() {
     bool expected = false;
     if (!g_started.compare_exchange_strong(expected, true)) return;
 
+    // Ask Windows for a 1 ms timer so sleep(1) is 1 ms and not 15.6 ms. This is
+    // the one genuinely useful thing in the cs2-bhop reference.
+    timeBeginPeriod(1);
+
     g_stop.store(false);
-    g_bhop_thread = std::thread(bhop_thread_main);
-    g_scan_thread = std::thread(scan_thread_main);
+    g_hook_thread = std::thread(hook_thread_main);
+    g_bhop_thread = std::thread(run_thread);
 }
 
 void Bhop_Shutdown() {
     g_stop.store(true);
-    inject_space(false);
+    g_suppress.store(false);
+    inject(false);
+
+    if (g_hook_tid.load())
+        PostThreadMessageW(g_hook_tid.load(), WM_QUIT, 0, 0);
+
     if (g_bhop_thread.joinable()) g_bhop_thread.join();
-    if (g_scan_thread.joinable()) g_scan_thread.join();
+    if (g_hook_thread.joinable()) g_hook_thread.join();
+
+    timeEndPeriod(1);
     g_started.store(false);
 }
 
 BhopDebug Bhop_GetDebug() {
     BhopDebug d;
-    d.offset     = g_jump_offset.load();
-    d.on_ground  = g_dbg_ground.load();
-    d.focused    = g_dbg_focused.load();
-    d.signals    = g_dbg_signals.load();
-    d.locked     = g_locked.load();
-    d.scanning   = g_scanning.load();
-    d.candidates = g_dbg_cands.load();
+    d.enabled      = g_enabled.load();
+    d.predict      = g_predict.load();
+    d.separate_key = g_separate_key.load();
+    d.on_ground    = g_dbg_ground.load();
+    d.focused      = g_dbg_focused.load();
+    d.space_held   = g_dbg_space.load();
+    d.hook_ok      = g_hook_ok.load();
+    d.driving      = g_dbg_driving.load();
+    d.suppressing  = g_dbg_suppress.load();
+    d.signals      = g_dbg_signals.load();
+    d.edges        = g_dbg_edges.load();
+    d.predicted    = g_dbg_predicted.load();
+    d.vz           = g_dbg_vz.load();
+    d.tti          = g_dbg_tti.load();
     return d;
 }
 
-void Bhop_Rescan() {
-    g_locked.store(false);
-    if (g_scan_thread.joinable()) g_scan_thread.join();
-    if (!g_started.load()) return;
-    g_scan_thread = std::thread(scan_thread_main);
-}
-
-void Bhop_SetEnabled(bool enabled) { g_enabled.store(enabled); }
-bool Bhop_InputMode()              { return g_input_mode.load(); }
-void Bhop_SetInputMode(bool enabled) { g_input_mode.store(enabled); }
+void  Bhop_SetEnabled(bool on)     { g_enabled.store(on); if (!on) inject(false); }
+void  Bhop_SetPredict(bool on)     { g_predict.store(on); }
+void  Bhop_SetSeparateKey(bool on) { g_separate_key.store(on); inject(false); }
+void  Bhop_SetLead(float ms)       { g_lead_ms.store(ms); }
+float Bhop_Lead()                  { return g_lead_ms.load(); }
