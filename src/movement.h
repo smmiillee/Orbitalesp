@@ -17,6 +17,7 @@ struct MovementDebug {
     bool  crouching   = false;   // we have CTRL held
     bool  game_ducked = false;   // the GAME thinks we are crouched
     bool  armed       = false;
+    bool  jumping     = false;   // SPACE currently held
     float vz          = 0.0f;
     float tti         = -1.0f;
     int   jumpbugs    = 0;
