@@ -2,48 +2,32 @@
 #pragma once
 #include <cstdint>
 
-// One bhop engine. SPACE only, no keybind, no memory writes.
+// Bhop. SPACE only, held as the gate, no keybind, no memory writes.
 //
-// ══ THE TWO MECHANISMS ══════════════════════════════════════════════════
+// ══ TIMING IS HARD-LOCKED ═══════════════════════════════════════════════
+// The values below are compiled in. They were chosen from reasoning rather than
+// taste, and the reasoning is written next to each one. There are no sliders.
 //
-// 1. HOLD. An injected down+up pair inside a single SendInput call leaves the
-//    key down for ~0 us, and CS2 samples keyboard state once per frame -- so
-//    such a press is frequently never observed. The key must therefore be held
-//    long enough to span a frame. This is already fixed and working.
+// ══ WHAT THIS CAN AND CANNOT DO ═════════════════════════════════════════
+// This is an EXTERNAL. The game builds its input from its own per-frame
+// sampling of keyboard state, in its own process, on its own schedule. We can
+// only post a key event and hope it lands inside one of those windows, and our
+// ground detection is itself one sample behind because we read a value the game
+// already wrote. Those two unsynchronised clocks are the residual error.
 //
-// 2. PRESS BEFORE THE LANDING. This is the remaining miss. We currently press
-//    AFTER observing the ground flag, which means the press is always late
-//    relative to the landing sample. A human scrolling continuously gets a
-//    notch in flight before touchdown, which is why manual bhop feels better.
+// Prediction reduces it by pressing before touchdown instead of reacting to it.
+// It cannot eliminate it, because the error is a timing gap between two
+// independent processes rather than a constant that can be subtracted.
 //
-//    So we estimate the landing from vertical velocity and start the press
-//    `lead_ms` BEFORE it, holding across the predicted touchdown. The key is
-//    then already down when the landing is sampled.
-//
-//    `lead_ms` is the control that matters now.
-//
-// The ground-flag retry is kept as a fallback, so if prediction is wrong we
-// still press once we can see we are grounded. Prediction can only add presses.
-//
-// ══ HONEST LIMIT ════════════════════════════════════════════════════════
-// Our ground detection is asynchronous to the game's input sampling, so the
-// gap between detection and the sampled tick cannot be closed from outside the
-// process. Prediction closes most of it by acting early instead of reacting.
-// It cannot be proven error-free from here.
+// Reaching 100% requires setting the jump state inside the game's own process,
+// in the same frame it builds input in. That is an internal, and a different
+// architecture. This file is the best an external can do.
 struct BhopDebug {
-    bool  focused     = false;
-    bool  space_held  = false;
-    bool  hook_ok     = false;
-    bool  on_ground   = false;
-    bool  suppressing = false;
-    bool  pressing    = false;   // key currently down
-
-    int   injected    = 0;       // presses started this session
-    int   age_ms      = -1;      // ms since last press, -1 = never
-
-    float vz          = 0.0f;    // vertical velocity, units/sec
-    float tti         = -1.0f;   // predicted ms to landing, -1 = unknown
-    int   pred_hits   = 0;       // presses started by prediction
+    bool  focused    = false;
+    bool  space_held = false;
+    bool  hook_ok    = false;
+    bool  on_ground  = false;
+    bool  pressing   = false;
 };
 
 void Bhop_Init();
@@ -53,15 +37,3 @@ BhopDebug Bhop_GetDebug();
 
 void Bhop_SetEnabled(bool on);
 bool Bhop_Enabled();
-
-// How early to press before the predicted landing, in ms.
-void  Bhop_SetLeadMs(float ms);
-float Bhop_LeadMs();
-
-// How long the key stays down per press. Must exceed one frame.
-void  Bhop_SetHoldMs(float ms);
-float Bhop_HoldMs();
-
-// Fallback retry interval while grounded.
-void  Bhop_SetRetryMs(float ms);
-float Bhop_RetryMs();
