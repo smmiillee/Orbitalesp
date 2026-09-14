@@ -16,6 +16,7 @@
 #include "offsets.h"
 #include "bhop.h"
 #include "aim.h"
+#include "movement.h"
 
 static ESP g_esp;
 static bool g_running = true;
@@ -24,9 +25,6 @@ bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
 
 // ── logging ──────────────────────────────────────────────────────────────
-// Silent failure modes are the theme of this project: a blocked startup loop,
-// a wrongly-chosen window, or a self-hiding overlay all look identical from
-// outside. The log says which one it was.
 static FILE* g_log = nullptr;
 
 static void open_log() {
@@ -55,8 +53,6 @@ void OrbitalLog(const char* fmt, ...) {
     fflush(g_log);
 }
 
-// A file next to the exe, falling back to C:\ if that folder is not writable
-// (Program Files, for instance).
 static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
     out[0] = L'\0';
     wchar_t exe[MAX_PATH]{};
@@ -69,6 +65,16 @@ static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
     }
     if (!out[0]) swprintf_s(out, cap, L"C:\\%s", name);
 }
+
+// ══ GLOBALS THAT THE CONFIG CODE USES MUST COME FIRST ════════════════════
+// The previous version inserted load_config() ABOVE these declarations, so
+// g_screen_w and friends did not exist where the config code referenced them.
+static int  g_screen_w = 1920;
+static int  g_screen_h = 1080;
+static int  g_local_team = 0;
+static int  g_detected_hz = 0;
+static bool g_limit_fps = true;
+static int  g_fps_override = 0;
 
 struct Config {
     // ESP visuals
@@ -98,22 +104,19 @@ struct Config {
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
     // Menu skin.
-    ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };  // the blue bar
+    ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };
     ImVec4 menu_button = { 0.88f, 0.80f, 0.55f, 1.00f };
     ImVec4 menu_slider = { 0.55f, 0.55f, 0.55f, 1.00f };
 
-    // Bhop -- timing is locked in bhop.cpp, so only the toggle is configured.
-    bool bh_enabled = false;
-
-    // Triggerbot. Detection is read-only; firing injects a click.
-    bool aim_enabled = false;
-    bool aim_fire    = true;
-    int  aim_key     = 0;   // 0 = always active
-    float aim_radius = 1.4f; // percent of screen height
+    // Feature toggles.
+    bool  bh_enabled  = false;
+    bool  aim_enabled = false;
+    bool  aim_fire    = true;
+    int   aim_key     = 0;
+    bool  jb_enabled  = false;
 } g_cfg;
 
 // ── config file ──────────────────────────────────────────────────────────
-// Plain key=value text next to the exe: trivial to read, hand-edit and diff.
 static void save_config() {
     wchar_t path[MAX_PATH]{};
     sidecar_path(path, MAX_PATH, L"orbital.cfg");
@@ -144,8 +147,8 @@ static void save_config() {
     W_C(menu_title);   W_C(menu_button);  W_C(menu_slider);
 
     W_B(bh_enabled);
-    W_B(aim_enabled);      W_B(aim_fire);
-    W_I(aim_key);          W_F(aim_radius);
+    W_B(aim_enabled);  W_B(aim_fire);     W_I(aim_key);
+    W_B(jb_enabled);
 
 #undef W_B
 #undef W_I
@@ -162,7 +165,7 @@ static void load_config() {
 
     FILE* f = nullptr;
     _wfopen_s(&f, path, L"r");
-    if (!f) return;   // no config yet is normal on first run
+    if (!f) return;
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -172,57 +175,49 @@ static void load_config() {
         const char* key = line;
         const char* val = eq + 1;
 
-        auto b = [&](bool& field)  { field = (atoi(val) != 0); };
-        auto s = [&](float& field) { field = static_cast<float>(atof(val)); };
-        auto c = [&](ImVec4& field) {
+        auto as_bool  = [&](bool& field)  { field = (atoi(val) != 0); };
+        auto as_int   = [&](int& field)   { field = atoi(val); };
+        auto as_float = [&](float& field) { field = static_cast<float>(atof(val)); };
+        auto as_col   = [&](ImVec4& field) {
             float r = 0, g = 0, bl = 0, a = 1;
             sscanf_s(val, "%f %f %f %f", &r, &g, &bl, &a);
             field = ImVec4(r, g, bl, a);
         };
 
-        if      (!strcmp(key, "esp_boxes"))        b(g_cfg.esp_boxes);
-        else if (!strcmp(key, "esp_skeleton"))     b(g_cfg.esp_skeleton);
-        else if (!strcmp(key, "esp_head_dot"))     b(g_cfg.esp_head_dot);
-        else if (!strcmp(key, "esp_name"))         b(g_cfg.esp_name);
-        else if (!strcmp(key, "esp_weapon"))       b(g_cfg.esp_weapon);
-        else if (!strcmp(key, "esp_health"))       b(g_cfg.esp_health);
-        else if (!strcmp(key, "esp_distance"))     b(g_cfg.esp_distance);
-        else if (!strcmp(key, "esp_bomb"))         b(g_cfg.esp_bomb);
-        else if (!strcmp(key, "esp_show_enemies")) b(g_cfg.esp_show_enemies);
-        else if (!strcmp(key, "esp_show_team"))    b(g_cfg.esp_show_team);
-        else if (!strcmp(key, "box_thickness"))    s(g_cfg.box_thickness);
-        else if (!strcmp(key, "team_colors"))      b(g_cfg.team_colors);
-        else if (!strcmp(key, "color_enemy"))      c(g_cfg.color_enemy);
-        else if (!strcmp(key, "color_team"))       c(g_cfg.color_team);
-        else if (!strcmp(key, "color_box"))        c(g_cfg.color_box);
-        else if (!strcmp(key, "color_skel"))       c(g_cfg.color_skel);
-        else if (!strcmp(key, "color_head"))       c(g_cfg.color_head);
-        else if (!strcmp(key, "color_name"))       c(g_cfg.color_name);
-        else if (!strcmp(key, "color_weapon"))     c(g_cfg.color_weapon);
-        else if (!strcmp(key, "color_dist"))       c(g_cfg.color_dist);
-        else if (!strcmp(key, "color_bomb"))       c(g_cfg.color_bomb);
-        else if (!strcmp(key, "color_carrier"))    c(g_cfg.color_carrier);
-        else if (!strcmp(key, "menu_title"))       c(g_cfg.menu_title);
-        else if (!strcmp(key, "menu_button"))      c(g_cfg.menu_button);
-        else if (!strcmp(key, "menu_slider"))      c(g_cfg.menu_slider);
-        else if (!strcmp(key, "bh_enabled"))       b(g_cfg.bh_enabled);
-        else if (!strcmp(key, "aim_enabled"))      b(g_cfg.aim_enabled);
-        else if (!strcmp(key, "aim_fire"))         b(g_cfg.aim_fire);
-        else if (!strcmp(key, "aim_key"))          i(g_cfg.aim_key);
-        else if (!strcmp(key, "aim_radius"))       s(g_cfg.aim_radius);
+        if      (!strcmp(key, "esp_boxes"))        as_bool(g_cfg.esp_boxes);
+        else if (!strcmp(key, "esp_skeleton"))     as_bool(g_cfg.esp_skeleton);
+        else if (!strcmp(key, "esp_head_dot"))     as_bool(g_cfg.esp_head_dot);
+        else if (!strcmp(key, "esp_name"))         as_bool(g_cfg.esp_name);
+        else if (!strcmp(key, "esp_weapon"))       as_bool(g_cfg.esp_weapon);
+        else if (!strcmp(key, "esp_health"))       as_bool(g_cfg.esp_health);
+        else if (!strcmp(key, "esp_distance"))     as_bool(g_cfg.esp_distance);
+        else if (!strcmp(key, "esp_bomb"))         as_bool(g_cfg.esp_bomb);
+        else if (!strcmp(key, "esp_show_enemies")) as_bool(g_cfg.esp_show_enemies);
+        else if (!strcmp(key, "esp_show_team"))    as_bool(g_cfg.esp_show_team);
+        else if (!strcmp(key, "box_thickness"))    as_float(g_cfg.box_thickness);
+        else if (!strcmp(key, "team_colors"))      as_bool(g_cfg.team_colors);
+        else if (!strcmp(key, "color_enemy"))      as_col(g_cfg.color_enemy);
+        else if (!strcmp(key, "color_team"))       as_col(g_cfg.color_team);
+        else if (!strcmp(key, "color_box"))        as_col(g_cfg.color_box);
+        else if (!strcmp(key, "color_skel"))       as_col(g_cfg.color_skel);
+        else if (!strcmp(key, "color_head"))       as_col(g_cfg.color_head);
+        else if (!strcmp(key, "color_name"))       as_col(g_cfg.color_name);
+        else if (!strcmp(key, "color_weapon"))     as_col(g_cfg.color_weapon);
+        else if (!strcmp(key, "color_dist"))       as_col(g_cfg.color_dist);
+        else if (!strcmp(key, "color_bomb"))       as_col(g_cfg.color_bomb);
+        else if (!strcmp(key, "color_carrier"))    as_col(g_cfg.color_carrier);
+        else if (!strcmp(key, "menu_title"))       as_col(g_cfg.menu_title);
+        else if (!strcmp(key, "menu_button"))      as_col(g_cfg.menu_button);
+        else if (!strcmp(key, "menu_slider"))      as_col(g_cfg.menu_slider);
+        else if (!strcmp(key, "bh_enabled"))       as_bool(g_cfg.bh_enabled);
+        else if (!strcmp(key, "aim_enabled"))      as_bool(g_cfg.aim_enabled);
+        else if (!strcmp(key, "aim_fire"))         as_bool(g_cfg.aim_fire);
+        else if (!strcmp(key, "aim_key"))          as_int(g_cfg.aim_key);
+        else if (!strcmp(key, "jb_enabled"))       as_bool(g_cfg.jb_enabled);
     }
     fclose(f);
     OrbitalLog("config loaded");
-}</｜DSML｜ parameter>
-</invoke>
-
-
-static int  g_screen_w = 1920;
-static int  g_screen_h = 1080;
-static int  g_local_team = 0;
-static int  g_detected_hz = 0;
-static bool g_limit_fps = true;
-static int  g_fps_override = 0;
+}
 
 static int query_refresh_rate(HWND game) {
     if (!game) return 0;
@@ -252,11 +247,6 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
 }
 
 // ── game window lookup ───────────────────────────────────────────────────
-// FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
-// keep the game window in front of its own detached console -- taking the first
-// match landed us on a 192x456 console window. So we enumerate every SDL
-// window, log them all, and pick the best: titled first, then largest client
-// area, with small windows penalised.
 struct WindowCand {
     HWND hwnd;
     int  w, h;
@@ -357,14 +347,14 @@ static constexpr int kSkeleton[][2] = {
     { BONE_R_KNEE,     BONE_R_FOOT     },
 };
 
-static void apply_bhop_config() {
+static void apply_feature_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
-}
 
-static void apply_aim_config() {
     Aim_SetEnabled(g_cfg.aim_enabled);
     Aim_SetFire(g_cfg.aim_fire);
     Aim_SetKey(g_cfg.aim_key);
+
+    Movement_SetJumpbug(g_cfg.jb_enabled);
 }
 
 void memory_thread() {
@@ -374,17 +364,18 @@ void memory_thread() {
     OrbitalLog("memory attach: %s", g_mem.is_valid() ? "ok" : "FAILED");
 
     Bhop_Init();
-    apply_bhop_config();
     Aim_Init();
-    apply_aim_config();
+    Movement_Init();
+    apply_feature_config();
 
     while (g_running) {
         if (g_mem.is_valid()) {
             const uintptr_t local_pawn = g_mem.read<uintptr_t>(
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
-            if (local_pawn)
+            if (local_pawn) {
                 g_local_team =
                     g_mem.read<uint8_t>(local_pawn + offsets::m_iTeamNum);
+            }
 
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
@@ -423,8 +414,6 @@ void render_esp(ImDrawList* dl) {
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
 
-        // Text spacing scales with the box and is clamped, so labels stay just
-        // outside the box at every distance.
         float gap = bh * 0.06f;
         if (gap < 2.0f) gap = 2.0f;
         if (gap > 8.0f) gap = 8.0f;
@@ -559,10 +548,6 @@ static void tab_esp() {
     ImGui::Columns(1);
 }
 
-// ── AIM tab: triggerbot ──────────────────────────────────────────────────
-// Detection is read-only. Firing injects a click -- there is no way for the
-// game to shoot from a read, so that part is input injection, same as bhop's
-// space. Unticking Firing leaves a detection-only indicator.
 static void tab_aim() {
     ImGui::TextDisabled("[ Triggerbot ]");
     ImGui::TextDisabled("detection: read-only     firing: injects a click");
@@ -571,16 +556,16 @@ static void tab_aim() {
     if (ImGui::Checkbox("Triggerbot", &g_cfg.aim_enabled))
         Aim_SetEnabled(g_cfg.aim_enabled);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Fires when the crosshair is within the radius of an\n"
-                          "enemy bone. Uses the NEWEST position, not the\n"
-                          "smoothed one, so it does not fire behind a mover.");
+        ImGui::SetTooltip("Fires when the crosshair is within range of an enemy\n"
+                          "bone. Uses the NEWEST position, not the smoothed one,\n"
+                          "so it does not fire behind a moving target.");
 
     if (ImGui::Checkbox("Firing (injects left click)", &g_cfg.aim_fire))
         Aim_SetFire(g_cfg.aim_fire);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Unticked: the trigger still detects and shows the\n"
-                          "indicator, but never clicks. That makes the whole\n"
-                          "feature read-only.");
+                          "indicator, but never clicks. That makes the feature\n"
+                          "read-only.");
 
     static const char* const kKeyNames[] = {
         "always on", "MOUSE5", "MOUSE4", "ALT", "SHIFT", "CTRL", "CAPS"
@@ -599,17 +584,6 @@ static void tab_aim() {
         g_cfg.aim_key = kKeyVks[cur];
         Aim_SetKey(g_cfg.aim_key);
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hold this to arm the trigger.\n"
-                          "'always on' fires whenever the radius is met.");
-
-    if (ImGui::SliderFloat("radius %.2f%% of height", &g_cfg.aim_radius,
-                           0.4f, 5.0f, "%.2f%%")) {
-        // kept local until the aim module reads it; see note below
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How close to the crosshair a bone must be, as a\n"
-                          "percentage of screen height. ~1.4%% is head-sized.");
 
     const AimDebug ad = Aim_GetDebug();
     ImGui::Separator();
@@ -622,36 +596,36 @@ static void tab_aim() {
     ImGui::TextDisabled("firing: %s", ad.firing ? "yes" : "no");
 }
 
-// ── RADAR tab: placeholder ───────────────────────────────────────────────
-// Reserved for the radar from the other repo. Deliberately inert for now.
-static void tab_radar() {
-    ImGui::TextDisabled("[ Radar ]");
+static void tab_movement() {
+    ImGui::TextDisabled("[ Movement ]");
+    ImGui::TextDisabled("injects CTRL; nothing is written to CS2");
     ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::TextDisabled("not implemented yet");
-    ImGui::Spacing();
-    ImGui::TextDisabled("This tab is reserved for the radar module.");
-}
 
-static void tab_misc() {
+    if (ImGui::Checkbox("Jumpbug", &g_cfg.jb_enabled))
+        Movement_SetJumpbug(g_cfg.jb_enabled);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Crouches just before you land, then releases after\n"
+                          "touchdown. Cancels fall damage reliably, and gains\n"
+                          "height on the frames the crouch lines up with the\n"
+                          "landing. No key needed - it arms itself while\n"
+                          "airborne and falling.");
+
+    const MovementDebug md = Movement_GetDebug();
+    ImGui::Text("ground: %s   crouching: %s",
+        md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no");
+    ImGui::TextDisabled("vz %.0f   tti %.1f ms   jumpbugs %d",
+        md.vz, md.tti, md.jumpbugs);
+
+    ImGui::Separator();
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::TextDisabled("HOLD SPACE - no auto-jump, no keybind");
-    ImGui::TextDisabled("injects SPACE; nothing is written to CS2");
-    ImGui::Separator();
-
     if (ImGui::Checkbox("Bhop (space)", &g_cfg.bh_enabled))
         Bhop_SetEnabled(g_cfg.bh_enabled);
 
     const BhopDebug bd = Bhop_GetDebug();
-
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("pressing: %s", bd.pressing ? "yes" : "no");
-
-    if (!bd.hook_ok)
-        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
-                           "key hook failed - gate may misbehave");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -661,6 +635,15 @@ static void tab_misc() {
     ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
         g_fps_override ? "cap %d fps" : "cap auto (refresh)");
     ImGui::Checkbox("V-Sync", &g_vsync);
+}
+
+static void tab_radar() {
+    ImGui::TextDisabled("[ Radar ]");
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("not implemented yet");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Reserved for the radar module.");
 }
 
 static void tab_colors() {
@@ -701,8 +684,20 @@ static void tab_colors() {
     ImGui::Columns(1);
 }
 
+static void tab_misc() {
+    ImGui::TextDisabled("[ Config ]");
+    ImGui::Separator();
+    ImGui::TextDisabled("saved next to the exe as orbital.cfg");
+    ImGui::TextDisabled("also saved automatically on exit");
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ game window ]");
+    ImGui::TextDisabled("found: %s",
+        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "yes" : "NO");
+    ImGui::TextDisabled("viewport: %dx%d", g_screen_w, g_screen_h);
+    ImGui::TextDisabled("refresh: %d Hz", g_detected_hz);
+}
+
 void render_menu() {
-    // Menu skin, reapplied every frame so the pickers take effect live.
     {
         ImGuiStyle& st = ImGui::GetStyle();
         st.Colors[ImGuiCol_TitleBg]       = g_cfg.menu_title;
@@ -711,7 +706,7 @@ void render_menu() {
         st.Colors[ImGuiCol_SliderGrab]    = g_cfg.menu_slider;
     }
 
-    ImGui::SetNextWindowSize({ 600.0f, 520.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSize({ 600.0f, 540.0f }, ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints({ 500.0f, 320.0f }, { 1000.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital - Mars", nullptr);
@@ -727,11 +722,12 @@ void render_menu() {
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("##orbital_tabs", ImGuiTabBarFlags_None)) {
-        if (ImGui::BeginTabItem("ESP"))    { tab_esp();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("AIM"))    { tab_aim();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("RADAR"))  { tab_radar();  ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("COLORS")) { tab_colors(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("MISC"))   { tab_misc();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("ESP"))      { tab_esp();      ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("AIM"))      { tab_aim();      ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("MOVEMENT")) { tab_movement(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("RADAR"))    { tab_radar();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("COLORS"))   { tab_colors();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("MISC"))     { tab_misc();     ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
 
@@ -746,14 +742,12 @@ void render_menu() {
     if (ImGui::Button("[Reset]", { btn_w3, 0 })) {
         g_cfg = Config{};
         g_esp.interp_delay_ms = 35.0f;
-        apply_bhop_config();
-        apply_aim_config();
+        apply_feature_config();
     }
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { btn_w3, 0 })) g_running = false;
 
     ImGui::TextDisabled("INSERT - menu (in-game only)    F9 - exit");
-    ImGui::TextDisabled("config: orbital.cfg next to the exe");
 
     ImGui::End();
 }
@@ -801,16 +795,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) g_running = false;
         }
 
-        // INSERT only acts while CS2 is the foreground window. Previously you
-        // could toggle the menu while alt-tabbed, which meant the overlay could
-        // appear over whatever you switched to. g_cs2_hwnd is the game's own
-        // handle, so this test is exact rather than a guess by process name.
+        // INSERT only acts while CS2 is the foreground window, and losing focus
+        // closes the menu, so it can never be left over another application.
         const bool cs2_active =
             (g_cs2_hwnd && IsWindow(g_cs2_hwnd) &&
              GetForegroundWindow() == g_cs2_hwnd);
 
-        // Losing focus also closes the menu, so it can never be left sitting on
-        // top of another application.
         if (!cs2_active && g_menu_open) g_menu_open = false;
 
         if (cs2_active && (GetAsyncKeyState(VK_INSERT) & 1))
@@ -856,6 +846,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     mem_t.join();
     Bhop_Shutdown();
     Aim_Shutdown();
+    Movement_Shutdown();
     overlay.cleanup();
     g_mem.detach();
 
