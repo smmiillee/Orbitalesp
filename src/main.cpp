@@ -144,10 +144,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
 
     // Read actual CS2 window resolution
-    HWND cs2 = FindWindowA("SDL_app", nullptr);
-    if (cs2) {
+    g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
+    if (g_cs2_hwnd) {
         RECT r{};
-        if (GetClientRect(cs2, &r) && r.right > 0) {
+        if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0) {
             g_screen_w = r.right;
             g_screen_h = r.bottom;
         }
