@@ -1,5 +1,4 @@
 // --- src/aim.cpp ---
-// Triggerbot. Detection is read-only; firing injects a click.
 #include "aim.h"
 #include "esp.h"
 #include "memory.h"
@@ -22,22 +21,32 @@ extern int g_screen_h;
 
 namespace {
 
-struct Hit { int bone; const char* name; };
+// ---- HARDCODED BONE RADII ----
+// Authored against a 1080p reference and scaled by actual height, so the
+// behaviour is identical at any resolution without a user control.
+struct Hit { int bone; const char* name; float radius_px_at_1080; };
 constexpr Hit kHits[] = {
-    {BONE_HEAD,"head"},{BONE_NECK,"neck"},{BONE_CHEST,"chest"},
-    {BONE_PELVIS,"pelvis"},{BONE_SPINE_1,"spine"},
+    { BONE_HEAD,    "head",   14.0f },
+    { BONE_NECK,    "neck",   12.0f },
+    { BONE_CHEST,   "chest",  16.0f },
+    { BONE_SPINE_1, "spine",  16.0f },
+    { BONE_PELVIS,  "pelvis", 15.0f },
 };
+constexpr float kReferenceHeight = 1080.0f;
 
 std::atomic<bool>  g_stop{false}, g_started{false};
 std::atomic<bool>  g_on{false}, g_fire{true};
-std::atomic<int>   g_key{0};          // 0 == unbound == OFF
-std::atomic<float> g_radius{1.4f};
+std::atomic<bool>  g_teamcheck{true}, g_vischeck{false};
+std::atomic<int>   g_key{0};        // 0 == unbound == OFF
 std::atomic<int>   g_delay{0};
 
 std::atomic<bool>  g_dbg_firing{false}, g_dbg_on{false};
+std::atomic<bool>  g_dbg_vis{false},    g_dbg_visable{false};
 std::atomic<float> g_dbg_dist{-1.0f};
 std::atomic<const char*> g_dbg_bone{"-"};
+std::atomic<const char*> g_dbg_blocked{"-"};
 std::atomic<int>   g_dbg_held{0};
+std::atomic<int>   g_vis_samples{0}, g_vis_hits{0};
 
 std::thread g_thread;
 
@@ -76,20 +85,28 @@ void mouse(bool down) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// Radar-spotted mask for a pawn. APPROXIMATE visibility, see aim.h.
+uint32_t spotted_mask(const Memory& mem, uintptr_t pawn) {
+    return mem.read<uint32_t>(
+        pawn + offsets::m_entitySpottedState + offsets::m_bSpottedByMask);
+}
+
 void run_thread() {
     bool   down = false;
     double down_at = 0.0;
     double next_shot = 0.0;
     double target_since = 0.0;
 
+    // The vis check proves itself by ever reading a nonzero mask. Until it has,
+    // it is treated as untrustworthy and does not block firing.
+    bool vis_trusted = false;
+
     while (!g_stop.load()) {
         wait_ms(2.0);
 
         const int k = g_key.load();
 
-        // *** UNBOUND MEANS OFF ***
-        // key == 0 is NOT "always on". The trigger only runs while a bound key
-        // is physically held, so an unbound triggerbot does nothing at all.
+        // UNBOUND MEANS OFF. key == 0 is not "always on".
         const bool gate = g_on.load() && g_mem.is_valid() && cs2_focused() &&
                           k != 0 && ((GetAsyncKeyState(k) & 0x8000) != 0);
 
@@ -102,15 +119,15 @@ void run_thread() {
             continue;
         }
 
-        // The cooldown clears the acquisition timer, so the full delay elapses
-        // AFTER the cooldown ends rather than appearing to count from the
-        // previous shot.
         if (down && now_ms() - down_at >= kClickMs) {
             mouse(false);
             down = false;
             g_dbg_firing.store(false);
         }
 
+        // Cooldown clears the acquisition timer, so the full delay elapses
+        // after the cooldown ends rather than appearing to count from the
+        // previous shot.
         const double now = now_ms();
         if (now < next_shot) {
             target_since = 0.0;
@@ -125,30 +142,76 @@ void run_thread() {
             g_esp.project(g_mem, g_mem.client_dll, sw, sh, false);
 
         const float cx = sw * 0.5f, cy = sh * 0.5f;
-        const float radius = sh * (g_radius.load() / 100.0f);
+        const float scale = (float)sh / kReferenceHeight;
 
-        bool found = false;
+        const uintptr_t local_pawn =
+            g_mem.read<uintptr_t>(g_mem.client_dll + offsets::dwLocalPlayerPawn);
+
+        bool  found = false, blocked = false, has_vis = false;
         float best = 1e9f;
         const char* best_name = "-";
+        const char* why = "-";
 
         for (const PlayerESP& p : players) {
             if (p.team == 0) continue;
-            if (g_local_team != 0 && p.team == g_local_team) continue;
+
+            if (g_teamcheck.load() && g_local_team != 0 &&
+                p.team == g_local_team) {
+                // Only reported as a block if we were actually aiming at them.
+                continue;
+            }
+
+            // Which hardcoded bone windows is the crosshair inside?
+            const Hit* in_bone = nullptr;
             for (const Hit& h : kHits) {
                 if (!p.bone_ok[h.bone]) continue;
                 const float dx = p.bones[h.bone].x - cx;
                 const float dy = p.bones[h.bone].y - cy;
                 const float d = std::sqrt(dx * dx + dy * dy);
-                if (d > radius) continue;
-                if (d < best) { best = d; best_name = h.name; found = true; }
+                if (d > h.radius_px_at_1080 * scale) continue;
+                if (!in_bone || d < best) {
+                    in_bone = &h;
+                    best = d;
+                    best_name = h.name;
+                }
+            }
+            if (!in_bone) continue;
+
+            found = true;
+
+            // ---- approximate visibility ----
+            if (g_vischeck.load()) {
+                const uint32_t mask = spotted_mask(g_mem, p.pawn);
+                ++g_vis_samples;
+                if (mask != 0) {
+                    ++g_vis_hits;
+                    vis_trusted = true;   // the offset reads something real
+                }
+
+                // Only enforce once the check has proved it works.
+                if (vis_trusted) {
+                    if (mask == 0) {
+                        blocked = true;
+                        why = "vis";
+                        continue;
+                    }
+                    has_vis = true;
+                } else {
+                    g_dbg_visable.store(false);
+                }
+            } else {
+                has_vis = true;
             }
         }
 
         g_dbg_on.store(found);
+        g_dbg_vis.store(has_vis);
+        g_dbg_visable.store(vis_trusted);
         g_dbg_dist.store(found ? best : -1.0f);
         g_dbg_bone.store(found ? best_name : "-");
+        g_dbg_blocked.store(blocked ? why : "-");
 
-        if (!found) {
+        if (blocked || !found) {
             target_since = 0.0;
             g_dbg_held.store(0);
             continue;
@@ -160,7 +223,7 @@ void run_thread() {
 
         if (held < g_delay.load()) continue;
 
-        if (g_fire.load()) {
+        if (g_fire.load() && local_pawn) {
             mouse(true);
             down = true;
             down_at = now;
@@ -195,6 +258,11 @@ AimDebug Aim_GetDebug() {
     d.enabled     = g_on.load();
     d.firing      = g_dbg_firing.load();
     d.on_target   = g_dbg_on.load();
+    d.has_vis     = g_dbg_vis.load();
+    d.vis_usable  = g_dbg_visable.load();
+    d.vis_samples = g_vis_samples.load();
+    d.vis_hits    = g_vis_hits.load();
+    d.blocked_by  = g_dbg_blocked.load();
     d.target_dist = g_dbg_dist.load();
     d.target_bone = g_dbg_bone.load();
     d.delay_ms    = g_delay.load();
@@ -209,12 +277,11 @@ bool Aim_Fire() { return g_fire.load(); }
 void Aim_SetKey(int vk) { g_key.store(vk); }
 int  Aim_Key() { return g_key.load(); }
 
-void Aim_SetRadius(float pct) {
-    if (pct < 0.2f) pct = 0.2f;
-    if (pct > 10.0f) pct = 10.0f;
-    g_radius.store(pct);
-}
-float Aim_Radius() { return g_radius.load(); }
+void Aim_SetTeamCheck(bool on) { g_teamcheck.store(on); }
+bool Aim_TeamCheck() { return g_teamcheck.load(); }
+
+void Aim_SetVisCheck(bool on) { g_vischeck.store(on); }
+bool Aim_VisCheck() { return g_vischeck.load(); }
 
 void Aim_SetDelay(int ms) {
     if (ms < 0) ms = 0;
