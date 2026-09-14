@@ -2,56 +2,52 @@
 #pragma once
 #include <cstdint>
 
-// Bhop by KEYSTROKE INJECTION ONLY. Nothing in this file writes to cs2.exe.
+// Bhop by INPUT INJECTION ONLY. Nothing in this file writes to cs2.exe, and the
+// project as a whole performs zero writes to the game process.
 //
-// Removing the memory-write bhop means the whole project now performs ZERO
-// writes to the game process -- it only reads memory and injects keystrokes.
+// ══ THE TWO TECHNIQUES, BOTH GATED ON HOLDING SPACE ══════════════════════
 //
-// ══ HOW HOLD-SPACE WORKS ═════════════════════════════════════════════════
-// Holding the physical key is a GATE, not the input. While bhop is driving, the
-// keyboard hook swallows your physical spacebar, because holding it makes the
-// engine's +jump stay down -- and a jump needs a fresh PRESS edge, so a held key
-// means you can never re-jump on landing. With your key swallowed, the game's
-// jump input comes only from us and every landing gets its own clean edge.
+//  SCROLL (default, recommended) -- repeatedly injects mouse-wheel events while
+//      the gate is held. A wheel event is itself a press+release pair for a
+//      `+jump` bind, and we emit several per game tick, so one of them lands in
+//      the window the game allows for a re-jump on landing.
 //
-// ══ THE TWO OUTPUT MODES ═════════════════════════════════════════════════
-//  PLAIN      - press when the ground flag says you are grounded. Simple, and
-//               correct as far as it goes, but the flag is only written once
-//               per game tick (~15.6 ms), so by the time we see it the landing
-//               tick may already have passed.
+//      This is why scroll beats prediction: prediction has to hit one specific
+//      tick and its error is as wide as the window, whereas spamming covers
+//      every phase of the tick instead of trying to hit one.
 //
-//  PREDICTIVE - instead of waiting to OBSERVE the landing, estimate when it
-//               will happen from your vertical velocity and press slightly
-//               early, so the press is already down when the engine samples
-//               input for the landing tick. The observed ground flag is still
-//               used as a fallback, so prediction can only help.
+//  KEY EDGE (optional) -- presses/releases a key once per observed landing.
+//      Kept as a second chance, not as the primary path.
 //
-// ══ HONEST STATUS ════════════════════════════════════════════════════════
-// Prediction is an EXPERIMENT. There is no reference implementation to copy --
-// the cs2-bhop repo people cite for this is itself a memory-write bhop, and the
-// SendInput snippet circulating online is not from it. Whether early-pressing
-// lands inside the right input window depends on engine internals I cannot
-// inspect, so treat this as something to measure rather than something proven.
+// ══ WHY YOUR PHYSICAL KEY IS SWALLOWED WHILE DRIVING ═════════════════════
+// Holding space makes the engine's own +jump stay down. A button that is
+// already down cannot produce a new press edge, so a held key would block every
+// jump we try to inject. While bhop is driving, the low-level keyboard hook
+// swallows your physical spacebar: your held key becomes the GATE, and the
+// edges come from us.
+//
+// ══ GROUND STATE ═════════════════════════════════════════════════════════
+// Z comes from m_vOldOrigin, which is verified working. m_fFlags and
+// m_hGroundEntity are not verified for this build, so each is only trusted
+// after it has been seen set while Z is static AND clear while Z is moving --
+// a wrong offset then degrades the reading rather than breaking it.
 struct BhopDebug {
     // config
-    bool enabled      = true;
-    bool predict      = false;
-    bool separate_key = false;
+    bool enabled     = true;
+    bool scroll      = true;
+    bool key_inject  = false;
 
     // live state
-    bool  on_ground   = false;
-    bool  focused     = false;
-    bool  space_held  = false;   // PHYSICAL spacebar state
-    bool  hook_ok     = false;   // low-level keyboard hook installed
-    bool  driving     = false;   // currently commanding the jump
-    bool  suppressing = false;   // physical spacebar is being swallowed
+    bool on_ground   = false;
+    bool focused     = false;
+    bool space_held  = false;   // PHYSICAL spacebar state
+    bool hook_ok     = false;   // low-level keyboard hook installed
+    bool driving     = false;   // currently injecting
+    bool suppressing = false;   // physical spacebar is being swallowed
 
-    int   signals     = 0;       // bit0 z, bit1 flag, bit2 hge
-    int   edges       = 0;       // press edges generated
-    int   predicted   = 0;       // of those, how many prediction armed
-
-    float vz          = 0.0f;    // vertical velocity, units/sec
-    float tti         = -1.0f;   // ms to predicted impact, -1 if unknown
+    int  signals     = 0;       // bit0 z, bit1 flag, bit2 hge
+    int  scrolls     = 0;       // wheel events injected
+    int  edges       = 0;       // key press edges injected
 };
 
 void Bhop_Init();
@@ -60,7 +56,7 @@ void Bhop_Shutdown();
 BhopDebug Bhop_GetDebug();
 
 void  Bhop_SetEnabled(bool on);
-void  Bhop_SetPredict(bool on);
-void  Bhop_SetSeparateKey(bool on);
-void  Bhop_SetLead(float ms);   // prediction lead, ms
-float Bhop_Lead();
+void  Bhop_SetScroll(bool on);
+void  Bhop_SetKeyInject(bool on);
+void  Bhop_SetScrollInterval(float ms);
+float Bhop_ScrollInterval();
