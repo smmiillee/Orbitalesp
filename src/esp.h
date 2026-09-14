@@ -62,6 +62,7 @@ struct Track {
     int   health = 0;
     int   team = 0;
     float distance = 0.0f;
+    int   bone_health = 0;   // bones read successfully on the last refresh
 
     Snap hist[kHist];
     int  count = 0;
@@ -90,7 +91,7 @@ struct PlayerESP {
 };
 
 struct BombESP {
-    bool  active = false;      // a PLANTED C4 is in the world
+    bool  active = false;      // a planted C4 is in the world
     Vec2  screen{};
     Vec2  screen_top{};
     float distance = 0.0f;
@@ -100,9 +101,8 @@ class ESP {
 public:
     // Snapshot interpolation delay, ms. CS2 writes positions at ~64 Hz; drawing
     // those raw steps at 144+ fps is the shake. The render thread draws a fixed
-    // time in the past, interpolating between two REAL frames, so the latency
-    // is constant -- constant lag is invisible where variable lag reads as
-    // shake.
+    // time in the past, interpolating between two REAL frames, so the latency is
+    // constant -- constant lag is invisible where variable lag reads as shake.
     float interp_delay_ms = 35.0f;
 
     std::mutex mtx;   // guards tracks_ / bomb state
@@ -114,9 +114,7 @@ public:
                          int screen_w, int screen_h);
 
     int players_alive = 0;
-    int  diag_slots   = 0;
-    int  diag_carrier = 0;   // 0 = not found, else the carrier's pawn
-    int  diag_defidx  = 0;   // local player's active weapon def index
+    int diag_slots = 0;   // entity-list slots that read as valid pointers
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
@@ -129,19 +127,6 @@ private:
         uintptr_t bone_node = 0, bone_arr = 0;
         bool      bones_ok = false;
         int       bone_fail = 0, probe_cd = 0;
-
-        // Item-definition chain self-test (radar's ValidateDefIdxChain).
-        bool defidx_ok = false;
-        bool defidx_checked = false;
-
-        // Cached C4 entity so the full scan isn't repeated every frame.
-        int  c4_chunk = -1;
-        int  c4_slot  = -1;
-
-        // Discovered C4 owner handle offset (radar's DiscoverCarrier).
-        uintptr_t carrier_off = 0;
-        bool      carrier_ok = false;
-        double    last_discover = -1e9;
     } c_;
 
     std::vector<Track> tracks_;
