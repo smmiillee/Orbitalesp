@@ -9,11 +9,11 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 extern bool g_menu_open;
 extern bool g_vsync;
 extern HWND g_cs2_hwnd;
+extern void OrbitalLog(const char* fmt, ...);
 
 LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    // Eat WM_SETCURSOR so Windows never changes it to the loading arrow
     if (msg == WM_SETCURSOR) {
         SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
         return TRUE;
@@ -22,9 +22,6 @@ LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void Overlay::enable_dpi_awareness() {
-    // Per-monitor-v2 if the OS has it, else system-aware. This has to happen
-    // before the first HWND exists in this process, which is why it is called
-    // at the top of WinMain.
     using SetDpiCtxFn = BOOL (WINAPI*)(HANDLE);
     if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
         auto fn = reinterpret_cast<SetDpiCtxFn>(
@@ -43,7 +40,11 @@ bool Overlay::create(int width, int height) {
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"OrbitalESP_Overlay";
-    if (!RegisterClassExW(&wc)) return false;
+
+    if (!RegisterClassExW(&wc)) {
+        OrbitalLog("RegisterClassExW failed err=%lu", GetLastError());
+        return false;
+    }
 
     hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
@@ -53,7 +54,10 @@ bool Overlay::create(int width, int height) {
         0, 0, width, height,
         nullptr, nullptr, wc.hInstance, nullptr
     );
-    if (!hwnd) return false;
+    if (!hwnd) {
+        OrbitalLog("CreateWindowExW failed err=%lu", GetLastError());
+        return false;
+    }
 
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
 
@@ -64,7 +68,7 @@ bool Overlay::create(int width, int height) {
     UpdateWindow(hwnd);
 
     if (!init_dx11(width, height)) return false;
-    if (!create_rtv()) return false;
+    if (!create_rtv())            return false;
 
     width_  = width;
     height_ = height;
@@ -135,14 +139,15 @@ bool Overlay::create(int width, int height) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(device, context);
 
+    OrbitalLog("imgui initialised, overlay hwnd=0x%p", hwnd);
     return true;
 }
 
 // Glue the overlay to the game's client area, and resize the swap chain if the
-// game's resolution changed. Without this, a windowed/borderless game that
-// isn't at (0,0) or that changes resolution silently misaligns every box.
+// game's resolution changed.
 void Overlay::sync_to_game() {
-    if (!hwnd || !g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) return;
+    if (!hwnd) return;
+    if (!g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) return;
 
     RECT rc{};
     if (!GetClientRect(g_cs2_hwnd, &rc)) return;
@@ -180,23 +185,32 @@ bool Overlay::resize_buffers(int width, int height) {
 }
 
 void Overlay::update_visibility_and_input() {
-    HWND fg = GetForegroundWindow();
-    const bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
+    if (!hwnd) return;
 
-    if (!cs2_focused) {
-        if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
-        return;
+    // *** THIS IS WHAT COULD HIDE THE OVERLAY FOREVER ***
+    // The old logic hid the window whenever the game was not the foreground
+    // window. If g_cs2_hwnd was missing or stale, that condition was ALWAYS
+    // true, so the window was hidden on its very first frame and never came
+    // back -- process alive, nothing drawn, INSERT apparently dead.
+    //
+    // Now we only hide when we actually HAVE a live game window and it is not
+    // focused, and never while the menu is open.
+    const bool have_game = (g_cs2_hwnd && IsWindow(g_cs2_hwnd));
+    if (have_game) {
+        const HWND fg = GetForegroundWindow();
+        const bool focused = (fg == g_cs2_hwnd || fg == hwnd);
+        if (!focused && !g_menu_open) {
+            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+            return;
+        }
     }
+
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
 
     // The overlay NEVER activates. It keeps WS_EX_NOACTIVATE at all times and
     // only toggles click-through, so CS2 retains keyboard focus even while the
-    // menu is open. Clearing WS_EX_NOACTIVATE and calling SetForegroundWindow
-    // used to steal focus from the game and never give it back, which silently
-    // disabled any focus-gated feature.
-    //
-    // WS_EX_NOACTIVATE still allows the window to receive mouse clicks, so the
-    // menu stays fully usable.
+    // menu is open. WS_EX_NOACTIVATE still allows mouse clicks, so the menu
+    // stays fully usable.
     LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if (g_menu_open) {
         ex &= ~WS_EX_TRANSPARENT;
@@ -226,20 +240,36 @@ bool Overlay::init_dx11(int width, int height) {
     D3D_FEATURE_LEVEL level;
     constexpr D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
 
-    return SUCCEEDED(D3D11CreateDeviceAndSwapChain(
+    const HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
         0, levels, 1, D3D11_SDK_VERSION,
         &sd, &swapchain, &device, &level, &context
-    ));
+    );
+    if (FAILED(hr)) {
+        OrbitalLog("D3D11CreateDeviceAndSwapChain failed hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return false;
+    }
+    return true;
 }
 
 bool Overlay::create_rtv() {
+    if (!swapchain || !device) return false;
+
     ID3D11Texture2D* buf = nullptr;
-    swapchain->GetBuffer(0, IID_PPV_ARGS(&buf));
-    if (!buf) return false;
-    device->CreateRenderTargetView(buf, nullptr, &rtv);
+    if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&buf))) || !buf) {
+        OrbitalLog("swapchain->GetBuffer failed");
+        return false;
+    }
+    const HRESULT hr = device->CreateRenderTargetView(buf, nullptr, &rtv);
     buf->Release();
-    return rtv != nullptr;
+
+    if (FAILED(hr) || !rtv) {
+        OrbitalLog("CreateRenderTargetView failed hr=0x%08lX",
+                   static_cast<unsigned long>(hr));
+        return false;
+    }
+    return true;
 }
 
 void Overlay::release_rtv() {
@@ -260,10 +290,9 @@ void Overlay::end_frame() {
     context->ClearRenderTargetView(rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-    // Present was hardcoded as Present(1, 0) -- vsync forced on -- which locked
-    // the overlay to the refresh rate while the game ran far faster, so every
-    // box was drawn with a view matrix up to a full refresh stale. Uncapped, the
-    // matrix is only a few ms stale. The main loop caps the uncapped rate.
+    // Present used to be hardcoded as Present(1, 0) -- vsync forced on -- which
+    // locked the overlay to the refresh rate while the game ran far faster, so
+    // every box was drawn with a view matrix up to a full refresh stale.
     swapchain->Present(g_vsync ? 1 : 0, 0);
 }
 
