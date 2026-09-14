@@ -566,8 +566,10 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
         // Candidates are tried both relative to the scene node and relative to
         // the entity, because which one holds the position differs by build.
-        struct Cand { bool on_node; uintptr_t off; };
-        static const Cand kCand[] = {
+        // Use the member type ESP::C4Cand, NOT a local struct. A local type
+        // would shadow the member, so the lambda's parameter type and the
+        // cached c_.c4_cand would silently become different types.
+        static const C4Cand kCand[] = {
             { true,  offsets::m_vecAbsOrigin }, { true,  0xD0 },
             { true,  0xC8 },  { true,  0xD8 },  { true,  0xE0 },
             { false, offsets::m_vOldOrigin },   { false, 0xC4 },
@@ -582,7 +584,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             return dx * dx + dy * dy + dz * dz < 12000.0f * 12000.0f;
         };
 
-        auto read_pos = [&](const Cand& cd, Vec3& v) {
+        auto read_pos = [&](const C4Cand& cd, Vec3& v) {
             const uintptr_t base = cd.on_node ? node : c4;
             if (!cd.on_node && !valid_ptr(node)) { /* entity read is fine */ }
             v.x = mem.read<float>(base + cd.off);
@@ -602,7 +604,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         }
 
         if (!c_.c4_ok) {
-            for (const Cand& cd : kCand) {
+            for (const C4Cand& cd : kCand) {
                 Vec3 v{};
                 if (!read_pos(cd, v) || !accept(v)) continue;
 
