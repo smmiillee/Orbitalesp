@@ -58,9 +58,9 @@ EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
 }
 
 // ── entity-list enumeration ──────────────────────────────────────────────
-// Each read is a WHOLE NUMBER OF SLOTS. Reading fixed 16 KB pieces used to step
-// off the slot grid (16384 / 120 = 136.5), so every piece after the first read
-// from 64 bytes inside a slot and returned noise.
+// Each read is a WHOLE NUMBER OF SLOTS. Reading fixed 16 KB pieces used to
+// step off the slot grid (16384 / 120 = 136.5), so every piece after the first
+// read from 64 bytes inside a slot and returned noise.
 void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                      uintptr_t stride, std::vector<uintptr_t>& out) {
     out.clear();
@@ -91,6 +91,23 @@ void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     }
 }
 
+// Slots -> live player pawns, skipping the local player and anyone dead.
+void collect_pawns(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                   uintptr_t stride, uintptr_t local_pawn,
+                   std::vector<uintptr_t>& all, std::vector<uintptr_t>& out) {
+    enumerate_slots(mem, el, chunk_off, stride, all);
+
+    out.clear();
+    for (uintptr_t e : all) {
+        if (e == local_pawn) continue;              // never box ourselves
+        const EntHead h = read_ent_head(mem, e);
+        if (h.health <= 0 || h.health > 150) continue;
+        if (h.team != 2 && h.team != 3) continue;
+        out.push_back(e);
+    }
+}
+
+// A handle is an entity index: 9 bits of chunk, 9 bits of slot.
 uintptr_t resolve_handle(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                          uintptr_t stride, uint32_t handle) {
     const uint32_t idx = handle & 0x7FFF;
@@ -111,111 +128,100 @@ void sanitize(char* dst, size_t cap, const char* src, size_t src_len) {
     dst[j] = '\0';
 }
 
-// ── weapon names from item definition index ──────────────────────────────
-// This is the radar's PRIMARY path: definition index, self-tested at startup.
-const char* weapon_name(int id) {
-    switch (id) {
-        case 1:  return "Deagle";     case 2:  return "Dual Berettas";
-        case 3:  return "Five-SeveN"; case 4:  return "Glock-18";
-        case 7:  return "AK-47";      case 8:  return "AUG";
-        case 9:  return "AWP";        case 10: return "FAMAS";
-        case 11: return "G3SG1";      case 13: return "Galil AR";
-        case 14: return "M249";       case 16: return "M4A4";
-        case 17: return "MAC-10";     case 19: return "P90";
-        case 23: return "MP5-SD";     case 24: return "UMP-45";
-        case 25: return "XM1014";     case 26: return "PP-Bizon";
-        case 27: return "MAG-7";      case 28: return "Negev";
-        case 29: return "Sawed-Off";  case 30: return "Tec-9";
-        case 31: return "Zeus x27";   case 32: return "P2000";
-        case 33: return "MP7";        case 34: return "MP9";
-        case 35: return "Nova";       case 36: return "P250";
-        case 38: return "SCAR-20";    case 39: return "SG 553";
-        case 40: return "SSG 08";     case 43: return "Flashbang";
-        case 44: return "HE Grenade"; case 45: return "Smoke";
-        case 46: return "Molotov";    case 47: return "Decoy";
-        case 48: return "Incendiary"; case 49: return "C4";
-        case 57: return "Health Shot";
-        case 60: return "M4A1-S";     case 61: return "USP-S";
-        case 63: return "CZ75-Auto";  case 64: return "R8 Revolver";
-        default: break;
-    }
-    if (id >= 500 && id <= 600) return "Knife";
-    return nullptr;
+// ── weapon name (designer string) ────────────────────────────────────────
+// The radar reads the weapon's designer name rather than mapping item indices,
+// and that is what makes WEAPON ESP work. Chain:
+//     weapon + 0x10 -> firstLevel
+//     firstLevel + 0x20 -> char* ("weapon_ak47")
+const char* prettify(const char* n) {
+    struct Map { const char* in; const char* out; };
+    static const Map kMap[] = {
+        {"ak47","AK-47"}, {"m4a1","M4A4"}, {"m4a1_silencer","M4A1-S"},
+        {"awp","AWP"}, {"deagle","Desert Eagle"}, {"glock","Glock-18"},
+        {"usp_silencer","USP-S"}, {"hkp2000","P2000"}, {"p250","P250"},
+        {"fiveseven","Five-SeveN"}, {"tec9","Tec-9"}, {"cz75a","CZ75-Auto"},
+        {"revolver","R8 Revolver"}, {"elite","Dual Berettas"}, {"ssg08","SSG 08"},
+        {"sg556","SG 553"}, {"aug","AUG"}, {"famas","FAMAS"},
+        {"galilar","Galil AR"}, {"g3sg1","G3SG1"}, {"scar20","SCAR-20"},
+        {"mp9","MP9"}, {"mp7","MP7"}, {"mp5sd","MP5-SD"}, {"ump45","UMP-45"},
+        {"p90","P90"}, {"bizon","PP-Bizon"}, {"mac10","MAC-10"},
+        {"xm1014","XM1014"}, {"mag7","MAG-7"}, {"sawedoff","Sawed-Off"},
+        {"nova","Nova"}, {"negev","Negev"}, {"m249","M249"},
+        {"taser","Zeus x27"}, {"smokegrenade","Smoke"}, {"flashbang","Flashbang"},
+        {"hegrenade","HE Grenade"}, {"molotov","Molotov"},
+        {"incgrenade","Incendiary"}, {"decoy","Decoy"}, {"c4","C4"},
+        {"healthshot","Health Shot"},
+    };
+    for (const Map& m : kMap)
+        if (std::strcmp(n, m.in) == 0) return m.out;
+    if (std::strncmp(n, "knife", 5) == 0 || std::strncmp(n, "bayonet", 7) == 0)
+        return "Knife";
+    return nullptr;   // unknown -> show the raw name
 }
 
-// designer-name fallback: entity + 0x10 -> level1, level1 + 0x20 -> char*
-bool read_designer_name(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
-    out[0] = '\0';
-    const uintptr_t lvl1 = mem.read<uintptr_t>(ent + offsets::m_designerLvl1);
-    if (!valid_ptr(lvl1)) return false;
-    const uintptr_t np = mem.read<uintptr_t>(lvl1 + offsets::m_designerPtr);
-    if (!valid_ptr(np)) return false;
+struct WeaponInfo {
+    char name[24]{};
+    bool is_c4 = false;
+    bool ok = false;
+};
 
-    char raw[48] = {};
-    if (!mem.read_bytes(np, raw, 40)) return false;
-    raw[39] = '\0';
+// pawn -> weapon services -> active weapon -> designer name (+ C4 check).
+WeaponInfo read_weapon(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                       uintptr_t stride, uintptr_t pawn) {
+    WeaponInfo out;
 
-    const char* s = raw;
-    if (std::strncmp(s, "weapon_", 7) == 0) s += 7;
-    sanitize(out, cap, s, std::strlen(s));
-    return out[0] != '\0';
-}
-
-// The exact read the radar performs for a definition index.
-uint16_t item_def_index(const Memory& mem, uintptr_t weapon) {
-    return mem.read<uint16_t>(weapon + offsets::m_AttributeManager +
-                              offsets::m_Item +
-                              offsets::m_iItemDefinitionIndex);
-}
-
-// Self-test the def-index chain against OUR OWN active weapon, exactly like the
-// radar's ValidateDefIdxChain. If it returns a sane index for us, the chain is
-// good for everyone; if not, weapons fall back to designer names.
-bool validate_defidx_chain(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                           uintptr_t stride, uintptr_t local_pawn, int& out_id) {
-    out_id = 0;
-    const uintptr_t ws = mem.read<uintptr_t>(local_pawn + offsets::m_pWeaponServices);
-    if (!valid_ptr(ws)) return false;
+    const uintptr_t ws = mem.read<uintptr_t>(pawn + offsets::m_pWeaponServices);
+    if (!valid_ptr(ws)) return out;
 
     const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
-    if (!h || h == 0xFFFFFFFFu) return false;
+    if (!h || h == 0xFFFFFFFFu) return out;
 
     const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
-    if (!valid_ptr(w)) return false;
+    if (!valid_ptr(w)) return out;
 
-    out_id = item_def_index(mem, w);
-    return out_id >= 1 && out_id <= 600;
-}
-
-// ── planted C4 ───────────────────────────────────────────────────────────
-bool looks_like_entity(const Memory& mem, uintptr_t ent) {
-    if (!valid_ptr(ent)) return false;
-    const uintptr_t gsn = mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode);
-    return valid_ptr(gsn);
-}
-
-// dwPlantedC4 may BE the entity or may point at one, and which it is differs
-// between builds -- so try both, exactly like the radar does.
-bool read_planted_c4(const Memory& mem, uintptr_t client_base, Vec3& out) {
-    const uintptr_t p = mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
-    if (!valid_ptr(p)) return false;
-
-    uintptr_t ent = 0;
-    if (looks_like_entity(mem, p)) {
-        ent = p;
-    } else {
-        const uintptr_t inner = mem.read<uintptr_t>(p);
-        if (looks_like_entity(mem, inner)) ent = inner;
+    const uintptr_t lvl1 = mem.read<uintptr_t>(w + offsets::m_designerLvl1);
+    if (valid_ptr(lvl1)) {
+        const uintptr_t np = mem.read<uintptr_t>(lvl1 + offsets::m_designerPtr);
+        if (valid_ptr(np)) {
+            char raw[48] = {};
+            if (mem.read_bytes(np, raw, 40)) {
+                raw[39] = '\0';
+                const char* s = raw;
+                if (std::strncmp(s, "weapon_", 7) == 0) s += 7;
+                sanitize(out.name, sizeof(out.name), s, std::strlen(s));
+            }
+        }
     }
-    if (!ent) return false;
 
-    const uintptr_t node = mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode);
-    if (!valid_ptr(node)) return false;
+    // Secondary C4 check through the embedded econ item, in case the designer
+    // string is unavailable for this particular weapon entity.
+    if (!out.is_c4) {
+        const uint16_t id = mem.read<uint16_t>(
+            w + offsets::m_AttributeManager + offsets::m_Item +
+            offsets::m_iItemDefinitionIndex);
+        if (id == offsets::kItemDefC4) out.is_c4 = true;
+    }
+    if (out.is_c4) std::snprintf(out.name, sizeof(out.name), "C4");
 
-    out.x = mem.read<float>(node + offsets::m_vecAbsOrigin);
-    out.y = mem.read<float>(node + offsets::m_vecAbsOrigin + 4);
-    out.z = mem.read<float>(node + offsets::m_vecAbsOrigin + 8);
-    return sane_vec(out);
+    out.ok = out.name[0] != '\0';
+    return out;
+}
+
+void read_player_name(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                      uintptr_t stride, uintptr_t pawn, char* out, size_t cap) {
+    out[0] = '\0';
+    // pawn -> controller, which is the direction the schema defines.
+    const uint32_t h = mem.read<uint32_t>(pawn + offsets::m_hController);
+    if (!h || h == 0xFFFFFFFFu) return;
+
+    const uintptr_t ctrl = resolve_handle(mem, el, chunk_off, stride, h);
+    if (!valid_ptr(ctrl)) return;
+
+    char raw[128] = {};
+    if (!mem.read_bytes(ctrl + offsets::m_iszPlayerName, raw, sizeof(raw)))
+        return;
+    raw[127] = '\0';
+    sanitize(out, cap, raw, sizeof(raw));
 }
 
 // ── skeleton ─────────────────────────────────────────────────────────────
@@ -316,6 +322,50 @@ bool read_bones(const Memory& mem, uintptr_t pawn, const Vec3& origin,
     return n >= 6;
 }
 
+// ── planted C4 ───────────────────────────────────────────────────────────
+// dwPlantedC4 is a pointer chain, and which variant it is differs by build, so
+// both are tried exactly like the radar does: the value may BE the entity, or
+// it may point at one.
+uintptr_t scene_node_of(const Memory& mem, uintptr_t ent) {
+    static const uintptr_t kCand[] = { 0x338, 0x340, 0x348, 0x350, 0x358, 0x360 };
+    for (uintptr_t off : kCand) {
+        const uintptr_t n = mem.read<uintptr_t>(ent + off);
+        if (valid_ptr(n)) return n;
+    }
+    return 0;
+}
+
+bool looks_like_entity(const Memory& mem, uintptr_t ent) {
+    if (!valid_ptr(ent)) return false;
+    return scene_node_of(mem, ent) != 0;
+}
+
+bool read_scene_pos(const Memory& mem, uintptr_t node, Vec3& out) {
+    // X at +0xC4, then Y and Z follow contiguously.
+    out.x = mem.read<float>(node + offsets::m_vecAbsOrigin);
+    out.y = mem.read<float>(node + offsets::m_vecAbsOrigin + 4);
+    out.z = mem.read<float>(node + offsets::m_vecAbsOrigin + 8);
+    return sane_vec(out);
+}
+
+bool read_planted_c4(const Memory& mem, uintptr_t client_base, Vec3& out) {
+    const uintptr_t p = mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
+    if (!valid_ptr(p)) return false;
+
+    uintptr_t ent = 0;
+    if (looks_like_entity(mem, p)) {
+        ent = p;                       // direct entity pointer
+    } else {
+        const uintptr_t inner = mem.read<uintptr_t>(p);
+        if (looks_like_entity(mem, inner)) ent = inner;   // pointer-to-pointer
+    }
+    if (!ent) return false;
+
+    const uintptr_t node = scene_node_of(mem, ent);
+    if (!node) return false;
+    return read_scene_pos(mem, node, out);
+}
+
 } // namespace
 
 bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
@@ -358,7 +408,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static std::vector<uintptr_t> pawns;
     static double slots_at = -1e9;
     static double info_at  = -1e9;
-    static double c4_at    = -1e9;
 
     // ── refresh the pawn list ~10x/sec, auto-detecting the list layout ────
     if (now - slots_at > 100.0) {
@@ -372,23 +421,13 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         int best = -1;
         std::vector<uintptr_t> best_all, best_pawns;
         for (const Layout& L : kLayouts) {
-            std::vector<uintptr_t> all;
-            enumerate_slots(mem, el, L.off, L.stride, all);
-
-            std::vector<uintptr_t> got;
-            for (uintptr_t e : all) {
-                if (e == local_pawn) continue;          // never box ourselves
-                const EntHead h = read_ent_head(mem, e);
-                if (h.health <= 0 || h.health > 150) continue;
-                if (h.team != 2 && h.team != 3) continue;
-                got.push_back(e);
-            }
-
+            std::vector<uintptr_t> all, got;
+            collect_pawns(mem, el, L.off, L.stride, local_pawn, all, got);
             if (static_cast<int>(got.size()) > best) {
                 best = static_cast<int>(got.size());
                 c_.chunk_off   = L.off;
                 c_.slot_stride = L.stride;
-                best_all   = std::move(all);
+                best_all  = std::move(all);
                 best_pawns = std::move(got);
             }
         }
@@ -399,14 +438,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             pawns.clear();
         }
         diag_slots = static_cast<int>(slots.size());
-    }
-
-    // ── item-def chain self-test (once, then remembered) ─────────────────
-    if (!c_.defidx_checked && !pawns.empty()) {
-        c_.defidx_checked = true;
-        c_.defidx_ok = validate_defidx_chain(mem, el, c_.chunk_off,
-                                             c_.slot_stride, local_pawn,
-                                             diag_defidx);
     }
 
     // ── bone chain, resolved once and re-probed if it goes stale ─────────
@@ -432,77 +463,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         }
     }
 
-    // ── find the weapon_c4 entity, then discover who owns it ─────────────
-    // The radar's method, and the reason my old approach failed: the carrier
-    // is found from the C4 entity's OWNER handle, not from the player's
-    // active weapon. Once discovered, the offset is cached (2 reads/frame).
-    uintptr_t c4_ent  = 0;
-    uintptr_t carrier = 0;
-
-    if (!pawns.empty() && now - c4_at > 500.0) {
-        c4_at = now;
-
-        // Fast path: re-check the slot the C4 was in last time.
-        if (c_.c4_chunk >= 0) {
-            const uintptr_t cp = mem.read<uintptr_t>(
-                el + c_.chunk_off + 8 * c_.c4_chunk);
-            if (valid_ptr(cp)) {
-                const uintptr_t e =
-                    mem.read<uintptr_t>(cp + c_.slot_stride * c_.c4_slot);
-                if (valid_ptr(e) && item_def_index(mem, e) == offsets::kItemDefC4)
-                    c4_ent = e;
-            }
-            if (!c4_ent) { c_.c4_chunk = -1; c_.c4_slot = -1; }
-        }
-
-        // Full scan when the cache is cold. Only the def-index read is needed,
-        // and only when the chain passed its self-test.
-        if (!c4_ent && c_.defidx_ok) {
-            for (int ch = 0; ch < offsets::kChunks && !c4_ent; ++ch) {
-                const uintptr_t cp =
-                    mem.read<uintptr_t>(el + c_.chunk_off + 8 * ch);
-                if (!valid_ptr(cp)) continue;
-                for (int i = 1; i < offsets::kSlots; ++i) {
-                    const uintptr_t e =
-                        mem.read<uintptr_t>(cp + c_.slot_stride * i);
-                    if (!valid_ptr(e)) continue;
-                    if (item_def_index(mem, e) != offsets::kItemDefC4) continue;
-                    c4_ent = e;
-                    c_.c4_chunk = ch;
-                    c_.c4_slot  = i;
-                    break;
-                }
-            }
-        }
-
-        // Owner discovery: scan the C4 entity for a handle that resolves to one
-        // of the pawns we already know are real. Throttled to once per second
-        // because it is the expensive part.
-        if (c4_ent && !c_.carrier_ok && now - c_.last_discover > 1000.0) {
-            c_.last_discover = now;
-            for (uintptr_t off = 0x40; off <= 0x1400; off += 4) {
-                const uint32_t h = mem.read<uint32_t>(c4_ent + off);
-                if (!h || h == 0xFFFFFFFFu || (h & 0x7FFF) == 0) continue;
-                const uintptr_t owner =
-                    resolve_handle(mem, el, c_.chunk_off, c_.slot_stride, h);
-                if (!owner) continue;
-                if (std::find(pawns.begin(), pawns.end(), owner) != pawns.end()) {
-                    c_.carrier_off = off;
-                    c_.carrier_ok  = true;
-                    break;
-                }
-            }
-        }
-
-        if (c4_ent && c_.carrier_ok) {
-            const uint32_t h = mem.read<uint32_t>(c4_ent + c_.carrier_off);
-            if (h && h != 0xFFFFFFFFu)
-                carrier = resolve_handle(mem, el, c_.chunk_off,
-                                         c_.slot_stride, h);
-        }
-    }
-    diag_carrier = static_cast<int>(carrier);
-
     // ── per-tick sample of every live pawn ───────────────────────────────
     std::vector<Track> fresh;
     fresh.reserve(pawns.size());
@@ -527,7 +487,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                      ? s.bones[BONE_HEAD]
                      : Vec3{ origin.x, origin.y, origin.z + kFallbackHeadZ };
 
-        // Reuse the existing track so its history, name and weapon survive.
+        // Reuse the existing track so its interpolation history, name and
+        // weapon survive between ticks.
         Track* dst = nullptr;
         for (Track& t : tracks_) {
             if (t.pawn == p) { dst = &t; break; }
@@ -546,7 +507,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         moved.health    = h.health;
         moved.team      = h.team;
         moved.distance  = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
-        moved.has_bomb  = (carrier != 0 && p == carrier);
+        moved.bone_health = s.has_bones ? 1 : 0;
         moved.push(s);
         fresh.push_back(std::move(moved));
     }
@@ -554,56 +515,20 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ── names + weapons, ~3x/sec ─────────────────────────────────────────
+    // ── names + weapons: slow-moving, ~3x/sec ─────────────────────────────
     if (now - info_at > 300.0) {
         info_at = now;
-
         for (Track& t : fresh) {
-            // name: pawn -> controller (schema-supported direction)
-            const uint32_t hc = mem.read<uint32_t>(t.pawn + offsets::m_hController);
-            if (hc && hc != 0xFFFFFFFFu) {
-                const uintptr_t ctrl = resolve_handle(mem, el, c_.chunk_off,
-                                                      c_.slot_stride, hc);
-                if (valid_ptr(ctrl)) {
-                    char raw[128] = {};
-                    if (mem.read_bytes(ctrl + offsets::m_iszPlayerName,
-                                       raw, sizeof(raw))) {
-                        raw[127] = '\0';
-                        sanitize(t.name, sizeof(t.name), raw, sizeof(raw));
-                    }
-                }
-            }
+            read_player_name(mem, el, c_.chunk_off, c_.slot_stride,
+                             t.pawn, t.name, sizeof(t.name));
 
-            // weapon: PRIMARY = item-definition index (chain self-tested);
-            // FALLBACK = designer-name string, same as the radar.
-            const uintptr_t ws =
-                mem.read<uintptr_t>(t.pawn + offsets::m_pWeaponServices);
-            if (valid_ptr(ws)) {
-                const uint32_t hw =
-                    mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
-                if (hw && hw != 0xFFFFFFFFu) {
-                    const uintptr_t w = resolve_handle(mem, el, c_.chunk_off,
-                                                       c_.slot_stride, hw);
-                    if (valid_ptr(w)) {
-                        t.weapon[0] = '\0';
-                        if (c_.defidx_ok) {
-                            const int id = item_def_index(mem, w);
-                            const char* nm = weapon_name(id);
-                            if (nm) std::snprintf(t.weapon, sizeof(t.weapon),
-                                                  "%s", nm);
-                        }
-                        if (!t.weapon[0]) {
-                            char dn[24] = {};
-                            if (read_designer_name(mem, w, dn, sizeof(dn))) {
-                                if (std::strcmp(dn, "c4") == 0)
-                                    std::snprintf(t.weapon, sizeof(t.weapon), "C4");
-                                else
-                                    std::snprintf(t.weapon, sizeof(t.weapon),
-                                                  "%s", dn);
-                            }
-                        }
-                    }
-                }
+            const WeaponInfo w =
+                read_weapon(mem, el, c_.chunk_off, c_.slot_stride, t.pawn);
+            t.has_bomb = w.is_c4;
+            if (w.ok) {
+                const char* pretty = prettify(w.name);
+                std::snprintf(t.weapon, sizeof(t.weapon), "%s",
+                              pretty ? pretty : w.name);
             }
         }
     }
