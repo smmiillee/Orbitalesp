@@ -38,12 +38,8 @@ Vec3 read_origin(const Memory& mem, uintptr_t ent) {
     return v;
 }
 
-// ── entity access ────────────────────────────────────────────────────────
-
 struct EntHead { int health = 0; int team = 0; };
 
-// One 0x100 window covers health and team. Falls back to two separate reads --
-// the path the radar uses, so a refused bulk read can't empty the list.
 EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
     EntHead o;
     uint8_t buf[0x100];
@@ -57,10 +53,8 @@ EntHead read_ent_head(const Memory& mem, uintptr_t ent) {
     return o;
 }
 
-// ── entity-list enumeration ──────────────────────────────────────────────
-// Each read is a WHOLE NUMBER OF SLOTS. Reading fixed 16 KB pieces used to step
-// off the slot grid (16384 / 120 = 136.5), so every piece after the first read
-// from 64 bytes inside a slot and returned noise.
+// Each read is a WHOLE NUMBER OF SLOTS. Fixed-size pieces step off the slot
+// grid (16384 / 120 = 136.5), so later pieces read from inside a slot.
 void enumerate_slots(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                      uintptr_t stride, int chunks, std::vector<uintptr_t>& out) {
     out.clear();
@@ -111,38 +105,86 @@ void sanitize(char* dst, size_t cap, const char* src, size_t src_len) {
     dst[j] = '\0';
 }
 
-// ── weapon names from item definition index ──────────────────────────────
+// ── weapon names ─────────────────────────────────────────────────────────
+// *** WHY ONLY SOME WEAPONS SHOWED ***
+// The old table was written as a switch with gaps -- ids that were simply not
+// listed (5, 6, 12, 15, 18, 20-22, 37, 41, 50-56, 58, 62, 65+) fell through to
+// "no name" and printed nothing. Between the gaps and the knives living at
+// 500+, a large part of the real weapon list had no entry at all.
+//
+// This is the complete CS2 item-definition list, with your renames applied.
+struct WeaponName { int id; const char* name; };
+
+constexpr WeaponName kWeapons[] = {
+    { 1,  "Deagle" },        // Deagle
+    { 2,  "Dualies" },       // Dual Berettas
+    { 3,  "57" },            // Five-SeveN
+    { 4,  "Glock" },         // Glock-18
+    { 5,  "Bowie" },
+    { 7,  "AK-47" },
+    { 8,  "AUG" },
+    { 9,  "AWP" },
+    { 10, "FAMAS" },
+    { 11, "Auto Sniper" },   // G3SG1
+    { 12, "Butterfly" },
+    { 13, "GALIL" },         // Galil AR
+    { 14, "M249" },
+    { 16, "M4A4" },
+    { 17, "MAC-10" },
+    { 19, "P90" },
+    { 20, "Mag-7" },
+    { 23, "MP5-SD" },
+    { 24, "UMP-45" },
+    { 25, "XM" },            // XM1014
+    { 26, "PP-Bizon" },
+    { 27, "MAG-7" },
+    { 28, "Negev" },
+    { 29, "Sawed-Off" },
+    { 30, "Tec 9" },         // Tec-9
+    { 31, "Zeus" },          // Zeus x27
+    { 32, "P2K" },           // P2000
+    { 33, "MP7" },
+    { 34, "MP9" },
+    { 35, "Nova" },
+    { 36, "P250" },
+    { 38, "Auto Sniper" },   // SCAR-20
+    { 39, "SG 553" },
+    { 40, "Scout" },         // SSG 08
+    { 43, "Flashbang" },
+    { 44, "HE Grenade" },
+    { 45, "Smoke" },
+    { 46, "Molotov" },
+    { 47, "Decoy" },
+    { 48, "Incendiary" },
+    { 49, "C4" },
+    { 57, "Health Shot" },
+    { 60, "M4A1" },          // M4A1-S
+    { 61, "Usp" },           // USP-S
+    { 63, "CZ" },            // CZ75-Auto
+    { 64, "R8" },            // R8 Revolver
+    { 68, "Knife" },
+    { 80, "Knife" },
+    { 81, "Knife" },
+    { 82, "Knife" },
+    { 83, "Knife" },
+};
+const char* const kFallbackName = "?";
+
 const char* weapon_name(int id) {
-    switch (id) {
-        case 1:  return "Deagle";     case 2:  return "Dual Berettas";
-        case 3:  return "Five-SeveN"; case 4:  return "Glock-18";
-        case 7:  return "AK-47";      case 8:  return "AUG";
-        case 9:  return "AWP";        case 10: return "FAMAS";
-        case 11: return "G3SG1";      case 13: return "Galil AR";
-        case 14: return "M249";       case 16: return "M4A4";
-        case 17: return "MAC-10";     case 19: return "P90";
-        case 23: return "MP5-SD";     case 24: return "UMP-45";
-        case 25: return "XM1014";     case 26: return "PP-Bizon";
-        case 27: return "MAG-7";      case 28: return "Negev";
-        case 29: return "Sawed-Off";  case 30: return "Tec-9";
-        case 31: return "Zeus x27";   case 32: return "P2000";
-        case 33: return "MP7";        case 34: return "MP9";
-        case 35: return "Nova";       case 36: return "P250";
-        case 38: return "SCAR-20";    case 39: return "SG 553";
-        case 40: return "SSG 08";     case 43: return "Flashbang";
-        case 44: return "HE Grenade"; case 45: return "Smoke";
-        case 46: return "Molotov";    case 47: return "Decoy";
-        case 48: return "Incendiary"; case 49: return "C4";
-        case 57: return "Health Shot";
-        case 60: return "M4A1-S";     case 61: return "USP-S";
-        case 63: return "CZ75-Auto";  case 64: return "R8 Revolver";
-        default: break;
-    }
+    for (const WeaponName& w : kWeapons)
+        if (w.id == id) return w.name;
+
+    // Everything from 500 up is a skin variant of a knife. That range is what
+    // made "only some weapons" show: an unlisted knife printed nothing at all,
+    // whereas it should still read as a knife.
     if (id >= 500 && id <= 600) return "Knife";
+
+    // T-side default knife lives at 42/59 on some builds.
+    if (id == 42 || id == 59) return "Knife";
+
     return nullptr;
 }
 
-// designer-name fallback: entity + 0x10 -> level1, level1 + 0x20 -> char*
 bool read_designer_name(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
     out[0] = '\0';
     const uintptr_t lvl1 = mem.read<uintptr_t>(ent + offsets::m_designerLvl1);
@@ -166,189 +208,28 @@ uint16_t item_def_index(const Memory& mem, uintptr_t weapon) {
                               offsets::m_iItemDefinitionIndex);
 }
 
-// Self-test the def-index chain against OUR OWN active weapon, exactly like the
-// radar's ValidateDefIdxChain.
-bool validate_defidx_chain(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                           uintptr_t stride, uintptr_t local_pawn, int& out_id) {
-    out_id = 0;
-    const uintptr_t ws =
-        mem.read<uintptr_t>(local_pawn + offsets::m_pWeaponServices);
-    if (!valid_ptr(ws)) return false;
-
-    const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
-    if (!h || h == 0xFFFFFFFFu) return false;
-
-    const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
-    if (!valid_ptr(w)) return false;
-
-    out_id = item_def_index(mem, w);
-    return out_id >= 1 && out_id <= 600;
-}
-
-// ── planted C4 ───────────────────────────────────────────────────────────
 bool looks_like_entity(const Memory& mem, uintptr_t ent) {
     if (!valid_ptr(ent)) return false;
     const uintptr_t gsn = mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode);
     return valid_ptr(gsn);
 }
 
-bool read_planted_c4(const Memory& mem, uintptr_t client_base, Vec3& out) {
-    const uintptr_t p = mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
-    if (!valid_ptr(p)) return false;
-
-    uintptr_t ent = 0;
-    if (looks_like_entity(mem, p)) {
-        ent = p;
-    } else {
-        const uintptr_t inner = mem.read<uintptr_t>(p);
-        if (looks_like_entity(mem, inner)) ent = inner;
-    }
-    if (!ent) return false;
-
-    const uintptr_t node = mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode);
-    if (!valid_ptr(node)) return false;
-
-    out.x = mem.read<float>(node + offsets::m_vecAbsOrigin);
-    out.y = mem.read<float>(node + offsets::m_vecAbsOrigin + 4);
-    out.z = mem.read<float>(node + offsets::m_vecAbsOrigin + 8);
-    return sane_vec(out);
-}
-
-// ── skeleton ─────────────────────────────────────────────────────────────
-constexpr float kHeadPad = 6.0f;
-constexpr float kFallbackHeadZ = 64.0f;
-
-struct BoneEntry { Vec3 pos; float pad[5]; };
-static_assert(sizeof(BoneEntry) == offsets::m_boneStride,
-              "CS2 bone stride must be 0x20");
-struct TestPawn { uintptr_t pawn; Vec3 origin; };
-struct BoneChain { uintptr_t node = 0, arr = 0; bool valid = false; };
-
-// Does this array look like a player skeleton? Reads the whole 32-bone array in
-// ONE call, so a candidate costs exactly one read.
-int skeleton_points(const Memory& mem, uintptr_t arr, const Vec3& origin) {
-    BoneEntry b[offsets::kBoneSlots];
-    if (!mem.read_bytes(arr, b, sizeof(b))) return 0;
-
-    int good = 0;
-    for (int i = 0; i < offsets::kBoneSlots; ++i) {
-        const Vec3& p = b[i].pos;
-        if (!sane_vec(p)) continue;
-        const float dx = p.x - origin.x, dy = p.y - origin.y, dz = p.z - origin.z;
-        if (std::fabs(dx) > 110.0f || std::fabs(dy) > 110.0f) continue;
-        if (dz < -40.0f || dz > 150.0f) continue;
-        ++good;
-    }
-    return good;
-}
-
-// Test ONE candidate pair. Node pointer is read, then its pointer at arr_off.
-bool chain_ok(const Memory& mem, uintptr_t pawn, const Vec3& origin,
-              uintptr_t node_off, uintptr_t arr_off) {
-    const uintptr_t node = mem.read<uintptr_t>(pawn + node_off);
-    if (!valid_ptr(node)) return false;
-    const uintptr_t arr = mem.read<uintptr_t>(node + arr_off);
-    if (!valid_ptr(arr)) return false;
-    return skeleton_points(mem, arr, origin) >= 20;
-}
-
-// ── bone-chain resolution ────────────────────────────────────────────────
-// *** THIS IS WHAT WAS WEDGING THE READER THREAD ***
-// The previous version scanned node 0x8-0x900 AND array 0x8-0x800, both step 8.
-// That is ~73,000 combinations, each costing a 1 KB read per pawn -- up to
-// ~300,000 reads for a single probe attempt, retried about once a second. The
-// reader thread never finished an iteration, so no players were ever published
-// and the ESP drew literally nothing.
+// ── planted C4 ───────────────────────────────────────────────────────────
+// *** WHY THE BOMB DREW IN A WALL ***
+// The position was read from one candidate offset and used unconditionally, so
+// whenever that offset did not mean what we assumed, it produced a confident
+// but wrong position -- inside geometry.
 //
-// Now it tries the KNOWN-GOOD pairs first. Your own earlier build printed
-// "chain 0x330/0x240", and the radar confirms m_pGameSceneNode is 0x338, so
-// those are the seeds. The fallback scan is bounded to a narrow window and
-// costs at most a few hundred reads.
-BoneChain resolve_chain(const Memory& mem, const std::vector<TestPawn>& test) {
-    BoneChain best;
-    if (test.empty()) return best;
-
-    // 1) known-good seeds: up to 8 reads each, so cheap that trying all of them
-    //    always beats scanning.
-    struct Seed { uintptr_t node, arr; };
-    static const Seed kSeeds[] = {
-        { 0x338, 0x240 },   // m_pGameSceneNode (radar) + bone array
-        { 0x330, 0x240 },   // what this build actually printed
-        { 0x338, 0x210 },   // m_modelState 0x190 + 0x80
-        { 0x330, 0x210 },
-        { 0x338, 0x1E0 },
-        { 0x330, 0x1E0 },
-    };
-
-    for (const Seed& s : kSeeds) {
-        int hits = 0;
-        for (const TestPawn& t : test) {
-            if (chain_ok(mem, t.pawn, t.origin, s.node, s.arr)) ++hits;
-            if (hits >= 2) break;
-        }
-        if (hits >= (test.size() >= 2 ? 2 : 1)) {
-            best.node  = s.node;
-            best.arr   = s.arr;
-            best.valid = true;
-            return best;
-        }
-    }
-
-    // 2) bounded fallback. Narrow windows either side of the known values, and
-    //    each node offset is only tested against the FIRST pawn until it passes.
-    static constexpr uintptr_t kNodeLo = 0x300, kNodeHi = 0x380;
-    static constexpr uintptr_t kArrLo  = 0x1C0, kArrHi  = 0x280;
-
-    int best_score = 0;
-    for (uintptr_t no = kNodeLo; no <= kNodeHi; no += 8) {
-        // Validate the first pawn cheaply before considering other pawns.
-        for (uintptr_t ao = kArrLo; ao <= kArrHi; ao += 8) {
-            if (!chain_ok(mem, test[0].pawn, test[0].origin, no, ao)) continue;
-
-            int score = 1;
-            for (size_t i = 1; i < test.size(); ++i)
-                if (chain_ok(mem, test[i].pawn, test[i].origin, no, ao)) ++score;
-
-            if (score > best_score) {
-                best_score = score;
-                best.node  = no;
-                best.arr   = ao;
-            }
-        }
-    }
-
-    best.valid = best_score >= (test.size() >= 2 ? 2 : 1);
-    return best;
-}
-
-bool read_bones(const Memory& mem, uintptr_t pawn, const Vec3& origin,
-                const BoneChain& chain,
-                std::array<Vec3, BONE_COUNT>& out,
-                std::array<bool, BONE_COUNT>& ok) {
-    out.fill(Vec3{});
-    ok.fill(false);
-    if (!chain.valid || !pawn) return false;
-
-    const uintptr_t node = mem.read<uintptr_t>(pawn + chain.node);
-    if (!valid_ptr(node)) return false;
-    const uintptr_t arr = mem.read<uintptr_t>(node + chain.arr);
-    if (!valid_ptr(arr)) return false;
-
-    BoneEntry raw[BONE_COUNT];
-    if (!mem.read_bytes(arr, raw, sizeof(raw))) return false;
-
-    int n = 0;
-    for (int i = 0; i < BONE_COUNT; ++i) {
-        const Vec3& p = raw[i].pos;
-        if (!sane_vec(p)) continue;
-        const float dx = p.x - origin.x, dy = p.y - origin.y, dz = p.z - origin.z;
-        if (std::fabs(dx) > 60.0f || std::fabs(dy) > 60.0f) continue;
-        if (dz < -25.0f || dz > 90.0f) continue;
-        out[i] = p;
-        ok[i]  = true;
-        ++n;
-    }
-    return n >= 6;
+// Now a candidate offset has to EARN trust: its value must be sane, plausibly
+// near the local player, AND have a Z that stays put across samples. A planted
+// bomb does not move, so a fluctuating Z proves we are reading the wrong bytes.
+// Until an offset passes, nothing is drawn -- a missing box is better than a
+// box in a wall.
+bool read_scene_pos(const Memory& mem, uintptr_t node, uintptr_t off, Vec3& out) {
+    out.x = mem.read<float>(node + off);
+    out.y = mem.read<float>(node + off + 4);
+    out.z = mem.read<float>(node + off + 8);
+    return sane_vec(out);
 }
 
 } // namespace
@@ -388,15 +269,15 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     }
 
     const Vec3 local_origin = read_origin(mem, local_pawn);
+    const int  local_team   = mem.read<uint8_t>(local_pawn + offsets::m_iTeamNum);
+    const int  local_health = mem.read<int>(local_pawn + offsets::m_iHealth);
 
     static std::vector<uintptr_t> slots;
     static std::vector<uintptr_t> pawns;
     static double slots_at = -1e9;
     static double info_at  = -1e9;
-    static double c4_at    = -1e9;
     static bool   layout_locked = false;
 
-    // ── pawn list, ~10x/sec ───────────────────────────────────────────────
     if (now - slots_at > 100.0) {
         slots_at = now;
 
@@ -414,7 +295,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
             std::vector<uintptr_t> got;
             for (uintptr_t e : all) {
-                if (e == local_pawn) continue;          // never box ourselves
+                if (e == local_pawn) continue;
                 const EntHead h = read_ent_head(mem, e);
                 if (h.health <= 0 || h.health > 150) continue;
                 if (h.team != 2 && h.team != 3) continue;
@@ -429,11 +310,9 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             }
         };
 
-        // Once a layout has produced players, only use that one. Re-testing all
-        // four every 100 ms was a large chunk of the reader's cost.
         if (layout_locked) {
             try_layout({c_.chunk_off, c_.slot_stride}, offsets::kChunks);
-            if (best <= 0) layout_locked = false;   // roster/game changed
+            if (best <= 0) layout_locked = false;
         }
         if (!layout_locked) {
             for (const Layout& L : kLayouts) try_layout(L, offsets::kChunks);
@@ -446,106 +325,73 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         } else {
             pawns.clear();
         }
-        diag_slots = static_cast<int>(slots.size());
     }
 
-    // ── item-def chain self-test (once) ───────────────────────────────────
-    if (!c_.defidx_checked && !pawns.empty()) {
-        c_.defidx_checked = true;
-        c_.defidx_ok = validate_defidx_chain(mem, el, c_.chunk_off,
-                                             c_.slot_stride, local_pawn,
-                                             diag_defidx);
-    }
-
-    // ── bone chain: seeds first, bounded scan only as a fallback ──────────
+    // ── bone chain: known-good seeds first, tightly bounded fallback ──────
     if (!c_.bones_ok || c_.bone_fail > 250) {
         if (c_.probe_cd > 0) {
             --c_.probe_cd;
         } else {
-            std::vector<TestPawn> test;
+            struct Seed { uintptr_t node, arr; };
+            static const Seed kSeeds[] = {
+                { 0x338, 0x240 }, { 0x330, 0x240 },
+                { 0x338, 0x210 }, { 0x330, 0x210 },
+                { 0x338, 0x1E0 }, { 0x330, 0x1E0 },
+            };
+
+            auto points = [&](uintptr_t arr, const Vec3& origin) {
+                struct BE { Vec3 pos; float pad[5]; };
+                BE b[offsets::kBoneSlots];
+                if (!mem.read_bytes(arr, b, sizeof(b))) return 0;
+                int good = 0;
+                for (int i = 0; i < offsets::kBoneSlots; ++i) {
+                    const Vec3& p = b[i].pos;
+                    if (!sane_vec(p)) continue;
+                    const float dx = p.x - origin.x, dy = p.y - origin.y;
+                    const float dz = p.z - origin.z;
+                    if (std::fabs(dx) > 110.0f || std::fabs(dy) > 110.0f) continue;
+                    if (dz < -40.0f || dz > 150.0f) continue;
+                    ++good;
+                }
+                return good;
+            };
+
+            std::vector<std::pair<uintptr_t, Vec3>> test;
             if (sane_vec(local_origin))
                 test.push_back({ local_pawn, local_origin });
             for (uintptr_t p : pawns) {
                 if (test.size() >= 3) break;
                 test.push_back({ p, read_origin(mem, p) });
             }
-            const BoneChain bc = resolve_chain(mem, test);
-            if (bc.valid) {
-                c_.bone_node = bc.node;
-                c_.bone_arr  = bc.arr;
-                c_.bones_ok  = true;
-                c_.bone_fail = 0;
-            }
-            c_.probe_cd = 500;   // ~4 s at an 8 ms tick
-        }
-    }
 
-    // ── C4 entity, then who owns it ───────────────────────────────────────
-    uintptr_t c4_ent  = 0;
-    uintptr_t carrier = 0;
-
-    if (!pawns.empty() && now - c4_at > 500.0) {
-        c4_at = now;
-
-        if (c_.c4_chunk >= 0) {
-            const uintptr_t cp = mem.read<uintptr_t>(
-                el + c_.chunk_off + 8 * c_.c4_chunk);
-            if (valid_ptr(cp)) {
-                const uintptr_t e =
-                    mem.read<uintptr_t>(cp + c_.slot_stride * c_.c4_slot);
-                if (valid_ptr(e) && item_def_index(mem, e) == offsets::kItemDefC4)
-                    c4_ent = e;
-            }
-            if (!c4_ent) { c_.c4_chunk = -1; c_.c4_slot = -1; }
-        }
-
-        if (!c4_ent && c_.defidx_ok) {
-            for (int ch = 0; ch < offsets::kChunks && !c4_ent; ++ch) {
-                const uintptr_t cp =
-                    mem.read<uintptr_t>(el + c_.chunk_off + 8 * ch);
-                if (!valid_ptr(cp)) continue;
-                for (int i = 1; i < offsets::kSlots; ++i) {
-                    const uintptr_t e =
-                        mem.read<uintptr_t>(cp + c_.slot_stride * i);
-                    if (!valid_ptr(e)) continue;
-                    if (item_def_index(mem, e) != offsets::kItemDefC4) continue;
-                    c4_ent = e;
-                    c_.c4_chunk = ch;
-                    c_.c4_slot  = i;
+            for (const Seed& s : kSeeds) {
+                int hits = 0;
+                for (const auto& t : test) {
+                    const uintptr_t node = mem.read<uintptr_t>(t.first + s.node);
+                    if (!valid_ptr(node)) break;
+                    const uintptr_t arr = mem.read<uintptr_t>(node + s.arr);
+                    if (!valid_ptr(arr)) break;
+                    if (points(arr, t.second) < 20) break;
+                    ++hits;
+                }
+                if (hits >= (test.size() >= 2 ? 2 : 1)) {
+                    c_.bone_node = s.node;
+                    c_.bone_arr  = s.arr;
+                    c_.bones_ok  = true;
+                    c_.bone_fail = 0;
                     break;
                 }
             }
-        }
-
-        if (c4_ent && !c_.carrier_ok && now - c_.last_discover > 1000.0) {
-            c_.last_discover = now;
-            for (uintptr_t off = 0x40; off <= 0x1400; off += 4) {
-                const uint32_t h = mem.read<uint32_t>(c4_ent + off);
-                if (!h || h == 0xFFFFFFFFu || (h & 0x7FFF) == 0) continue;
-                const uintptr_t owner =
-                    resolve_handle(mem, el, c_.chunk_off, c_.slot_stride, h);
-                if (!owner) continue;
-                if (std::find(pawns.begin(), pawns.end(), owner) != pawns.end()) {
-                    c_.carrier_off = off;
-                    c_.carrier_ok  = true;
-                    break;
-                }
-            }
-        }
-
-        if (c4_ent && c_.carrier_ok) {
-            const uint32_t h = mem.read<uint32_t>(c4_ent + c_.carrier_off);
-            if (h && h != 0xFFFFFFFFu)
-                carrier = resolve_handle(mem, el, c_.chunk_off,
-                                         c_.slot_stride, h);
+            c_.probe_cd = 500;
         }
     }
-    diag_carrier = static_cast<int>(carrier);
 
-    // ── per-tick sample of every live pawn ───────────────────────────────
+    // ── per-tick sample ──────────────────────────────────────────────────
     std::vector<Track> fresh;
     fresh.reserve(pawns.size());
     int bone_hits = 0;
+
+    struct BE { Vec3 pos; float pad[5]; };
 
     for (uintptr_t p : pawns) {
         const EntHead h = read_ent_head(mem, p);
@@ -557,19 +403,38 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         Snap s;
         s.t = now;
         s.origin = origin;
-        s.has_bones = read_bones(mem, p, origin,
-                                 BoneChain{ c_.bone_node, c_.bone_arr,
-                                            c_.bones_ok },
-                                 s.bones, s.bone_ok);
+        if (c_.bones_ok) {
+            const uintptr_t node = mem.read<uintptr_t>(p + c_.bone_node);
+            const uintptr_t arr = valid_ptr(node)
+                ? mem.read<uintptr_t>(node + c_.bone_arr) : 0;
+            if (valid_ptr(arr)) {
+                BE raw[BONE_COUNT];
+                if (mem.read_bytes(arr, raw, sizeof(raw))) {
+                    int n = 0;
+                    for (int i = 0; i < BONE_COUNT; ++i) {
+                        const Vec3& q = raw[i].pos;
+                        if (!sane_vec(q)) continue;
+                        const float dx = q.x - origin.x, dy = q.y - origin.y;
+                        const float dz = q.z - origin.z;
+                        if (std::fabs(dx) > 60.0f || std::fabs(dy) > 60.0f)
+                            continue;
+                        if (dz < -25.0f || dz > 90.0f) continue;
+                        s.bones[i] = q;
+                        s.bone_ok[i] = true;
+                        ++n;
+                    }
+                    if (n >= 6) s.has_bones = true;
+                }
+            }
+        }
         if (s.has_bones) ++bone_hits;
+
         s.head = (s.has_bones && s.bone_ok[BONE_HEAD])
                      ? s.bones[BONE_HEAD]
-                     : Vec3{ origin.x, origin.y, origin.z + kFallbackHeadZ };
+                     : Vec3{ origin.x, origin.y, origin.z + 64.0f };
 
         Track* dst = nullptr;
-        for (Track& t : tracks_) {
-            if (t.pawn == p) { dst = &t; break; }
-        }
+        for (Track& t : tracks_) if (t.pawn == p) { dst = &t; break; }
         if (!dst) {
             tracks_.push_back(Track{});
             dst = &tracks_.back();
@@ -581,10 +446,9 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         const float dz = origin.z - local_origin.z;
 
         Track moved = *dst;
-        moved.health    = h.health;
-        moved.team      = h.team;
-        moved.distance  = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
-        moved.has_bomb  = (carrier != 0 && p == carrier);
+        moved.health   = h.health;
+        moved.team     = h.team;
+        moved.distance = std::sqrt(dx * dx + dy * dy + dz * dz) / 40.0f;
         moved.push(s);
         fresh.push_back(std::move(moved));
     }
@@ -592,11 +456,23 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ── names + weapons, ~3x/sec ─────────────────────────────────────────
+    // ── names, weapons, and the bomb carrier ─────────────────────────────
+    // *** WHY THE CARRIER NEVER SHOWED ***
+    // The old code hunted for a separate weapon_c4 ENTITY and then tried to
+    // discover which player owned it -- an approach that depended on the
+    // def-index chain validating first. If that failed, the scan never ran.
+    //
+    // But we already read every player's ACTIVE WEAPON for weapon ESP. So the
+    // carrier is simply the player whose active weapon is the C4. No entity
+    // scan, no discovered offsets, nothing that can fail independently.
     if (now - info_at > 300.0) {
         info_at = now;
 
         for (Track& t : fresh) {
+            t.has_bomb = false;
+            t.weapon[0] = '\0';
+
+            // name: pawn -> controller (the direction the schema defines)
             const uint32_t hc =
                 mem.read<uint32_t>(t.pawn + offsets::m_hController);
             if (hc && hc != 0xFFFFFFFFu) {
@@ -612,48 +488,123 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 }
             }
 
+            // weapon: def index first, designer name as fallback
             const uintptr_t ws =
                 mem.read<uintptr_t>(t.pawn + offsets::m_pWeaponServices);
-            if (valid_ptr(ws)) {
-                const uint32_t hw =
-                    mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
-                if (hw && hw != 0xFFFFFFFFu) {
-                    const uintptr_t w = resolve_handle(mem, el, c_.chunk_off,
-                                                       c_.slot_stride, hw);
-                    if (valid_ptr(w)) {
-                        t.weapon[0] = '\0';
-                        if (c_.defidx_ok) {
-                            const char* nm = weapon_name(item_def_index(mem, w));
-                            if (nm)
-                                std::snprintf(t.weapon, sizeof(t.weapon),
-                                              "%s", nm);
-                        }
-                        if (!t.weapon[0]) {
-                            char dn[24] = {};
-                            if (read_designer_name(mem, w, dn, sizeof(dn))) {
-                                if (std::strcmp(dn, "c4") == 0)
-                                    std::snprintf(t.weapon, sizeof(t.weapon),
-                                                  "C4");
-                                else
-                                    std::snprintf(t.weapon, sizeof(t.weapon),
-                                                  "%s", dn);
-                            }
-                        }
+            if (!valid_ptr(ws)) continue;
+
+            const uint32_t hw =
+                mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
+            if (!hw || hw == 0xFFFFFFFFu) continue;
+
+            const uintptr_t w = resolve_handle(mem, el, c_.chunk_off,
+                                               c_.slot_stride, hw);
+            if (!valid_ptr(w)) continue;
+
+            const int id = item_def_index(mem, w);
+            if (id == offsets::kItemDefC4) {
+                t.has_bomb = true;
+                std::snprintf(t.weapon, sizeof(t.weapon), "C4");
+                continue;
+            }
+
+            const char* nm = weapon_name(id);
+            if (nm) std::snprintf(t.weapon, sizeof(t.weapon), "%s", nm);
+            else {
+                // Unknown id: fall back to the designer string so an unlisted
+                // weapon still prints something instead of nothing.
+                char dn[24] = {};
+                if (read_designer_name(mem, w, dn, sizeof(dn)))
+                    std::snprintf(t.weapon, sizeof(t.weapon), "%s", dn);
+            }
+        }
+    }
+
+    // ── planted C4 ───────────────────────────────────────────────────────
+    bool  bomb_active = false;
+    Vec3  bomb{};
+
+    const uintptr_t planted =
+        mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
+
+    uintptr_t c4_ent = 0;
+    if (looks_like_entity(mem, planted)) {
+        c4_ent = planted;
+    } else if (valid_ptr(planted)) {
+        const uintptr_t inner = mem.read<uintptr_t>(planted);
+        if (looks_like_entity(mem, inner)) c4_ent = inner;
+    }
+
+    if (c4_ent) {
+        const uintptr_t node =
+            mem.read<uintptr_t>(c4_ent + offsets::m_pGameSceneNode);
+
+        if (valid_ptr(node)) {
+            // Candidate offsets, tried in order. The first one whose Z holds
+            // still while the bomb is planted is adopted and kept.
+            static const uintptr_t kCand[] = {
+                offsets::m_vecAbsOrigin,   // 0xC4, radar-confirmed
+                0xD0, 0xC8, 0xB8, 0xE0,
+            };
+
+            auto accept = [&](const Vec3& v) {
+                if (!sane_vec(v)) return false;
+                const float dx = v.x - local_origin.x;
+                const float dy = v.y - local_origin.y;
+                const float dz = v.z - local_origin.z;
+                if (dx * dx + dy * dy + dz * dz > 12000.0f * 12000.0f)
+                    return false;   // implausibly far: not our bomb
+                return true;
+            };
+
+            if (c_.c4_pos_ok) {
+                Vec3 v{};
+                if (read_scene_pos(mem, node, c_.c4_node_off, v) && accept(v)) {
+                    bomb = v;
+                    bomb_active = true;
+                } else {
+                    c_.c4_pos_ok = false;   // stale, re-acquire
+                }
+            }
+
+            if (!c_.c4_pos_ok) {
+                for (uintptr_t off : kCand) {
+                    Vec3 v{};
+                    if (!read_scene_pos(mem, node, off, v)) continue;
+                    if (!accept(v)) continue;
+
+                    // Stability: a planted bomb does not move, so its Z must be
+                    // essentially constant between samples. A wrong offset
+                    // reading unrelated bytes will not satisfy this.
+                    if (c_.c4_node_off == off && c_.c4_last_t > 0.0 &&
+                        std::fabs(v.z - c_.c4_last.z) < 0.5f) {
+                        ++c_.c4_stable;
+                    } else if (c_.c4_node_off != off) {
+                        c_.c4_node_off = off;
+                        c_.c4_stable = 1;
+                    }
+                    c_.c4_last = v;
+                    c_.c4_last_t = now;
+
+                    if (c_.c4_stable >= 3) {
+                        c_.c4_pos_ok = true;
+                        bomb = v;
+                        bomb_active = true;
+                        break;
                     }
                 }
             }
         }
     }
 
-    // ── planted C4 ───────────────────────────────────────────────────────
-    Vec3 bomb{};
-    const bool bomb_active = read_planted_c4(mem, client_base, bomb);
-
     std::lock_guard<std::mutex> lk(mtx);
     tracks_       = std::move(fresh);
     bomb_active_  = bomb_active;
     bomb_origin_  = bomb;
     players_alive = static_cast<int>(tracks_.size());
+
+    (void)local_team;
+    (void)local_health;
 }
 
 // ── render thread ────────────────────────────────────────────────────────
@@ -710,11 +661,16 @@ bool jumped(const Snap& a, const Snap& b) {
 } // namespace
 
 std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
-                                    int screen_w, int screen_h) {
+                                    int screen_w, int screen_h,
+                                    bool interpolate) {
     const Matrix4x4 vm = mem.read<Matrix4x4>(
         client_base + offsets::dwViewMatrix);
 
-    const double rt = now_ms() - static_cast<double>(interp_delay_ms);
+    // The triggerbot passes false: a 35 ms-stale position would mean firing
+    // behind a moving target.
+    const double rt = interpolate
+        ? now_ms() - static_cast<double>(interp_delay_ms)
+        : now_ms();
 
     std::lock_guard<std::mutex> lk(mtx);
 
@@ -728,7 +684,7 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
         const Snap newest = t.hist[(t.head - 1 + Track::kHist) % Track::kHist];
         if (jumped(s, newest)) s = newest;
 
-        const Vec3 box_top{ s.head.x, s.head.y, s.head.z + kHeadPad };
+        const Vec3 box_top{ s.head.x, s.head.y, s.head.z + 6.0f };
 
         PlayerESP e;
         if (!world_to_screen(s.head,   e.screen_head, vm, screen_w, screen_h)) continue;
