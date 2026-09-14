@@ -2,51 +2,49 @@
 #pragma once
 #include <cstdint>
 
-// One bhop engine. SPACE is the only injected key -- no bind needed, because
-// `space` is already bound to +jump by default.
+// One bhop engine. SPACE only, no keybind needed, no memory writes.
 //
-// NOTHING HERE WRITES TO cs2.exe. The engine injects keystrokes; the project
-// stays read-only towards the game process.
+// ══ WHY EVERY PREVIOUS ATTEMPT MISSED ═══════════════════════════════════
+// The injected key was sent as a down+up PAIR inside a SINGLE SendInput call.
+// That makes the key transition down and back up in essentially zero
+// microseconds. CS2 samples OS keyboard state ONCE PER FRAME (subtick
+// timestamps are computed by the client from that sampling). A zero-width press
+// is therefore very likely never observed by any frame sample at all --
+// it is not a mistimed input, it is an INVISIBLE one.
 //
-// ══ HOW IT WORKS ═════════════════════════════════════════════════════════
-// Holding space is the GATE. While the engine runs, the hook swallows your
-// physical spacebar, so the game's +jump input comes only from us -- your held
-// key can never block the press edges we need.
+// That single bug explains the whole pattern: the scroll engines (discrete
+// events, presumably queued) worked better than the key engines, and the key
+// engines only ever worked occasionally -- whenever a zero-width press happened
+// to fall across a frame boundary.
 //
-// A jump needs a fresh PRESS EDGE while grounded, so the engine injects a
-// SPACE down+up pair, and retries while the ground flag stays true. Retrying is
-// what stops a missed hop from ending the chain: the flag sticking true no
-// longer silences the engine.
+// THE FIX: hold the key DOWN for long enough to span at least one frame, then
+// release it, then retry. The hold is the mechanism; `hold_ms` is the control
+// that matters, sized against frame time rather than tick time.
 //
-// ══ THE TIMING FIX: PRESS ON A TICK BOUNDARY ════════════════════════════
-// The retry cadence used to be "15.625 ms from when we noticed". But detection
-// happens somewhere INSIDE a tick (up to one sample late), so every retry was
-// offset by a random phase and the presses drifted around the tick -- which is
-// why it stopped hoppjing cleanly.
+// ══ TICK vs FRAME (correcting an earlier mistake) ═══════════════════════
+// Subtick sits ON TOP of the tick -- the server still ticks (64 in MM, 128
+// elsewhere). Subtick means input carries a sub-tick timestamp which the server
+// resolves at that fractional position.
 //
-// The fix is a tick clock. Ground transitions can only happen on tick
-// boundaries, so we watch them, estimate the tick period and phase, and then
-// aim each press AT a boundary instead of at an interval. The offset control
-// shifts where inside the tick the press lands, so you can dial it in.
-//
-// ══ GROUND STATE ════════════════════════════════════════════════════════
-// m_fFlags bit 0, tested as a BITMASK and graded against Z before being
-// trusted. Z (m_vOldOrigin) is the reference because it is verified working.
+// The consequence for us is that the CLIENT decides when our input happened,
+// from its per-frame read of OS keyboard state. So the limiting clock is FRAME
+// time, not tick time. An earlier version aligned presses to tick boundaries,
+// which was modelling the wrong clock.
+enum { BHOP_ENGINE_COUNT = 1 };
+
 struct BhopDebug {
-    bool  focused      = false;
-    bool  space_held   = false;
-    bool  hook_ok      = false;
-    bool  on_ground    = false;
-    bool  suppressing  = false;
-    int   signals      = 0;      // bit0 z, bit1 flag, bit2 hge
+    bool  focused     = false;
+    bool  space_held  = false;
+    bool  hook_ok     = false;
+    bool  on_ground   = false;
+    bool  suppressing = false;
+    bool  pressing    = false;   // key currently held down
+    int   signals     = 0;       // bit0 z, bit1 flag, bit2 hge
 
-    int   injected     = 0;      // pairs injected this session
-    int   age_ms       = -1;     // ms since the last pair, -1 = never
-
-    // tick clock
-    bool  locked       = false;  // clock has converged
-    float tick_ms      = 0.0f;   // estimated tick period
-    float last_phase   = -1.0f;  // phase of the last injection, ms into tick
+    int   injected    = 0;       // press events started this session
+    int   age_ms      = -1;      // ms since the last press, -1 = never
+    float hold_ms     = 0.0f;    // how long the key is held per press
+    float retry_ms    = 0.0f;    // interval between presses while grounded
 };
 
 void Bhop_Init();
@@ -57,14 +55,12 @@ BhopDebug Bhop_GetDebug();
 void Bhop_SetEnabled(bool on);
 bool Bhop_Enabled();
 
-// Press immediately on landing detection, or aim at the next tick boundary.
-void  Bhop_SetTickLock(bool on);
-bool  Bhop_TickLock();
+// How long the key stays DOWN per press. Must exceed one frame or the press is
+// invisible to the game's input sampling. 144 fps -> 6.9 ms/frame.
+void  Bhop_SetHoldMs(float ms);
+float Bhop_HoldMs();
 
-// Where inside the tick to press (tick-lock only). 0 = on the boundary.
-void  Bhop_SetOffsetMs(float ms);
-float Bhop_OffsetMs();
-
-// How many ticks between retries while grounded. 1 = every tick.
-void  Bhop_SetRetryTicks(int ticks);
-int   Bhop_RetryTicks();
+// Interval between the START of successive presses while grounded. Retrying is
+// what stops a missed hop from ending the chain.
+void  Bhop_SetRetryMs(float ms);
+float Bhop_RetryMs();
