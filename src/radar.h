@@ -1,29 +1,50 @@
 // --- src/radar.h ---
 #pragma once
+#include <cstdint>
 
 // Radar launcher.
 //
-// The radar is a separate app (orbitalweb) that runs its own local server on
-// port 3000. This does NOT embed it -- it finds this machine's LAN IPv4 and
-// opens a browser at http://<ip>:3000 so the radar is reachable from another
-// device on the same network (a phone, a second PC).
+// IMPORTANT: the radar is its OWN program -- cs2_dashboard.exe, built from the
+// orbitalweb repo. It reads CS2 memory itself and serves a WebSocket dashboard
+// on port 3000. NOTHING here embeds it; this file only builds a URL and opens a
+// browser.
 //
-// Deliberately no injection and no memory access: this is a convenience button.
+// There is no Node.js server and no package.json in that repo -- it is C++ and
+// CMake, so "run server.js" is not a thing. You build cs2_dashboard.exe and run
+// it on the PC playing CS2.
+//
+// ADDRESS SELECTION
+// The old version guessed: it took the first up adapter's non-loopback IPv4.
+// On any machine with a VPN, WSL, Hyper-V or Docker that is frequently a
+// virtual adapter, and nothing can reach the URL it produced.
+//
+// So instead of guessing we ENUMERATE every usable IPv4 and let you pick, with
+// loopback first -- because if you are viewing the radar on the same PC as the
+// server, 127.0.0.1 is correct and always works.
 struct RadarInfo {
-    char ipv4[64] = "";     // best LAN IPv4, empty if none found
-    char url[128] = "";     // http://<ipv4>:3000
+    // Detected addresses. Entry 0 is always 127.0.0.1.
+    static constexpr int kMaxAddr = 10;
+    char addr[kMaxAddr][64] = {};
+    char label[kMaxAddr][80] = {};   // "127.0.0.1  (this PC)" etc.
+    int  count = 0;
+    int  selected = 0;
+
+    char url[128] = "";
     int  port = 3000;
-    bool opened = false;    // set for one frame after a successful open
-    bool failed = false;    // set for one frame if it could not open
+    bool opened = false;   // browser opened, shown briefly
+    bool failed = false;
 };
 
 void Radar_Init();
 void Radar_Shutdown();
 
+// Re-enumerates adapters on every call, so plugging in a network shows up.
 RadarInfo Radar_Get();
 
-// Opens the radar URL in the default browser.
 void Radar_Start();
+
+void Radar_SetSelection(int index);
+int  Radar_Selection();
 
 void Radar_SetPort(int port);
 int  Radar_Port();
