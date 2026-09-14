@@ -48,6 +48,10 @@ struct Track {
 };
 
 struct PlayerESP {
+    // The entity pointer, so a caller can read per-entity fields it needs --
+    // the triggerbot's visibility check reads m_bSpottedByMask from here.
+    uintptr_t pawn = 0;
+
     Vec2  screen_head{}, screen_top{}, screen_feet{};
     std::array<Vec2, BONE_COUNT> bones{};
     std::array<bool, BONE_COUNT> bone_ok{};
@@ -81,13 +85,13 @@ public:
 
     int players_alive = 0;
 
-    // Status for features still being brought up.
+    // Status for the parts still being brought up.
     bool      diag_bones_ok = false;
     uintptr_t diag_bone_node = 0, diag_bone_arr = 0;
     bool      diag_wsvc_ok = false;
     uintptr_t diag_wsvc = 0;
+    int       diag_defidx = 0;
     uintptr_t diag_c4_ent = 0;
-    int       diag_defidx = 0;   // discovered def-index offset, 0 if not yet
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
@@ -107,7 +111,6 @@ private:
         bool      wsvc_ok = false;
         double    wsvc_try = 0.0;
 
-        // Def-index calibration is retried on a timer until it succeeds.
         double defidx_try = -1e9;
 
         C4Cand c4_cand{};
