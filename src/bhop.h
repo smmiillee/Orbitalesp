@@ -2,80 +2,51 @@
 #pragma once
 #include <cstdint>
 
-// Six INDEPENDENT bhop engines. Each is a complete feature with its own enable
-// flag, its own state and its own output. Disabling one cannot affect another.
+// One bhop engine. SPACE is the only injected key -- no bind needed, because
+// `space` is already bound to +jump by default.
 //
-// NOTHING HERE WRITES TO cs2.exe. Every engine injects input (or types a console
-// command); the project stays read-only towards the game process.
+// NOTHING HERE WRITES TO cs2.exe. The engine injects keystrokes; the project
+// stays read-only towards the game process.
 //
-// ══ WHY THE PREVIOUS VERSION KEPT STOPPING ══════════════════════════════
-// The key engines were EDGE-TRIGGERED: they injected once on the rising edge of
-// the ground flag. If a hop was missed, you ended up standing on the ground with
-// the flag stuck true -- so no new rising edge ever occurred and the engine
-// NEVER INJECTED AGAIN until the gate was released and re-pressed. One miss
-// killed the whole chain, which is exactly the "stops randomly" symptom.
+// ══ HOW IT WORKS ═════════════════════════════════════════════════════════
+// Holding space is the GATE. While the engine runs, the hook swallows your
+// physical spacebar, so the game's +jump input comes only from us -- your held
+// key can never block the press edges we need.
 //
-// Every key engine now RETRIES while grounded: it keeps injecting at a fixed
-// cadence for as long as the flag says you are on the ground. A missed hop is
-// therefore self-correcting -- the next attempt happens a tick later.
+// A jump needs a fresh PRESS EDGE while grounded, so the engine injects a
+// SPACE down+up pair, and retries while the ground flag stays true. Retrying is
+// what stops a missed hop from ending the chain: the flag sticking true no
+// longer silences the engine.
 //
-// ══ THE ENGINES ═════════════════════════════════════════════════════════
+// ══ THE TIMING FIX: PRESS ON A TICK BOUNDARY ════════════════════════════
+// The retry cadence used to be "15.625 ms from when we noticed". But detection
+// happens somewhere INSIDE a tick (up to one sample late), so every retry was
+// offset by a random phase and the presses drifted around the tick -- which is
+// why it stopped hoppjing cleanly.
 //
-//  SCROLL_SI      Wheel spam via SendInput while the gate is held. Continuous,
-//                 so it has no state to latch.
+// The fix is a tick clock. Ground transitions can only happen on tick
+// boundaries, so we watch them, estimate the tick period and phase, and then
+// aim each press AT a boundary instead of at an interval. The offset control
+// shifts where inside the tick the press lands, so you can dial it in.
 //
-//  KEY_EDGE       Key pairs while grounded, first one immediately. The workhorse.
-//
-//  KEY_EDGE_DEL   Same, but the first pair of each grounded period waits one
-//                 client tick (15.625 ms). Valve has changed when a landing jump
-//                 is accepted more than once; this is the fix for builds where
-//                 an immediate jump gets swallowed.
-//
-//  SCROLL_ME      Wheel spam via the older mouse_event API -- a different path
-//                 through the Windows input stack than SendInput.
-//
-//  FPS64          Types "fps_max 64", then uses the KEY_EDGE_DEL pattern. At
-//                 64 fps frames align 1:1 with the server tick, so the injected
-//                 input lands in the tick intended. Disabling restores fps_max 0.
-//
-//  KEY_REPEAT     Ignores the ground flag ENTIRELY. Injects a pair at a fixed
-//                 cadence for as long as the gate is held. This is the most
-//                 latch-proof engine possible: there is no state machine to get
-//                 stuck, and while airborne the presses rely on jump buffering.
-//
-// ══ THE SPACE GATE ══════════════════════════════════════════════════════
-// Holding space is the GATE, never input we rely on: a held +jump cannot make a
-// new press edge. While any engine is running the hook swallows your physical
-// spacebar so the game only ever sees our edges.
-enum BhopEngine : int {
-    BHOP_SCROLL_SI = 0,
-    BHOP_KEY_EDGE,
-    BHOP_KEY_EDGE_DEL,
-    BHOP_SCROLL_ME,
-    BHOP_FPS64,
-    BHOP_KEY_REPEAT,
-    BHOP_ENGINE_COUNT
-};
-
+// ══ GROUND STATE ════════════════════════════════════════════════════════
+// m_fFlags bit 0, tested as a BITMASK and graded against Z before being
+// trusted. Z (m_vOldOrigin) is the reference because it is verified working.
 struct BhopDebug {
-    // shared
-    bool  focused     = false;
-    bool  space_held  = false;
-    bool  hook_ok     = false;
-    bool  on_ground   = false;
-    bool  suppressing = false;
-    int   signals     = 0;      // bit0 z, bit1 flag, bit2 hge
+    bool  focused      = false;
+    bool  space_held   = false;
+    bool  hook_ok      = false;
+    bool  on_ground    = false;
+    bool  suppressing  = false;
+    int   signals      = 0;      // bit0 z, bit1 flag, bit2 hge
 
-    // per-engine
-    bool  active[BHOP_ENGINE_COUNT]   = {};
-    int   injected[BHOP_ENGINE_COUNT] = {};
-    // ms since that engine last injected; -1 if it never has. This is the
-    // diagnostic that separates "our logic stalled" from "the game ignored us".
-    int   age_ms[BHOP_ENGINE_COUNT]   = {};
+    int   injected     = 0;      // pairs injected this session
+    int   age_ms       = -1;     // ms since the last pair, -1 = never
 
-    // FPS64
-    bool  fps_cmd_sent = false;
-    int   fps_target   = 64;
+    // tick clock
+    bool  locked       = false;  // clock has converged
+    float tick_ms      = 0.0f;   // estimated tick period
+    float last_phase   = -1.0f;  // phase of the last injection, ms into tick
 };
 
 void Bhop_Init();
@@ -83,17 +54,17 @@ void Bhop_Shutdown();
 
 BhopDebug Bhop_GetDebug();
 
-void Bhop_SetEngine(int engine, bool on);
-bool Bhop_GetEngine(int engine);
+void Bhop_SetEnabled(bool on);
+bool Bhop_Enabled();
 
-// Per-engine tuning.
-void  Bhop_SetScrollInterval(float ms);   // SCROLL_SI / SCROLL_ME
-float Bhop_ScrollInterval();
-void  Bhop_SetRepeatMs(float ms);         // retry cadence for the key engines
-float Bhop_RepeatMs();
-void  Bhop_SetDelayMs(float ms);          // KEY_EDGE_DEL / FPS64 first-pair delay
-float Bhop_DelayMs();
-void  Bhop_SetInjectKey(int vk);
-int   Bhop_InjectKey();
-void  Bhop_SetFpsTarget(int fps);
-int   Bhop_FpsTarget();
+// Press immediately on landing detection, or aim at the next tick boundary.
+void  Bhop_SetTickLock(bool on);
+bool  Bhop_TickLock();
+
+// Where inside the tick to press (tick-lock only). 0 = on the boundary.
+void  Bhop_SetOffsetMs(float ms);
+float Bhop_OffsetMs();
+
+// How many ticks between retries while grounded. 1 = every tick.
+void  Bhop_SetRetryTicks(int ticks);
+int   Bhop_RetryTicks();
