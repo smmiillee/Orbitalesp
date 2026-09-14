@@ -21,9 +21,9 @@ bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
 
 // ── logging ──────────────────────────────────────────────────────────────
-// Every init step is logged, because the failure modes here are SILENT: a
-// blocked startup loop, a wrongly-chosen window, or a self-hiding overlay all
-// look identical from outside. The log says which one it was.
+// Silent failure modes are the theme of this project: a blocked startup loop,
+// a wrongly-chosen window, or a self-hiding overlay all look identical from
+// outside. The log says which one it was.
 static FILE* g_log = nullptr;
 
 static void open_log() {
@@ -79,18 +79,11 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- six independent engines, nothing writes to cs2.exe.
-    bool  bh_scroll_si   = false;
-    bool  bh_key_edge    = false;
-    bool  bh_key_edge_del = true;   // was the most consistent
-    bool  bh_scroll_me   = false;
-    bool  bh_fps64       = false;
-    bool  bh_key_repeat  = false;
-    float bh_scroll_ms   = 8.0f;
-    float bh_repeat_ms   = 15.625f; // retry cadence
-    float bh_delay_ms    = 15.625f; // one tick
-    int   bh_inject_key  = VK_F20;
-    int   bh_fps_target  = 64;
+    // Bhop -- single engine, SPACE only, no memory writes.
+    bool  bh_enabled    = false;
+    bool  bh_tick_lock  = true;
+    float bh_offset_ms  = 0.0f;
+    int   bh_retry      = 1;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -129,10 +122,9 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
 
 // ── game window lookup ───────────────────────────────────────────────────
 // FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
-// keep the game window in front of its own detached console. Taking the first
-// match landed us on a 192x456 console window. So we enumerate every SDL
-// window, log all of them, and pick the best: titled first, then largest client
-// area, with small windows penalised so a console can never outrank the game.
+// keep the game window in front of its own detached console -- taking the first
+// match landed us on a 192x456 console. So we enumerate every SDL window, log
+// them all, and pick the best: titled first, then largest client area.
 struct WindowCand {
     HWND hwnd;
     int  w, h;
@@ -158,8 +150,7 @@ static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
 
     wchar_t title[128]{};
     GetWindowTextW(h, title, 127);
-    const bool titled =
-        (wcsstr(title, L"Counter-Strike") != nullptr);
+    const bool titled = (wcsstr(title, L"Counter-Strike") != nullptr);
 
     list->push_back(WindowCand{ h, w, hh, titled });
     OrbitalLog("  sdl window 0x%p client %dx%d titled=%d", h, w, hh,
@@ -234,19 +225,11 @@ static constexpr int kSkeleton[][2] = {
     { BONE_R_KNEE,     BONE_R_FOOT     },
 };
 
-// Push the whole bhop config into the module, so the two can never drift apart.
 static void apply_bhop_config() {
-    Bhop_SetEngine(BHOP_SCROLL_SI,    g_cfg.bh_scroll_si);
-    Bhop_SetEngine(BHOP_KEY_EDGE,     g_cfg.bh_key_edge);
-    Bhop_SetEngine(BHOP_KEY_EDGE_DEL, g_cfg.bh_key_edge_del);
-    Bhop_SetEngine(BHOP_SCROLL_ME,    g_cfg.bh_scroll_me);
-    Bhop_SetEngine(BHOP_FPS64,        g_cfg.bh_fps64);
-    Bhop_SetEngine(BHOP_KEY_REPEAT,   g_cfg.bh_key_repeat);
-    Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
-    Bhop_SetRepeatMs(g_cfg.bh_repeat_ms);
-    Bhop_SetDelayMs(g_cfg.bh_delay_ms);
-    Bhop_SetInjectKey(g_cfg.bh_inject_key);
-    Bhop_SetFpsTarget(g_cfg.bh_fps_target);
+    Bhop_SetEnabled(g_cfg.bh_enabled);
+    Bhop_SetTickLock(g_cfg.bh_tick_lock);
+    Bhop_SetOffsetMs(g_cfg.bh_offset_ms);
+    Bhop_SetRetryTicks(g_cfg.bh_retry);
 }
 
 void memory_thread() {
@@ -437,180 +420,65 @@ static void tab_esp() {
     ImGui::Columns(1);
 }
 
-// ── MISC: five independent bhop engines ──────────────────────────────────
-
-static void engine_row(int engine, const char* label, const char* tip,
-                       bool* cfg_flag) {
-    if (ImGui::Checkbox(label, cfg_flag))
-        Bhop_SetEngine(engine, *cfg_flag);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-
-    const BhopDebug d = Bhop_GetDebug();
-    ImGui::SameLine(320.0f);
-    if (d.active[engine]) {
-        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "running");
-    } else {
-        ImGui::TextDisabled("-");
-    }
-    ImGui::SameLine();
-
-    // The age is the diagnostic that matters: if hops stop while age keeps
-    // resetting, we are still injecting and the game is ignoring us. If age
-    // climbs, our own logic has stalled.
-    if (d.age_ms[engine] < 0)
-        ImGui::TextDisabled("%d  never", d.injected[engine]);
-    else if (d.age_ms[engine] < 1000)
-        ImGui::TextDisabled("%d  %dms ago", d.injected[engine],
-                            d.age_ms[engine]);
-    else
-        ImGui::TextDisabled("%d  stopped %ds ago", d.injected[engine],
-                            d.age_ms[engine] / 1000);
-}
-
 static void tab_misc() {
-    ImGui::TextDisabled("[ Bhop ]  HOLD SPACE - no auto-jump");
-    ImGui::TextDisabled("all engines inject input; none write to CS2");
+    ImGui::TextDisabled("[ Bhop ]  HOLD SPACE - no auto-jump, no keybind");
+    ImGui::TextDisabled("injects SPACE; nothing is written to CS2");
     ImGui::Separator();
 
-    engine_row(BHOP_SCROLL_SI, "1. Scroll - SendInput",
-        "Spams mouse-wheel events while the gate is held.\n"
-        "Continuous, so it has no state that can latch.\n"
-        "Needs the scroll bind in game (see below).",
-        &g_cfg.bh_scroll_si);
-
-    engine_row(BHOP_KEY_EDGE, "2. Key pair - while grounded",
-        "Injects F20 down+up pairs for as long as the ground flag\n"
-        "says you are on the ground. Retries automatically, so a\n"
-        "missed hop is corrected on the next attempt instead of\n"
-        "ending the chain. Needs the F-key bind.",
-        &g_cfg.bh_key_edge);
-
-    engine_row(BHOP_KEY_EDGE_DEL, "3. Key pair - one tick delay",
-        "Same as 2, but the first pair of each grounded period waits\n"
-        "one client tick (15.625 ms). This was the most consistent of\n"
-        "the previous engines, and now it retries instead of stopping.",
-        &g_cfg.bh_key_edge_del);
-
-    engine_row(BHOP_SCROLL_ME, "4. Scroll - mouse_event",
-        "Wheel spam through the older mouse_event API. Travels a\n"
-        "different path through the Windows input stack than\n"
-        "SendInput, so if CS2 filters one it may not filter the other.",
-        &g_cfg.bh_scroll_me);
-
-    engine_row(BHOP_FPS64, "5. 64 FPS tick-aligned",
-        "Types fps_max 64 into the CS2 console, then uses the\n"
-        "one-tick-delay pattern. At 64 fps frames align 1:1 with the\n"
-        "server tick, so input lands in the tick intended.\n"
-        "Disabling this restores fps_max 0.",
-        &g_cfg.bh_fps64);
-
-    engine_row(BHOP_KEY_REPEAT, "6. Key pair - always (no ground check)",
-        "Ignores the ground flag entirely and injects a pair at a\n"
-        "fixed cadence for as long as you hold space. There is no\n"
-        "state machine at all, so nothing can latch or stall -- the\n"
-        "most failure-proof option. While airborne the presses rely\n"
-        "on the game's jump buffering.",
-        &g_cfg.bh_key_repeat);
+    if (ImGui::Checkbox("Bhop (space)", &g_cfg.bh_enabled))
+        Bhop_SetEnabled(g_cfg.bh_enabled);
 
     const BhopDebug bd = Bhop_GetDebug();
 
-    ImGui::Columns(2, nullptr, false);
-    ImGui::SetColumnWidth(0, 260.0f);
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ Tuning ]");
-    ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::SliderFloat("##scrollms", &g_cfg.bh_scroll_ms, 2.0f, 30.0f,
-                           "scroll every %.0f ms"))
-        Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
-
-    ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::SliderFloat("##repeatms", &g_cfg.bh_repeat_ms, 4.0f, 40.0f,
-                           "retry every %.3f ms"))
-        Bhop_SetRepeatMs(g_cfg.bh_repeat_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How often a key engine retries while grounded.\n"
-                          "One tick is 15.625 ms. This is the setting that\n"
-                          "keeps the bhop from stopping.");
-
-    ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::SliderFloat("##delayms", &g_cfg.bh_delay_ms, 0.0f, 40.0f,
-                           "first-pair delay %.3f ms"))
-        Bhop_SetDelayMs(g_cfg.bh_delay_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Engines 3 and 5 only: how long the FIRST pair of\n"
-                          "each grounded period waits. One tick is 15.625 ms.");
-
-    // Plain parallel arrays + the classic string-array Combo overload. The
-    // getter-based Combo (bool(*)(void*,int,const char**)) only exists in newer
-    // ImGui, so it is deliberately not used here.
-    static const char* const kKeyNames[] = {
-        "F20", "F19", "F18", "APPS (menu key)", "RIGHT", "SPACE", "ALT"
-    };
-    static const int kKeyVks[] = {
-        VK_F20, VK_F19, VK_F18, VK_APPS, VK_RIGHT, VK_SPACE, VK_MENU
-    };
-    constexpr int kKeyCount = IM_ARRAYSIZE(kKeyNames);
-
-    int cur = 0;
-    for (int i = 0; i < kKeyCount; ++i)
-        if (kKeyVks[i] == g_cfg.bh_inject_key) cur = i;
-
-    ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::Combo("##key", &cur, kKeyNames, kKeyCount)) {
-        g_cfg.bh_inject_key = kKeyVks[cur];
-        Bhop_SetInjectKey(g_cfg.bh_inject_key);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Key injected by engines 2, 3 and 5.\n"
-                          "Some VK codes are ignored by CS2 - if a key does\n"
-                          "nothing, try another. You must bind it in game.");
-
-    ImGui::SetNextItemWidth(230.0f);
-    if (ImGui::SliderInt("##fps", &g_cfg.bh_fps_target, 32, 300,
-                         "fps_max %d"))
-        Bhop_SetFpsTarget(g_cfg.bh_fps_target);
-
-    ImGui::NextColumn();
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ State ]");
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("signals: %s%s%s",
-        (bd.signals & 1) ? "z " : "",
-        (bd.signals & 2) ? "flag " : "",
-        (bd.signals & 4) ? "hge" : "");
+
+    if (bd.age_ms < 0)
+        ImGui::TextDisabled("injected %d   never", bd.injected);
+    else
+        ImGui::TextDisabled("injected %d   %d ms ago", bd.injected, bd.age_ms);
+
     if (bd.suppressing)
-        ImGui::TextDisabled("space swallowed while driving");
+        ImGui::TextDisabled("physical space is swallowed while driving");
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
                            "key hook failed - gate may misbehave");
-    if (bd.fps_cmd_sent)
-        ImGui::TextDisabled("fps_max %d sent", bd.fps_target);
-
-    ImGui::Columns(1);
 
     ImGui::Separator();
-    ImGui::TextDisabled("[ in-game binds - paste one line at a time ]");
-    if (ImGui::BeginChild("##binds", { 0.0f, 108.0f }, true)) {
-        ImGui::TextDisabled("// scroll engines (1 and 4)");
-        ImGui::Text("alias +jh \"+jump;+jump\"");
-        ImGui::Text("alias -jh \"-jump;-jump;-jump\"");
-        ImGui::Text("bind mwheelup +jh");
-        ImGui::Text("bind mwheeldown +jh");
-        ImGui::TextDisabled("// key engines (2, 3 and 5)");
-        ImGui::Text("bind F20 +jump");
-    }
-    ImGui::EndChild();
+    ImGui::TextDisabled("[ Timing ]");
+
+    if (ImGui::Checkbox("Align to game tick", &g_cfg.bh_tick_lock))
+        Bhop_SetTickLock(g_cfg.bh_tick_lock);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The doubled +jump/-jump is the desubtick trick:\n"
-                          "each wheel input fires the command several times,\n"
-                          "so the engine gets more chances to register an edge.\n"
-                          "Plain mwheel +jump is unreliable post-July-2025.\n"
-                          "If 'bind F20' errors, CS2 cannot bind that key --\n"
-                          "pick a different one in the Tuning list.");
+        ImGui::SetTooltip("Presses are aimed at a predicted tick boundary instead\n"
+                          "of a fixed interval from when the landing was detected.\n"
+                          "Detection happens INSIDE a tick, so an interval-based\n"
+                          "retry drifts in phase -- which is why it stopped\n"
+                          "hopping cleanly. Untick to compare.");
+
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderFloat("##offset", &g_cfg.bh_offset_ms, 0.0f, 20.0f,
+                           "offset %.1f ms"))
+        Bhop_SetOffsetMs(g_cfg.bh_offset_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Where inside the tick the press lands.\n"
+                          "0 = right on the boundary. This is the control to\n"
+                          "sweep: try 0, 2, 4, 6, 8 and see which hops cleanest.");
+
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderInt("##retry", &g_cfg.bh_retry, 1, 4,
+                         "retry every %d tick(s)"))
+        Bhop_SetRetryTicks(g_cfg.bh_retry);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How often to retry while grounded.\n"
+                          "1 = every tick, which is the most persistent.");
+
+    ImGui::TextDisabled("tick clock: %s  %.3f ms",
+        bd.locked ? "locked" : "warming up",
+        bd.tick_ms > 0.0f ? bd.tick_ms : 15.625f);
+    if (bd.last_phase >= 0.0f)
+        ImGui::TextDisabled("last press: %.1f ms into the tick", bd.last_phase);
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -661,8 +529,8 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 640.0f, 620.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 520.0f, 340.0f }, { 1000.0f, 900.0f });
+    ImGui::SetNextWindowSize({ 600.0f, 560.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 500.0f, 320.0f }, { 1000.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
