@@ -1,4 +1,3 @@
-<artifact identifier="orbital-esp-cpp" type="code" language="cpp" title="src/esp.cpp">
 // --- src/esp.cpp ---
 #include "esp.h"
 
