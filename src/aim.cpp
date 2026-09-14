@@ -101,6 +101,13 @@ void run_thread() {
             continue;
         }
 
+        // *** WHY THE DELAY FELT WEAK ***
+        // The cooldown used to SKIP this block, so the acquisition timer was
+        // never reset while waiting to be allowed to shoot again. On a target
+        // held continuously, the delay then appeared to count from the previous
+        // shot rather than from re-acquiring -- which reads as much shorter than
+        // the value set. The timer is now cleared during the cooldown, so the
+        // full delay elapses AFTER the cooldown ends.
         if (down && now_ms() - down_at >= kClickMs) {
             mouse(false);
             down = false;
@@ -108,7 +115,11 @@ void run_thread() {
         }
 
         const double now = now_ms();
-        if (now < next_shot) continue;
+        if (now < next_shot) {
+            target_since = 0.0;
+            g_dbg_held.store(0);
+            continue;
+        }
 
         const int sw = g_screen_w, sh = g_screen_h;
         if (sw <= 0 || sh <= 0) continue;
@@ -212,9 +223,11 @@ void Aim_SetRadius(float pct) {
 }
 float Aim_Radius() { return g_radius.load(); }
 
+// Range raised to 600 ms: at 200 the effect was visible but subtle, and a wider
+// range makes it obvious whether the value is being applied at all.
 void Aim_SetDelay(int ms) {
     if (ms < 0) ms = 0;
-    if (ms > 200) ms = 200;
+    if (ms > 600) ms = 600;
     g_delay.store(ms);
 }
 int Aim_Delay() { return g_delay.load(); }
