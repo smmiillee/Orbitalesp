@@ -4,22 +4,36 @@
 
 class Overlay {
 public:
-    HWND                    hwnd      = nullptr;
-    ID3D11Device*           device    = nullptr;
-    ID3D11DeviceContext*    context   = nullptr;
-    IDXGISwapChain*         swapchain = nullptr;
-    ID3D11RenderTargetView* rtv       = nullptr;
+    HWND hwnd = nullptr;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    IDXGISwapChain* swapchain = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
 
     bool create(int width, int height);
     void begin_frame();
     void end_frame();
     void cleanup();
 
+    // Keeps the overlay glued to the game's client area and matches its size.
+    // Call this every frame, before begin_frame().
+    void sync_to_game();
+
+    // Process-level DPI awareness. MUST be called before any window is created,
+    // otherwise GetClientRect on another process's window returns virtualised
+    // (scaled) numbers and every ESP coordinate is wrong.
+    static void enable_dpi_awareness();
+
 private:
-    bool create_device();
-    bool create_render_target();
-    void release_render_target();
+    bool init_dx11(int width, int height);
+    bool create_rtv();
+    void release_rtv();
+    bool resize_buffers(int width, int height);
+    void update_visibility_and_input();
 
     static LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
     WNDCLASSEXW wc{};
+
+    int width_  = 0;
+    int height_ = 0;
 };
