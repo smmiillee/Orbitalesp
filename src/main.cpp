@@ -17,6 +17,7 @@
 #include "bhop.h"
 #include "aim.h"
 #include "movement.h"
+#include "radar.h"
 
 // ══ NON-STATIC BY REQUIREMENT ════════════════════════════════════════════
 // aim.cpp declares g_esp, g_local_team, g_screen_w and g_screen_h as extern so
@@ -134,6 +135,11 @@ struct Config {
     float aim_radius = 1.4f;
     bool  jb_enabled = false;
     int   jb_key = 0;
+    float jb_crouch_lead = 150.0f;
+    float jb_uncrouch_lead = 24.0f;
+
+    int   aim_delay = 0;
+    int   radar_port = 3000;
 } g_cfg;
 
 // ── config file ──────────────────────────────────────────────────────────
@@ -171,6 +177,8 @@ static void save_config() {
     W_B(bh_enabled);
     W_B(aim_enabled); W_B(aim_fire); W_I(aim_key); W_F(aim_radius);
     W_B(jb_enabled); W_I(jb_key);
+    W_F(jb_crouch_lead); W_F(jb_uncrouch_lead);
+    W_I(aim_delay); W_I(radar_port);
 
 #undef W_B
 #undef W_I
@@ -239,6 +247,10 @@ static void load_config() {
         else if (!strcmp(key,"aim_radius"))       asF(g_cfg.aim_radius);
         else if (!strcmp(key,"jb_enabled"))       asB(g_cfg.jb_enabled);
         else if (!strcmp(key,"jb_key"))           asI(g_cfg.jb_key);
+        else if (!strcmp(key,"jb_crouch_lead"))   asF(g_cfg.jb_crouch_lead);
+        else if (!strcmp(key,"jb_uncrouch_lead")) asF(g_cfg.jb_uncrouch_lead);
+        else if (!strcmp(key,"aim_delay"))        asI(g_cfg.aim_delay);
+        else if (!strcmp(key,"radar_port"))       asI(g_cfg.radar_port);
     }
     fclose(f);
     OrbitalLog("config loaded");
@@ -367,8 +379,12 @@ static void apply_feature_config() {
     Aim_SetFire(g_cfg.aim_fire);
     Aim_SetKey(g_cfg.aim_key);
     Aim_SetRadius(g_cfg.aim_radius);
+    Aim_SetDelay(g_cfg.aim_delay);
     Movement_SetJumpbug(g_cfg.jb_enabled);
     Movement_SetKey(g_cfg.jb_key);
+    Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
+    Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
+    Radar_SetPort(g_cfg.radar_port);
 }
 
 void memory_thread() {
@@ -379,6 +395,7 @@ void memory_thread() {
     Bhop_Init();
     Aim_Init();
     Movement_Init();
+    Radar_Init();
     apply_feature_config();
 
     while (g_running) {
@@ -738,6 +755,15 @@ static void tab_aim() {
         ImGui::SetTooltip("How close to the crosshair a bone must be.\n"
                           "~1.4%% of height is head-sized.");
 
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 200,
+                         "delay %d ms"))
+        Aim_SetDelay(g_cfg.aim_delay);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Target must stay acquired this long before firing.\n"
+                          "0 = instant. Higher damps instant reactions and\n"
+                          "makes the timing look less mechanical.");
+
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
 
@@ -766,6 +792,21 @@ static void tab_movement() {
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.jb_key, CAPTURE_JUMPBUG);
 
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderFloat("##jbc", &g_cfg.jb_crouch_lead, 10.0f, 400.0f,
+                           "crouch %.0f ms before landing"))
+        Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How early in the fall to crouch.");
+
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderFloat("##jbu", &g_cfg.jb_uncrouch_lead, 0.0f, 200.0f,
+                           "uncrouch %.0f ms before landing"))
+        Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("When to uncrouch. THIS is the bug window -- it is\n"
+                          "the release just before touchdown that matters.");
+
     const MovementDebug md = Movement_GetDebug();
     ImGui::Separator();
     ImGui::Text("ground: %s   crouching: %s",
@@ -790,12 +831,37 @@ static void tab_movement() {
 }
 
 static void tab_radar() {
+    const RadarInfo ri = Radar_Get();
+
     ImGui::TextDisabled("[ Radar ]");
+    ImGui::TextDisabled("opens the radar server in your browser");
     ImGui::Separator();
+
+    ImGui::Text("this machine: %s", ri.ipv4[0] ? ri.ipv4 : "not found");
+    ImGui::TextDisabled("url: %s", ri.url);
+    ImGui::TextDisabled("run the radar server on port %d first", ri.port);
+
     ImGui::Spacing();
-    ImGui::TextDisabled("not implemented yet");
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::SliderInt("##rport", &g_cfg.radar_port, 1024, 65535,
+                         "port %d"))
+        Radar_SetPort(g_cfg.radar_port);
+
     ImGui::Spacing();
-    ImGui::TextDisabled("Reserved for the radar module.");
+    if (ImGui::Button("[Start Radar]", { 200.0f, 0.0f }))
+        Radar_Start();
+
+    if (ri.opened)
+        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "opened in browser");
+    if (ri.failed)
+        ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f }, "could not open browser");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Open this URL on your phone or a second PC on the");
+    ImGui::TextDisabled("same network to use the radar as a second screen.");
+    if (!ri.ipv4[0])
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+            "no LAN IPv4 found - check your adapter is up");
 }
 
 static void tab_colors() {
@@ -1006,6 +1072,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     Bhop_Shutdown();
     Aim_Shutdown();
     Movement_Shutdown();
+    Radar_Shutdown();
     overlay.cleanup();
     g_mem.detach();
     if (g_log) { fclose(g_log); g_log = nullptr; }
