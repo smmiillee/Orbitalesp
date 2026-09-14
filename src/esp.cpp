@@ -1,3 +1,4 @@
+<artifact identifier="orbital-esp-cpp" type="code" language="cpp" title="src/esp.cpp">
 // --- src/esp.cpp ---
 #include "esp.h"
 
@@ -145,10 +146,29 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
     return out[0] != '\0';
 }
 
+// *** THE "#0" BUG ***
+// The def index was read only through the econ-item path:
+//     weapon + m_AttributeManager + m_Item + m_iItemDefinitionIndex
+// m_Item is an embedded C_EconItemView, and for a weapon ENTITY that path
+// returns a constant 0 -- which is exactly the "#0" you saw, for every weapon.
+//
+// The direct field on the weapon is the correct primary read. The long path is
+// kept only as a fallback.
+//
+//   0x1BA  m_iItemDefinitionIndex   (direct)
 uint16_t item_def_index(const Memory& mem, uintptr_t w) {
-    return mem.read<uint16_t>(w + offsets::m_AttributeManager +
-                              offsets::m_Item +
-                              offsets::m_iItemDefinitionIndex);
+    // Primary: direct field.
+    const uint16_t direct =
+        mem.read<uint16_t>(w + offsets::m_iItemDefinitionIndex);
+    if (direct >= 1 && direct <= 700) return direct;
+
+    // Fallback: the econ-item path.
+    const uint16_t via_item = mem.read<uint16_t>(
+        w + offsets::m_AttributeManager + offsets::m_Item +
+        offsets::m_iItemDefinitionIndex);
+    if (via_item >= 1 && via_item <= 700) return via_item;
+
+    return direct;
 }
 
 struct BE { Vec3 pos; float pad[5]; };
@@ -184,14 +204,6 @@ bool looks_like_entity(const Memory& mem, uintptr_t ent) {
     return valid_ptr(mem.read<uintptr_t>(ent + offsets::m_pGameSceneNode));
 }
 
-// ---- weapon services ----
-// Validation is deliberately pointer-only: a valid services pointer whose
-// active-weapon handle resolves to an entity that has a valid scene node.
-//
-// The PREVIOUS probe additionally required the designer-name read to succeed,
-// and that was fatal: m_designerLvl1/m_designerPtr are unverified guesses, so
-// when they were wrong the probe REJECTED the correct offset and reported
-// "nothing found" while 0x1208 was almost certainly right. Dependency removed.
 bool wsvc_valid(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                 uintptr_t stride, uintptr_t pawn, uintptr_t off) {
     const uintptr_t ws = mem.read<uintptr_t>(pawn + off);
@@ -248,7 +260,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static double info_at  = -1e9;
     static bool   layout_locked = false;
 
-    // ---- pawn list ----
     if (now - slots_at > 100.0) {
         slots_at = now;
 
@@ -291,14 +302,12 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         else           pawns.clear();
     }
 
-    // ---- weapon services, verified rather than assumed ----
     if (!c_.wsvc_ok && now - c_.wsvc_try > 1000.0) {
         c_.wsvc_try = now;
 
         std::vector<uintptr_t> probe = pawns;
         if (probe.empty()) probe.push_back(local_pawn);
 
-        // Known candidates first.
         static const uintptr_t kCand[] = { 0x1208, 0x11E0, 0x11D8, 0x11E8,
                                            0x1200, 0x1210 };
         bool found = false;
@@ -307,7 +316,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             if (!wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride,
                             local_pawn, off))
                 continue;
-            // Confirm on at least one other pawn before believing it.
             int extra = 0;
             for (uintptr_t p : probe) {
                 if (p == local_pawn) continue;
@@ -315,14 +323,11 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                     ++extra;
             }
             if (extra >= 1) {
-                c_.wsvc = off;
-                c_.wsvc_ok = true;
-                found = true;
+                c_.wsvc = off; c_.wsvc_ok = true; found = true;
                 break;
             }
         }
 
-        // Bounded scan if the candidates all failed.
         if (!found) {
             for (uintptr_t off = 0x1000; off <= 0x1600; off += 8) {
                 if (!wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride,
@@ -331,8 +336,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 int extra = 0;
                 for (uintptr_t p : probe) {
                     if (p == local_pawn) continue;
-                    if (wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride,
-                                   p, off))
+                    if (wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride, p, off))
                         ++extra;
                 }
                 if (extra >= 1) { c_.wsvc = off; c_.wsvc_ok = true; break; }
@@ -343,7 +347,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_wsvc_ok = c_.wsvc_ok;
     diag_wsvc = c_.wsvc;
 
-    // ---- bone chain: seeds, then bounded scan ----
     if (!c_.bones_ok || c_.bone_fail > 250) {
         if (c_.probe_cd > 0) {
             --c_.probe_cd;
@@ -371,10 +374,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 for (const auto& t : test)
                     if (chain_hits(mem, t.first, t.second, s.n, s.a)) ++hits;
                 if (hits >= need) {
-                    c_.bone_node = s.n;
-                    c_.bone_arr  = s.a;
-                    found = true;
-                    break;
+                    c_.bone_node = s.n; c_.bone_arr = s.a;
+                    found = true; break;
                 }
             }
 
@@ -392,23 +393,16 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                                            no, ao))
                                 ++hits;
                         if (hits > best_hits) {
-                            best_hits = hits;
-                            bn = no;
-                            ba = ao;
+                            best_hits = hits; bn = no; ba = ao;
                         }
                     }
                 }
                 if (best_hits >= need) {
-                    c_.bone_node = bn;
-                    c_.bone_arr  = ba;
-                    found = true;
+                    c_.bone_node = bn; c_.bone_arr = ba; found = true;
                 }
             }
 
-            if (found) {
-                c_.bones_ok  = true;
-                c_.bone_fail = 0;
-            }
+            if (found) { c_.bones_ok = true; c_.bone_fail = 0; }
             c_.probe_cd = 375;
         }
     }
@@ -417,7 +411,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_bone_node = c_.bone_node;
     diag_bone_arr  = c_.bone_arr;
 
-    // ---- sample every live pawn ----
     std::vector<Track> fresh;
     fresh.reserve(pawns.size());
     int bone_hits = 0;
@@ -486,7 +479,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ---- names, weapons, carrier ----
     if (now - info_at > 300.0) {
         info_at = now;
 
@@ -529,8 +521,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 continue;
             }
 
-            // Def index first, designer name second, raw index last so an
-            // unlisted weapon still prints something.
             const char* nm = weapon_name(id);
             if (nm) {
                 std::snprintf(t.weapon, sizeof(t.weapon), "%s", nm);
@@ -545,35 +535,62 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     }
 
     // ---- planted C4 ----
+    // dwPlantedC4 is UNVERIFIED, so instead of trusting it we check whether the
+    // pointer leads to a live entity; if not, we look for a C4 entity in the
+    // entity list instead, which needs no C4-specific offset at all.
     bool bomb_on = false;
     Vec3 bomb{};
 
+    uintptr_t c4 = 0;
+
     const uintptr_t pl =
         mem.read<uintptr_t>(client_base + offsets::dwPlantedC4);
-
-    uintptr_t c4 = 0;
     if (looks_like_entity(mem, pl)) {
         c4 = pl;
     } else if (valid_ptr(pl)) {
         const uintptr_t inner = mem.read<uintptr_t>(pl);
         if (looks_like_entity(mem, inner)) c4 = inner;
     }
+
+    // Fallback: scan the entity list for a C4. We already have the slots and a
+    // working def-index read, so this costs almost nothing and removes the
+    // dependency on dwPlantedC4 entirely.
+    if (!c4 && c_.wsvc_ok && !pawns.empty()) {
+        static std::vector<uintptr_t> c4_slots;
+        static double c4_scan_at = -1e9;
+
+        if (now - c4_scan_at > 1000.0) {
+            c4_scan_at = now;
+            c4_slots.clear();
+
+            for (int ch = 0; ch < offsets::kChunks && c4_slots.size() < 4; ++ch) {
+                const uintptr_t cp =
+                    mem.read<uintptr_t>(el + c_.chunk_off + 8 * ch);
+                if (!valid_ptr(cp)) continue;
+                for (int i = 1; i < offsets::kSlots; ++i) {
+                    const uintptr_t e =
+                        mem.read<uintptr_t>(cp + c_.slot_stride * i);
+                    if (!valid_ptr(e)) continue;
+                    if (item_def_index(mem, e) != offsets::kItemDefC4) continue;
+                    c4_slots.push_back(e);
+                    break;
+                }
+            }
+        }
+
+        if (!c4_slots.empty()) c4 = c4_slots[0];
+    }
+
     diag_c4_ent = c4;
 
     if (c4) {
         const uintptr_t node =
             mem.read<uintptr_t>(c4 + offsets::m_pGameSceneNode);
 
-        // Candidates are tried both relative to the scene node and relative to
-        // the entity, because which one holds the position differs by build.
-        // Use the member type ESP::C4Cand, NOT a local struct. A local type
-        // would shadow the member, so the lambda's parameter type and the
-        // cached c_.c4_cand would silently become different types.
         static const C4Cand kCand[] = {
-            { true,  offsets::m_vecAbsOrigin }, { true,  0xD0 },
-            { true,  0xC8 },  { true,  0xD8 },  { true,  0xE0 },
-            { false, offsets::m_vOldOrigin },   { false, 0xC4 },
-            { false, 0xD0 },
+            { true,  offsets::m_vecAbsOrigin },
+            { true,  0xD0 }, { true, 0xC8 }, { true, 0xD8 },
+            { false, offsets::m_vOldOrigin },
         };
 
         auto accept = [&](const Vec3& v) {
@@ -586,7 +603,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
         auto read_pos = [&](const C4Cand& cd, Vec3& v) {
             const uintptr_t base = cd.on_node ? node : c4;
-            if (!cd.on_node && !valid_ptr(node)) { /* entity read is fine */ }
             v.x = mem.read<float>(base + cd.off);
             v.y = mem.read<float>(base + cd.off + 4);
             v.z = mem.read<float>(base + cd.off + 8);
@@ -595,12 +611,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
         if (c_.c4_ok) {
             Vec3 v{};
-            if (read_pos(c_.c4_cand, v) && accept(v)) {
-                bomb = v;
-                bomb_on = true;
-            } else {
-                c_.c4_ok = false;
-            }
+            if (read_pos(c_.c4_cand, v) && accept(v)) { bomb = v; bomb_on = true; }
+            else c_.c4_ok = false;
         }
 
         if (!c_.c4_ok) {
@@ -610,7 +622,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
 
                 const bool same = (c_.c4_cand.on_node == cd.on_node &&
                                    c_.c4_cand.off == cd.off);
-
                 if (same && c_.c4_last_t > 0.0 &&
                     std::fabs(v.z - c_.c4_last.z) < 0.2f) {
                     ++c_.c4_stable;
@@ -621,14 +632,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 c_.c4_last = v;
                 c_.c4_last_t = now;
 
-                // A planted bomb is motionless, so a tight stable run is a
-                // strong signal. 4 samples (~35 ms) rather than 12, because 12
-                // was strict enough that a moving node pointer could never pass.
                 if (c_.c4_stable >= 4) {
-                    c_.c4_ok = true;
-                    bomb = v;
-                    bomb_on = true;
-                    break;
+                    c_.c4_ok = true; bomb = v; bomb_on = true; break;
                 }
             }
         }
