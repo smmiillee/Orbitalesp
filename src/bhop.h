@@ -2,52 +2,75 @@
 #pragma once
 #include <cstdint>
 
-// Bhop by INPUT INJECTION ONLY. Nothing in this file writes to cs2.exe, and the
-// project as a whole performs zero writes to the game process.
+// Five INDEPENDENT bhop engines. Each one is a complete feature: it has its own
+// enable flag, its own input method and its own state. Disabling one does not
+// affect any other, and they can be combined (they will simply both inject).
 //
-// ══ THE TWO TECHNIQUES, BOTH GATED ON HOLDING SPACE ══════════════════════
+// NOTHING HERE WRITES TO cs2.exe. Every engine either injects keystrokes/mouse
+// events or, in the 64 FPS case, types a console command. The project remains
+// read-only towards the game process.
 //
-//  SCROLL (default, recommended) -- repeatedly injects mouse-wheel events while
-//      the gate is held. A wheel event is itself a press+release pair for a
-//      `+jump` bind, and we emit several per game tick, so one of them lands in
-//      the window the game allows for a re-jump on landing.
+// ── THE ENGINES, AND WHY EACH EXISTS ────────────────────────────────────
 //
-//      This is why scroll beats prediction: prediction has to hit one specific
-//      tick and its error is as wide as the window, whereas spamming covers
-//      every phase of the tick instead of trying to hit one.
+//  SCROLL_SI   Spams mouse-wheel events via SendInput while the gate is held.
+//              Timing-agnostic: several events per tick, so one lands in the
+//              window. The community-standard technique.
 //
-//  KEY EDGE (optional) -- presses/releases a key once per observed landing.
-//      Kept as a second chance, not as the primary path.
+//  KEY_SI      Injects one F20 down+up PAIR on each observed landing. This is
+//              the arrangement reported as working on UnknownCheats: a lot of
+//              VK codes are ignored by CS2, but F13-F24 are unused by the game
+//              and are accepted. Requires an in-game bind (see MISC tab).
 //
-// ══ WHY YOUR PHYSICAL KEY IS SWALLOWED WHILE DRIVING ═════════════════════
-// Holding space makes the engine's own +jump stay down. A button that is
-// already down cannot produce a new press edge, so a held key would block every
-// jump we try to inject. While bhop is driving, the low-level keyboard hook
-// swallows your physical spacebar: your held key becomes the GATE, and the
-// edges come from us.
+//  KEY_SI_DEL   Same as KEY_SI but waits one client tick (15.625 ms) after the
+//              ground flag appears before injecting. Valve changed when a
+//              landing jump is accepted more than once, and a one-tick delay is
+//              the fix people used for the versions that needed it. Worth
+//              testing because we cannot tell which regime this build is in.
 //
-// ══ GROUND STATE ═════════════════════════════════════════════════════════
-// Z comes from m_vOldOrigin, which is verified working. m_fFlags and
-// m_hGroundEntity are not verified for this build, so each is only trusted
-// after it has been seen set while Z is static AND clear while Z is moving --
-// a wrong offset then degrades the reading rather than breaking it.
+//  SCROLL_ME   Wheel spam through the OLDER mouse_event API. It travels a
+//              different path through the Windows input stack than SendInput,
+//              so if CS2 filters one it may not filter the other.
+//
+//  FPS64       Sends "fps_max 64" to the CS2 console, then injects tick-aligned
+//              key pairs. At 64 fps frames line up 1:1 with the server tick, so
+//              the injected input lands in the tick intended rather than being
+//              quantised. Disabling it restores fps_max 0.
+//
+// ── THE SPACE GATE ──────────────────────────────────────────────────────
+// Holding space is the GATE; it is never the input we rely on. A held +jump
+// cannot produce a new press edge, so while any engine is running the hook
+// swallows your physical spacebar and the edges come from us.
+//
+// ── GROUND STATE ────────────────────────────────────────────────────────
+// m_fFlags bit 0 tested as a BITMASK, never as a whole-value comparison -- the
+// UnknownCheats thread reports the bitmask form being materially more
+// consistent, and our own grading has already confirmed bit 0 is meaningful on
+// this build (the MISC tab showed "z flag hge" as trusted signals).
+enum BhopEngine : int {
+    BHOP_SCROLL_SI = 0,
+    BHOP_KEY_SI,
+    BHOP_KEY_SI_DEL,
+    BHOP_SCROLL_ME,
+    BHOP_FPS64,
+    BHOP_ENGINE_COUNT
+};
+
 struct BhopDebug {
-    // config
-    bool enabled     = true;
-    bool scroll      = true;
-    bool key_inject  = false;
+    // shared
+    bool  focused     = false;
+    bool  space_held  = false;
+    bool  hook_ok     = false;
+    bool  on_ground   = false;
+    bool  suppressing = false;
+    int   signals     = 0;      // bit0 z, bit1 flag, bit2 hge
 
-    // live state
-    bool on_ground   = false;
-    bool focused     = false;
-    bool space_held  = false;   // PHYSICAL spacebar state
-    bool hook_ok     = false;   // low-level keyboard hook installed
-    bool driving     = false;   // currently injecting
-    bool suppressing = false;   // physical spacebar is being swallowed
-
-    int  signals     = 0;       // bit0 z, bit1 flag, bit2 hge
-    int  scrolls     = 0;       // wheel events injected
-    int  edges       = 0;       // key press edges injected
+    // per-engine: 1 while that engine is active and driving
+    bool  active[BHOP_ENGINE_COUNT]  = {};
+    // per-engine: inputs injected this session (wheels, pairs or commands)
+    int   injected[BHOP_ENGINE_COUNT] = {};
+    // FPS64 only
+    bool  fps_cmd_sent = false;
+    int   fps_target   = 64;
 };
 
 void Bhop_Init();
@@ -55,8 +78,16 @@ void Bhop_Shutdown();
 
 BhopDebug Bhop_GetDebug();
 
-void  Bhop_SetEnabled(bool on);
-void  Bhop_SetScroll(bool on);
-void  Bhop_SetKeyInject(bool on);
-void  Bhop_SetScrollInterval(float ms);
+// Each engine is set independently.
+void Bhop_SetEngine(int engine, bool on);
+bool Bhop_GetEngine(int engine);
+
+// Per-engine tuning.
+void  Bhop_SetScrollInterval(float ms);   // SCROLL_SI / SCROLL_ME
 float Bhop_ScrollInterval();
+void  Bhop_SetDelayMs(float ms);          // KEY_SI_DEL, default one tick
+float Bhop_DelayMs();
+void  Bhop_SetInjectKey(int vk);          // KEY_SI / KEY_SI_DEL / FPS64
+int   Bhop_InjectKey();
+void  Bhop_SetFpsTarget(int fps);         // FPS64
+int   Bhop_FpsTarget();
