@@ -79,14 +79,16 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- five independent engines, nothing writes to cs2.exe.
-    bool  bh_scroll_si   = true;
-    bool  bh_key_si      = false;
-    bool  bh_key_si_del  = false;
+    // Bhop -- six independent engines, nothing writes to cs2.exe.
+    bool  bh_scroll_si   = false;
+    bool  bh_key_edge    = false;
+    bool  bh_key_edge_del = true;   // was the most consistent
     bool  bh_scroll_me   = false;
     bool  bh_fps64       = false;
+    bool  bh_key_repeat  = false;
     float bh_scroll_ms   = 8.0f;
-    float bh_delay_ms    = 15.625f;
+    float bh_repeat_ms   = 15.625f; // retry cadence
+    float bh_delay_ms    = 15.625f; // one tick
     int   bh_inject_key  = VK_F20;
     int   bh_fps_target  = 64;
 } g_cfg;
@@ -234,12 +236,14 @@ static constexpr int kSkeleton[][2] = {
 
 // Push the whole bhop config into the module, so the two can never drift apart.
 static void apply_bhop_config() {
-    Bhop_SetEngine(BHOP_SCROLL_SI,  g_cfg.bh_scroll_si);
-    Bhop_SetEngine(BHOP_KEY_SI,     g_cfg.bh_key_si);
-    Bhop_SetEngine(BHOP_KEY_SI_DEL, g_cfg.bh_key_si_del);
-    Bhop_SetEngine(BHOP_SCROLL_ME,  g_cfg.bh_scroll_me);
-    Bhop_SetEngine(BHOP_FPS64,      g_cfg.bh_fps64);
+    Bhop_SetEngine(BHOP_SCROLL_SI,    g_cfg.bh_scroll_si);
+    Bhop_SetEngine(BHOP_KEY_EDGE,     g_cfg.bh_key_edge);
+    Bhop_SetEngine(BHOP_KEY_EDGE_DEL, g_cfg.bh_key_edge_del);
+    Bhop_SetEngine(BHOP_SCROLL_ME,    g_cfg.bh_scroll_me);
+    Bhop_SetEngine(BHOP_FPS64,        g_cfg.bh_fps64);
+    Bhop_SetEngine(BHOP_KEY_REPEAT,   g_cfg.bh_key_repeat);
     Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
+    Bhop_SetRepeatMs(g_cfg.bh_repeat_ms);
     Bhop_SetDelayMs(g_cfg.bh_delay_ms);
     Bhop_SetInjectKey(g_cfg.bh_inject_key);
     Bhop_SetFpsTarget(g_cfg.bh_fps_target);
@@ -442,14 +446,25 @@ static void engine_row(int engine, const char* label, const char* tip,
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
 
     const BhopDebug d = Bhop_GetDebug();
-    ImGui::SameLine(300.0f);
+    ImGui::SameLine(320.0f);
     if (d.active[engine]) {
         ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "running");
     } else {
         ImGui::TextDisabled("-");
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("%d", d.injected[engine]);
+
+    // The age is the diagnostic that matters: if hops stop while age keeps
+    // resetting, we are still injecting and the game is ignoring us. If age
+    // climbs, our own logic has stalled.
+    if (d.age_ms[engine] < 0)
+        ImGui::TextDisabled("%d  never", d.injected[engine]);
+    else if (d.age_ms[engine] < 1000)
+        ImGui::TextDisabled("%d  %dms ago", d.injected[engine],
+                            d.age_ms[engine]);
+    else
+        ImGui::TextDisabled("%d  stopped %ds ago", d.injected[engine],
+                            d.age_ms[engine] / 1000);
 }
 
 static void tab_misc() {
@@ -459,22 +474,22 @@ static void tab_misc() {
 
     engine_row(BHOP_SCROLL_SI, "1. Scroll - SendInput",
         "Spams mouse-wheel events while the gate is held.\n"
-        "Several events per tick, so one lands in the window.\n"
+        "Continuous, so it has no state that can latch.\n"
         "Needs the scroll bind in game (see below).",
         &g_cfg.bh_scroll_si);
 
-    engine_row(BHOP_KEY_SI, "2. Key pair - SendInput",
-        "Injects one F20 down+up pair per observed landing.\n"
-        "A lot of VK codes are ignored by CS2; F13-F24 are unused\n"
-        "by the game and are accepted. Needs the F-key bind.",
-        &g_cfg.bh_key_si);
+    engine_row(BHOP_KEY_EDGE, "2. Key pair - while grounded",
+        "Injects F20 down+up pairs for as long as the ground flag\n"
+        "says you are on the ground. Retries automatically, so a\n"
+        "missed hop is corrected on the next attempt instead of\n"
+        "ending the chain. Needs the F-key bind.",
+        &g_cfg.bh_key_edge);
 
-    engine_row(BHOP_KEY_SI_DEL, "3. Key pair - one tick delay",
-        "Same as 2, but waits one client tick (15.625 ms) after the\n"
-        "ground flag appears. Valve has changed when a landing jump\n"
-        "is accepted more than once; this is the fix for builds\n"
-        "where an immediate jump is swallowed.",
-        &g_cfg.bh_key_si_del);
+    engine_row(BHOP_KEY_EDGE_DEL, "3. Key pair - one tick delay",
+        "Same as 2, but the first pair of each grounded period waits\n"
+        "one client tick (15.625 ms). This was the most consistent of\n"
+        "the previous engines, and now it retries instead of stopping.",
+        &g_cfg.bh_key_edge_del);
 
     engine_row(BHOP_SCROLL_ME, "4. Scroll - mouse_event",
         "Wheel spam through the older mouse_event API. Travels a\n"
@@ -483,11 +498,19 @@ static void tab_misc() {
         &g_cfg.bh_scroll_me);
 
     engine_row(BHOP_FPS64, "5. 64 FPS tick-aligned",
-        "Types fps_max 64 into the CS2 console, then injects\n"
-        "tick-aligned key pairs. At 64 fps your frames line up 1:1\n"
-        "with the server tick, so the input lands in the tick you\n"
-        "intend. Disabling this restores fps_max 0.",
+        "Types fps_max 64 into the CS2 console, then uses the\n"
+        "one-tick-delay pattern. At 64 fps frames align 1:1 with the\n"
+        "server tick, so input lands in the tick intended.\n"
+        "Disabling this restores fps_max 0.",
         &g_cfg.bh_fps64);
+
+    engine_row(BHOP_KEY_REPEAT, "6. Key pair - always (no ground check)",
+        "Ignores the ground flag entirely and injects a pair at a\n"
+        "fixed cadence for as long as you hold space. There is no\n"
+        "state machine at all, so nothing can latch or stall -- the\n"
+        "most failure-proof option. While airborne the presses rely\n"
+        "on the game's jump buffering.",
+        &g_cfg.bh_key_repeat);
 
     const BhopDebug bd = Bhop_GetDebug();
 
@@ -502,11 +525,21 @@ static void tab_misc() {
         Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
 
     ImGui::SetNextItemWidth(230.0f);
+    if (ImGui::SliderFloat("##repeatms", &g_cfg.bh_repeat_ms, 4.0f, 40.0f,
+                           "retry every %.3f ms"))
+        Bhop_SetRepeatMs(g_cfg.bh_repeat_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("How often a key engine retries while grounded.\n"
+                          "One tick is 15.625 ms. This is the setting that\n"
+                          "keeps the bhop from stopping.");
+
+    ImGui::SetNextItemWidth(230.0f);
     if (ImGui::SliderFloat("##delayms", &g_cfg.bh_delay_ms, 0.0f, 40.0f,
-                           "delay %.3f ms"))
+                           "first-pair delay %.3f ms"))
         Bhop_SetDelayMs(g_cfg.bh_delay_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("One tick is 15.625 ms.");
+        ImGui::SetTooltip("Engines 3 and 5 only: how long the FIRST pair of\n"
+                          "each grounded period waits. One tick is 15.625 ms.");
 
     // Plain parallel arrays + the classic string-array Combo overload. The
     // getter-based Combo (bool(*)(void*,int,const char**)) only exists in newer
