@@ -134,9 +134,9 @@ struct Config {
     int   aim_key = 0;
     float aim_radius = 1.4f;
     bool  jb_enabled = false;
-    int   jb_key = 0;
-    float jb_crouch_lead = 200.0f;
-    float jb_uncrouch_lead = 0.0f;   // 0 = release on landing
+    int   jb_key = 0;                 // 0 = unbound = off
+    float jb_crouch_lead = 31.0f;     // two ticks
+    float jb_uncrouch_height = 11.0f; // documented 9-11 unit window
 
     int   aim_delay = 0;
     int   radar_port = 3000;
@@ -178,7 +178,7 @@ static void save_config() {
     W_B(bh_enabled);
     W_B(aim_enabled); W_B(aim_fire); W_I(aim_key); W_F(aim_radius);
     W_B(jb_enabled); W_I(jb_key);
-    W_F(jb_crouch_lead); W_F(jb_uncrouch_lead);
+    W_F(jb_crouch_lead); W_F(jb_uncrouch_height);
     W_I(aim_delay); W_I(radar_port); W_I(radar_sel);
 
 #undef W_B
@@ -249,7 +249,7 @@ static void load_config() {
         else if (!strcmp(key,"jb_enabled"))       asB(g_cfg.jb_enabled);
         else if (!strcmp(key,"jb_key"))           asI(g_cfg.jb_key);
         else if (!strcmp(key,"jb_crouch_lead"))   asF(g_cfg.jb_crouch_lead);
-        else if (!strcmp(key,"jb_uncrouch_lead")) asF(g_cfg.jb_uncrouch_lead);
+        else if (!strcmp(key,"jb_uncrouch_height")) asF(g_cfg.jb_uncrouch_height);
         else if (!strcmp(key,"aim_delay"))        asI(g_cfg.aim_delay);
         else if (!strcmp(key,"radar_port"))       asI(g_cfg.radar_port);
     }
@@ -384,7 +384,7 @@ static void apply_feature_config() {
     Movement_SetJumpbug(g_cfg.jb_enabled);
     Movement_SetKey(g_cfg.jb_key);
     Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
-    Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
+    Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
     Radar_SetPort(g_cfg.radar_port);
     Radar_SetSelection(g_cfg.radar_sel);
 }
@@ -571,15 +571,22 @@ static int capture_poll() {
 }
 
 // label + current bind + a "set" button that captures the next input.
+//
+// UNBOUND MEANS OFF. There is no "always on": an unbound feature does nothing
+// until you bind it, which is shown in orange so it cannot be mistaken for
+// working.
 static void keybind_row(const char* label, int* vk, int target) {
+    const bool unbound = (*vk == 0);
+
     ImGui::TextDisabled("%s", label);
     ImGui::SameLine(150.0f);
 
-    if (g_capture == target) {
+    if (g_capture == target)
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "press any input...");
-    } else {
+    else if (unbound)
+        ImGui::TextColored({ 1.0f, 0.5f, 0.2f, 1.0f }, "not bound");
+    else
         ImGui::Text("%s", vk_name(*vk));
-    }
 
     ImGui::SameLine(280.0f);
     char id[32];
@@ -590,7 +597,8 @@ static void keybind_row(const char* label, int* vk, int target) {
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Click, then press any key or mouse button.\n"
-                          "Press ESC to clear it back to always-on.");
+                          "HOLD that key to enable the feature.\n"
+                          "ESC leaves it unbound, which means OFF.");
 
     if (g_capture == target) {
         ImGui::SameLine();
@@ -598,6 +606,11 @@ static void keybind_row(const char* label, int* vk, int target) {
             g_capture = CAPTURE_NONE;
             *vk = 0;
         }
+    }
+
+    if (unbound && g_capture != target) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(off until bound)");
     }
 }
 
@@ -826,42 +839,41 @@ static void tab_movement() {
     keybind_row("arm key", &g_cfg.jb_key, CAPTURE_JUMPBUG);
 
     ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##jbc", &g_cfg.jb_crouch_lead, 10.0f, 400.0f,
+    if (ImGui::SliderFloat("##jbc", &g_cfg.jb_crouch_lead, 4.0f, 200.0f,
                            "crouch %.0f ms before landing"))
         Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How early in the fall to crouch.");
+        ImGui::SetTooltip("How early to crouch. 31 ms is two ticks, which is\n"
+                          "what the reference jumpbug uses.");
 
     ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##jbu", &g_cfg.jb_uncrouch_lead, 0.0f, 60.0f,
-                           g_cfg.jb_uncrouch_lead <= 0.0f
-                               ? "uncrouch on landing"
-                               : "uncrouch %.0f ms before landing"))
-        Movement_SetUncrouchLead(g_cfg.jb_uncrouch_lead);
+    if (ImGui::SliderFloat("##jbh", &g_cfg.jb_uncrouch_height, 2.0f, 30.0f,
+                           "uncrouch at %.0f units above ground"))
+        Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("0 = release the crouch when the ground flag says we\n"
-                          "landed. That release AT touchdown is the jumpbug, so\n"
-                          "0 is the correct default. Raise it only to test\n"
-                          "releasing slightly early.");
+        ImGui::SetTooltip("This is the real timing control, and it is a HEIGHT\n"
+                          "rather than a delay, because the ms window depends on\n"
+                          "fall speed. The documented jumpbug window is 9-11\n"
+                          "units above the ground; 11 triggers on entry.");
 
     const MovementDebug md = Movement_GetDebug();
     ImGui::Separator();
-    ImGui::Text("ground: %s   crouching: %s   armed: %s",
+    ImGui::Text("ground: %s   crouching: %s   jumping: %s",
         md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no",
-        md.armed ? "yes" : "no");
+        md.jumping ? "yes" : "no");
 
-    // game_ducked is the GAME's own crouch flag. If crouching is yes but
-    // game_ducked is no, our CTRL never reached the game and no timing change
-    // will help. If both are yes, the crouch is real and the timing is what to
-    // adjust.
+    // game_ducked is the GAME's own crouch flag. If we are crouching but the
+    // game does not think we are, our CTRL never registered and no timing
+    // change will help.
     if (md.crouching && !md.game_ducked)
         ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f },
                            "game does NOT see the crouch (CTRL not registering)");
     else
         ImGui::TextDisabled("game crouch: %s", md.game_ducked ? "yes" : "no");
 
-    ImGui::TextDisabled("vz %.0f   tti %.1f ms   jumpbugs %d",
-        md.vz, md.tti, md.jumpbugs);
+    // height is the number that decides the jumpbug, so it is shown always.
+    ImGui::TextDisabled("height %.1f units   tti %.1f ms   jumpbugs %d",
+        md.height, md.tti, md.jumpbugs);
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Bhop ]");
