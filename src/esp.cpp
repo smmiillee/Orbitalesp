@@ -149,11 +149,11 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
 // DEF-INDEX SELF-CALIBRATION
 //
 // Some weapons render as "#0" and others as lowercase designer names ("ak47",
-// "hegrenade"). The lowercase ones prove the DESIGNER chain works, and that the
-// def-index read is returning 0. A wrong def index also breaks the bomb carrier
-// and the C4 entity scan, because both match on id 49.
+// "hegrenade"). The lowercase ones prove the DESIGNER chain works and that the
+// def-index read returns 0. A wrong def index also breaks the bomb carrier and
+// the C4 entity scan, since both match on id 49.
 //
-// So rather than guess a fifth offset, we find it using the designer name as a
+// So rather than guess another offset, we find it using the designer name as a
 // reference: if the designer says "ak47", the correct offset must read 7.
 // ---------------------------------------------------------------------------
 
@@ -204,7 +204,6 @@ constexpr DMap kDesigner[] = {
     { "c4",            49, "C4" },
 };
 
-// Designer string to expected id, or 0 if unknown.
 int designer_id(const char* dn) {
     for (const DMap& d : kDesigner)
         if (std::strcmp(dn, d.designer) == 0) return d.id;
@@ -213,7 +212,6 @@ int designer_id(const char* dn) {
     return 0;
 }
 
-// Designer string to pretty display name, or nullptr.
 const char* pretty_from_designer(const char* dn) {
     for (const DMap& d : kDesigner)
         if (std::strcmp(dn, d.designer) == 0) return d.pretty;
@@ -228,7 +226,6 @@ bool plausible_id_val(int id) {
            (id >= 500 && id <= 600);
 }
 
-// Discovered def-index offset. 0 = not found yet.
 uintptr_t g_defidx_off = 0;
 
 uint16_t item_def_index(const Memory& mem, uintptr_t w) {
@@ -246,12 +243,6 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
     return direct;
 }
 
-// Find the def-index offset by requiring agreement with the designer name.
-// Scores each uint16 candidate across the weapon entity:
-//   +1  value is a plausible id at all
-//   +2  value matches what the designer name says it must be
-// The best candidate that matches at least one reference wins, so we cannot
-// latch onto a field that merely happens to hold a small number.
 uintptr_t calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                            uintptr_t stride,
                            const std::vector<uintptr_t>& pawns) {
@@ -300,7 +291,6 @@ uintptr_t calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         }
     }
 
-    // Require real agreement, not just plausible numbers.
     if (best_matches < 1) return 0;
     return best_off;
 }
@@ -484,8 +474,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_wsvc = c_.wsvc;
 
     // ---- def-index offset, calibrated from designer names ----
-    // One offset feeds weapons, the bomb carrier AND the C4 entity scan, so this
-    // is the highest-value thing to get right.
     if (!g_defidx_off && c_.wsvc_ok && !pawns.empty() &&
         now - c_.defidx_try > 2000.0) {
         c_.defidx_try = now;
@@ -671,10 +659,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 continue;
             }
 
-            // Display order: pretty name from the id, then the pretty name for
-            // the designer string, then the raw designer string, then the id.
-            // The designer path is the one we KNOW works, so it is a real
-            // fallback rather than a last resort.
             const char* nm = weapon_name(id);
             if (nm) {
                 std::snprintf(t.weapon, sizeof(t.weapon), "%s", nm);
@@ -692,9 +676,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     }
 
     // ---- planted C4 ----
-    // dwPlantedC4 is unverified, so instead of trusting it we check whether the
-    // pointer leads to a live entity; if not, we find the C4 by scanning the
-    // entity list for id 49, which needs no C4-specific global at all.
     bool bomb_on = false;
     Vec3 bomb{};
 
@@ -883,6 +864,7 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
         if (e.box_h < 5.0f) continue;
 
         e.box_w     = e.box_h * 0.45f;
+        e.pawn      = t.pawn;      // needed by the triggerbot's vis check
         e.health    = t.health;
         e.team      = t.team;
         e.distance  = t.distance;
