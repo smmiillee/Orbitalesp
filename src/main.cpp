@@ -752,6 +752,13 @@ static void tab_esp() {
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
                            "weapon svc: not found");
 
+    if (g_esp.diag_defidx)
+        ImGui::TextDisabled("def index off: 0x%X (calibrated)",
+                            g_esp.diag_defidx);
+    else
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+                           "def index: calibrating...");
+
     if (g_esp.diag_c4_ent)
         ImGui::TextDisabled("C4 ent: 0x%llX",
             (unsigned long long)g_esp.diag_c4_ent);
@@ -782,13 +789,13 @@ static void tab_aim() {
                           "~1.4%% of height is head-sized.");
 
     ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 200,
+    if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 600,
                          "delay %d ms"))
         Aim_SetDelay(g_cfg.aim_delay);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Target must stay acquired this long before firing.\n"
-                          "0 = instant. Higher damps instant reactions and\n"
-                          "makes the timing look less mechanical.");
+        ImGui::SetTooltip("Target must stay acquired this long before firing,\n"
+                          "measured from re-acquiring. 0 = instant.\n"
+                          "The cooldown is separate and starts after firing.");
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
