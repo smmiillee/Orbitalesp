@@ -49,11 +49,16 @@ namespace offsets {
     // the fallback.
     constexpr uintptr_t m_hActiveWeapon = 0x60;
 
-    // C_EconItem layout: AttributeManager and Item are EMBEDDED structs, so the
-    // chain is a plain add: weapon + 0x1378 + 0x50 + 0x1BA.
+    // Item definition index.
+    //   m_iItemDefinitionIndex is a DIRECT field on the weapon entity at 0x1BA.
+    //   Reading it only through the econ-item path returns a constant 0 for a
+    //   weapon entity, which rendered every weapon as "#0".
+    //
+    // The econ path (AttributeManager + Item, both EMBEDDED) is kept as a
+    // fallback only.
+    constexpr uintptr_t m_iItemDefinitionIndex = 0x1BA;
     constexpr uintptr_t m_AttributeManager     = 0x1378;
     constexpr uintptr_t m_Item                 = 0x50;
-    constexpr uintptr_t m_iItemDefinitionIndex = 0x1BA;
     constexpr uint16_t  kItemDefC4             = 49;
 
     // Designer-name fallback: entity + 0x10 -> firstLevel,
