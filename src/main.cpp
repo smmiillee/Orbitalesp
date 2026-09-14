@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -52,6 +53,21 @@ void OrbitalLog(const char* fmt, ...) {
     fflush(g_log);
 }
 
+// Path helper: a file next to the exe, falling back to C:\ if that folder is
+// not writable (Program Files, for instance).
+static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
+    out[0] = L'\0';
+    wchar_t exe[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(exe, L'\\');
+        if (slash) {
+            *(slash + 1) = L'\0';
+            swprintf_s(out, cap, L"%s%s", exe, name);
+        }
+    }
+    if (!out[0]) swprintf_s(out, cap, L"C:\\%s", name);
+}
+
 struct Config {
     // ESP visuals
     bool  esp_boxes    = true;
@@ -79,12 +95,113 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- single engine, SPACE only, no memory writes.
-    bool  bh_enabled  = false;
-    float bh_lead_ms  = 8.0f;
-    float bh_hold_ms  = 14.0f;
-    float bh_retry_ms = 16.0f;
+    // Bhop -- timing is locked in bhop.cpp, so only the toggle is configured.
+    bool  bh_enabled = false;
+
+    // Menu skin.
+    ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };  // the blue bar
+    ImVec4 menu_button = { 0.88f, 0.80f, 0.55f, 1.00f };
+    ImVec4 menu_slider = { 0.55f, 0.55f, 0.55f, 1.00f };
 } g_cfg;
+
+// ── config file ──────────────────────────────────────────────────────────
+// Plain key=value text next to the exe. Simple on purpose: it is trivial to
+// read, hand-edit and diff.
+static void save_config() {
+    wchar_t path[MAX_PATH]{};
+    sidecar_path(path, MAX_PATH, L"orbital.cfg");
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path, L"w");
+    if (!f) { OrbitalLog("config save FAILED"); return; }
+
+#define W_B(field) fprintf(f, #field "=%d\n", g_cfg.field ? 1 : 0)
+#define W_I(field) fprintf(f, #field "=%d\n", g_cfg.field)
+#define W_F(field) fprintf(f, #field "=%.4f\n", g_cfg.field)
+#define W_C(field) fprintf(f, #field "=%.4f %.4f %.4f %.4f\n", \
+                           g_cfg.field.x, g_cfg.field.y, \
+                           g_cfg.field.z, g_cfg.field.w)
+
+    W_B(esp_boxes);      W_B(esp_skeleton);  W_B(esp_head_dot);
+    W_B(esp_name);       W_B(esp_weapon);    W_B(esp_health);
+    W_B(esp_distance);   W_B(esp_bomb);
+    W_B(esp_show_enemies); W_B(esp_show_team);
+    W_F(box_thickness);
+
+    W_B(team_colors);
+    W_C(color_enemy);  W_C(color_team);    W_C(color_box);
+    W_C(color_skel);   W_C(color_head);    W_C(color_name);
+    W_C(color_weapon); W_C(color_dist);    W_C(color_bomb);
+    W_C(color_carrier);
+
+    W_C(menu_title);   W_C(menu_button);   W_C(menu_slider);
+
+    W_B(bh_enabled);
+
+#undef W_B
+#undef W_I
+#undef W_F
+#undef W_C
+
+    fclose(f);
+    OrbitalLog("config saved");
+}
+
+static void load_config() {
+    wchar_t path[MAX_PATH]{};
+    sidecar_path(path, MAX_PATH, L"orbital.cfg");
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, path, L"r");
+    if (!f) return;   // no config yet is normal on first run
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = line;
+        const char* val = eq + 1;
+
+        auto b = [&](bool& field)  { field = (atoi(val) != 0); };
+        auto i = [&](int& field)   { field = atoi(val); };
+        auto s = [&](float& field) { field = static_cast<float>(atof(val)); };
+        auto c = [&](ImVec4& field) {
+            float r = 0, g = 0, bl = 0, a = 1;
+            sscanf_s(val, "%f %f %f %f", &r, &g, &bl, &a);
+            field = ImVec4(r, g, bl, a);
+        };
+
+        if      (!strcmp(key, "esp_boxes"))        b(g_cfg.esp_boxes);
+        else if (!strcmp(key, "esp_skeleton"))     b(g_cfg.esp_skeleton);
+        else if (!strcmp(key, "esp_head_dot"))     b(g_cfg.esp_head_dot);
+        else if (!strcmp(key, "esp_name"))         b(g_cfg.esp_name);
+        else if (!strcmp(key, "esp_weapon"))       b(g_cfg.esp_weapon);
+        else if (!strcmp(key, "esp_health"))       b(g_cfg.esp_health);
+        else if (!strcmp(key, "esp_distance"))     b(g_cfg.esp_distance);
+        else if (!strcmp(key, "esp_bomb"))         b(g_cfg.esp_bomb);
+        else if (!strcmp(key, "esp_show_enemies")) b(g_cfg.esp_show_enemies);
+        else if (!strcmp(key, "esp_show_team"))    b(g_cfg.esp_show_team);
+        else if (!strcmp(key, "box_thickness"))    s(g_cfg.box_thickness);
+        else if (!strcmp(key, "team_colors"))      b(g_cfg.team_colors);
+        else if (!strcmp(key, "color_enemy"))      c(g_cfg.color_enemy);
+        else if (!strcmp(key, "color_team"))       c(g_cfg.color_team);
+        else if (!strcmp(key, "color_box"))        c(g_cfg.color_box);
+        else if (!strcmp(key, "color_skel"))       c(g_cfg.color_skel);
+        else if (!strcmp(key, "color_head"))       c(g_cfg.color_head);
+        else if (!strcmp(key, "color_name"))       c(g_cfg.color_name);
+        else if (!strcmp(key, "color_weapon"))     c(g_cfg.color_weapon);
+        else if (!strcmp(key, "color_dist"))       c(g_cfg.color_dist);
+        else if (!strcmp(key, "color_bomb"))       c(g_cfg.color_bomb);
+        else if (!strcmp(key, "color_carrier"))    c(g_cfg.color_carrier);
+        else if (!strcmp(key, "menu_title"))       c(g_cfg.menu_title);
+        else if (!strcmp(key, "menu_button"))      c(g_cfg.menu_button);
+        else if (!strcmp(key, "menu_slider"))      c(g_cfg.menu_slider);
+        else if (!strcmp(key, "bh_enabled"))       b(g_cfg.bh_enabled);
+    }
+    fclose(f);
+    OrbitalLog("config loaded");
+}
 
 static int  g_screen_w = 1920;
 static int  g_screen_h = 1080;
