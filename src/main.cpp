@@ -1,6 +1,7 @@
 // --- src/main.cpp ---
 #include <Windows.h>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -18,6 +19,39 @@ static bool g_running = true;
 bool g_menu_open = false;
 bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
+
+// ── logging ──────────────────────────────────────────────────────────────
+// Every init step is logged, because the failure modes here are SILENT: a
+// blocked startup loop or a self-hiding window both look identical from
+// outside -- process alive, nothing drawn, INSERT apparently dead. The log
+// says which one it was.
+static FILE* g_log = nullptr;
+
+static void open_log() {
+    if (g_log) return;
+
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (slash) {
+            *(slash + 1) = L'\0';
+            wcscat_s(path, MAX_PATH, L"orbital_log.txt");
+            _wfopen_s(&g_log, path, L"w");
+        }
+    }
+    if (!g_log) _wfopen_s(&g_log, L"C:\\orbital_log.txt", L"w");
+}
+
+void OrbitalLog(const char* fmt, ...) {
+    open_log();
+    if (!g_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
 
 struct Config {
     // ESP visuals
@@ -76,9 +110,6 @@ static int query_refresh_rate(HWND game) {
     return (hz < 30 || hz > 1000) ? 0 : hz;
 }
 
-// sleep_for() on Windows quantises to the timer resolution unless the process
-// raised it, which bhop does with timeBeginPeriod(1). Sleep the bulk, spin the
-// last stretch, so the frame cap is honest either way.
 static void wait_until(std::chrono::steady_clock::time_point deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -89,6 +120,75 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
         else
             std::this_thread::yield();
     }
+}
+
+// ── game window lookup ───────────────────────────────────────────────────
+// FindWindowA("SDL_app") is the primary path, but if it returns nothing --
+// different window class, game restarting, exclusive fullscreen toggle -- we
+// enumerate instead and accept any sizeable SDL window. This is a FALLBACK,
+// not a replacement, and it never blocks: a missing window is now a state we
+// operate in rather than a hang.
+struct EnumCtx { HWND found; };
+
+static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
+    auto* ctx = reinterpret_cast<EnumCtx*>(lp);
+
+    if (!IsWindowVisible(h)) return TRUE;
+
+    wchar_t cls[64]{};
+    if (!GetClassNameW(h, cls, 63)) return TRUE;
+    if (lstrcmpW(cls, L"SDL_app") != 0) return TRUE;
+
+    RECT r{};
+    if (!GetClientRect(h, &r)) return TRUE;
+    if (r.right < 320 || r.bottom < 240) return TRUE;
+
+    ctx->found = h;
+    return FALSE;   // stop
+}
+
+static HWND locate_game_window() {
+    HWND h = FindWindowA("SDL_app", nullptr);
+    if (h && IsWindow(h)) {
+        RECT r{};
+        if (GetClientRect(h, &r) && r.right > 0 && r.bottom > 0) return h;
+    }
+
+    EnumCtx ctx{ nullptr };
+    EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.found;
+}
+
+// Refresh g_cs2_hwnd and the client size. Returns true if we have a live game
+// window with a sane client rect.
+static bool refresh_game_window() {
+    if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
+        RECT r{};
+        if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
+            g_screen_w = r.right;
+            g_screen_h = r.bottom;
+            return true;
+        }
+    }
+
+    const HWND h = locate_game_window();
+    if (!h) return false;
+
+    RECT r{};
+    if (!GetClientRect(h, &r) || r.right <= 0 || r.bottom <= 0) return false;
+
+    g_cs2_hwnd = h;
+    g_screen_w = r.right;
+    g_screen_h = r.bottom;
+    OrbitalLog("game window found: 0x%p client %dx%d", h, g_screen_w, g_screen_h);
+    return true;
+}
+
+// Fallback size if no game window exists yet: the primary monitor's bounds.
+static void use_monitor_size() {
+    const int w = GetSystemMetrics(SM_CXSCREEN);
+    const int h = GetSystemMetrics(SM_CYSCREEN);
+    if (w > 0 && h > 0) { g_screen_w = w; g_screen_h = h; }
 }
 
 // Skeleton links, using the current (post animgraph_2_beta) bone map.
@@ -112,21 +212,7 @@ static constexpr int kSkeleton[][2] = {
     { BONE_R_KNEE,     BONE_R_FOOT     },
 };
 
-static bool find_cs2_window() {
-    g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
-    if (!g_cs2_hwnd) return false;
-
-    RECT r{};
-    if (!GetClientRect(g_cs2_hwnd, &r)) return false;
-    if (r.right <= 0 || r.bottom <= 0) return false;
-
-    g_screen_w = r.right;
-    g_screen_h = r.bottom;
-    return true;
-}
-
-// Push the whole bhop config into the module. Called once at startup and by
-// [Reset], so the two can never drift apart.
+// Push the whole bhop config into the module, so the two can never drift apart.
 static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bhop_enabled);
     Bhop_SetScroll(g_cfg.bhop_scroll);
@@ -138,6 +224,8 @@ static void apply_bhop_config() {
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+
+    OrbitalLog("memory attach: %s", g_mem.is_valid() ? "ok" : "FAILED");
 
     Bhop_Init();
     apply_bhop_config();
@@ -152,8 +240,6 @@ void memory_thread() {
 
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
-        // 8 ms (~125 Hz): the game only writes positions at 64 Hz and the
-        // render thread interpolates, so faster sampling buys nothing.
         wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
     }
 }
@@ -190,9 +276,7 @@ void render_esp(ImDrawList* dl) {
         if (bot < 0 || top > g_screen_h) continue;
 
         // Text spacing scales with the box and is CLAMPED, so labels stay just
-        // outside the box at every distance. A fixed pixel offset put the name
-        // a whole body-height above distant players, because at range the box
-        // is only a few pixels tall while the offset stayed 30 px.
+        // outside the box at every distance.
         float gap = bh * 0.06f;
         if (gap < 2.0f) gap = 2.0f;
         if (gap > 8.0f) gap = 8.0f;
@@ -231,21 +315,18 @@ void render_esp(ImDrawList* dl) {
                         IM_COL32(0, 0, 0, 180));
         }
 
-        // Name: bottom edge sits `gap` above the box top.
         if (g_cfg.esp_name && p.name[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.name);
             dl->AddText({ cx - sz.x * 0.5f, top - gap - lh },
                         pick(g_cfg.color_name), p.name);
         }
 
-        // Weapon: directly under the box.
         if (g_cfg.esp_weapon && p.weapon[0]) {
             const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
             dl->AddText({ cx - sz.x * 0.5f, bot + gap },
                         pick(g_cfg.color_weapon), p.weapon);
         }
 
-        // Bomb carrier: its own line, so it is never confused with the weapon.
         if (g_cfg.esp_bomb && p.has_bomb) {
             const char* tag = "C4 CARRIER";
             const ImVec2 sz = ImGui::CalcTextSize(tag);
@@ -290,7 +371,7 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::Text("%s", label);
 }
 
-// ── tabs ─────────────────────────────────────────────────────────────────
+// ── tabs (unchanged structure: ESP | MISC | COLORS) ──────────────────────
 
 static void tab_esp() {
     const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
@@ -356,9 +437,6 @@ static void tab_misc() {
     if (ImGui::SliderFloat("##scrollms", &g_cfg.bhop_interval_ms, 2.0f, 30.0f,
                            "scroll every %.0f ms"))
         Bhop_SetScrollInterval(g_cfg.bhop_interval_ms);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Wheel events per interval. 8 ms is ~2 per tick,\n"
-                          "which is the usual sweet spot. Lower = more events.");
 
     const BhopDebug bd = Bhop_GetDebug();
 
@@ -379,10 +457,6 @@ static void tab_misc() {
     ImGui::TextDisabled("alias +jh \"+jump;+jump\"");
     ImGui::TextDisabled("alias -jh \"-jump;-jump;-jump\"");
     ImGui::TextDisabled("bind mwheelup +jh ; bind mwheeldown +jh");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The doubled +jump/-jump is the de-subtick trick:\n"
-                          "each wheel input sends the command several times,\n"
-                          "so the engine gets more chances to register an edge.");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -394,6 +468,8 @@ static void tab_misc() {
     ImGui::Checkbox("V-Sync", &g_vsync);
 
     ImGui::Separator();
+    ImGui::TextDisabled("game window: %s",
+                        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "found" : "NOT FOUND");
     ImGui::TextDisabled("entities: %d slots", g_esp.diag_slots);
     ImGui::TextDisabled("weapon defIdx chain: %s (mine=%d)",
                         g_esp.diag_defidx ? "ok" : "not detected",
@@ -473,17 +549,40 @@ void render_menu() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    Overlay::enable_dpi_awareness();
+    OrbitalLog("=== orbital start ===");
 
-    while (!find_cs2_window())
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // MUST be first: before any window exists in this process.
+    Overlay::enable_dpi_awareness();
+    OrbitalLog("dpi awareness set");
+
+    // Try for the game window, but NEVER block on it. A missing window is a
+    // state we operate in, not a hang -- the old build spun here forever and
+    // looked like a dead process with a working menu.
+    bool have_game = false;
+    for (int i = 0; i < 20 && !have_game; ++i) {
+        have_game = refresh_game_window();
+        if (!have_game) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (!have_game) {
+        OrbitalLog("game window NOT found after 5s - using monitor size");
+        use_monitor_size();
+    } else {
+        OrbitalLog("game window ok (%dx%d)", g_screen_w, g_screen_h);
+    }
 
     g_detected_hz = query_refresh_rate(g_cs2_hwnd);
+    OrbitalLog("refresh rate: %d Hz", g_detected_hz);
 
     Overlay overlay;
-    if (!overlay.create(g_screen_w, g_screen_h)) return 1;
+    if (!overlay.create(g_screen_w, g_screen_h)) {
+        OrbitalLog("overlay.create FAILED - exiting");
+        return 1;
+    }
+    OrbitalLog("overlay created (%dx%d)", g_screen_w, g_screen_h);
 
     std::thread mem_t(memory_thread);
+
+    OrbitalLog("entering message loop");
 
     MSG msg{};
     while (g_running) {
@@ -496,17 +595,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
 
-        if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
-            RECT r{};
-            if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
-                g_screen_w = r.right;
-                g_screen_h = r.bottom;
-            }
-            overlay.sync_to_game();
-        }
+        // Re-locate the game window if it is missing or was restarted, and keep
+        // the overlay glued to its client area.
+        refresh_game_window();
+        overlay.sync_to_game();
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+        if (!g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) {
+            // Visible status, so "nothing is drawn" is never ambiguous again.
+            dl->AddText({ 20.0f, 20.0f }, IM_COL32(255, 200, 0, 255),
+                        "Orbital running - waiting for cs2.exe window");
+            dl->AddText({ 20.0f, 40.0f }, IM_COL32(255, 200, 0, 255),
+                        "INSERT - menu    F9 - exit");
+        }
+
         render_esp(dl);
         if (g_menu_open) render_menu();
         overlay.end_frame();
@@ -534,10 +638,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
     }
 
+    OrbitalLog("shutting down");
     g_running = false;
     mem_t.join();
     Bhop_Shutdown();
     overlay.cleanup();
     g_mem.detach();
+
+    if (g_log) { fclose(g_log); g_log = nullptr; }
     return 0;
 }
