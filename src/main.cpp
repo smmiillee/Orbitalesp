@@ -593,13 +593,55 @@ static void apply_captured(int vk) {
     g_capture = CAPTURE_NONE;
 }
 
-// ── colour rows, with right-click to copy ────────────────────────────────
+// ── colour rows: right-click copies, middle-click pastes ─────────────────
 static char   g_copy_flash[64] = "";
 static double g_copy_flash_at = -1e9;
 
+// Accepts "#RRGGBB", "#RRGGBBAA", "R,G,B" or "R,G,B,A".
+static bool paste_color_from_clipboard(ImVec4* c) {
+    if (!OpenClipboard(nullptr)) return false;
+
+    bool ok = false;
+    if (HANDLE h = GetClipboardData(CF_TEXT)) {
+        if (const char* txt = (const char*)GlobalLock(h)) {
+            unsigned r = 0, g = 0, b = 0, a = 255;
+            int got = 0;
+
+            // Skip leading whitespace.
+            while (*txt == ' ' || *txt == '\t' || *txt == '\r' || *txt == '\n')
+                ++txt;
+
+            if (*txt == '#') {
+                std::sscanf_s(txt + 1, "%2x%2x%2x%2x", &r, &g, &b, &a);
+                got = (int)std::strlen(txt + 1) >= 8 ? 4 : 3;
+            } else {
+                got = std::sscanf_s(txt, "%u,%u,%u,%u", &r, &g, &b, &a);
+            }
+            if (got < 3) { r = g = b = 0; a = 255; got = 0; }
+
+            if (got >= 3) {
+                if (got < 4) a = 255;
+                if (r > 255) r = 255;
+                if (g > 255) g = 255;
+                if (b > 255) b = 255;
+                if (a > 255) a = 255;
+                c->x = r / 255.0f;
+                c->y = g / 255.0f;
+                c->z = b / 255.0f;
+                c->w = a / 255.0f;
+                ok = true;
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
 static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::ColorEdit4(id, &c->x,
-        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
+        ImGuiColorEditFlags_AlphaPreviewHalf);
     const bool hovered = ImGui::IsItemHovered();
 
     char hex[16];
@@ -613,8 +655,20 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
                       label, hex);
         g_copy_flash_at = now_ms();
     }
+
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+        if (paste_color_from_clipboard(c))
+            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
+                          "%s  pasted", label);
+        else
+            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
+                          "%s  clipboard had no colour", label);
+        g_copy_flash_at = now_ms();
+    }
+
     if (hovered)
-        ImGui::SetTooltip("right-click to copy  %s", hex);
+        ImGui::SetTooltip("right-click: copy %s\nmiddle-click: paste colour",
+                          hex);
 
     ImGui::SameLine();
     ImGui::Text("%s", label);
