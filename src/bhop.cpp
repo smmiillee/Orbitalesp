@@ -1,23 +1,24 @@
 // --- src/bhop.cpp ---
 // One bhop engine. SPACE only. No memory writes.
 //
-// ══ WHY THE PREVIOUS TIMING DRIFTED ═════════════════════════════════════
-// The engine injected a pair, then scheduled the next at "now + 15.625 ms".
-// But `now` is when WE noticed the flag change, and detection lands somewhere
-// inside a tick -- up to one 2 ms sample late, and the flag itself is only
-// written once per 15.625 ms tick. So each retry carried a random phase offset,
-// and successive presses wandered around the tick instead of landing on it.
+// ══ THE BUG THIS FIXES ══════════════════════════════════════════════════
+// The old code did this:
 //
-// ══ THE FIX ═════════════════════════════════════════════════════════════
-// The ground flag can only change ON a tick boundary. So we timestamp every
-// transition, infer the tick period and phase from them, and then schedule each
-// press to land AT a predicted boundary rather than at a fixed interval.
+//     INPUT in[2]{};  in[0] = down;  in[1] = up;
+//     SendInput(2, in, sizeof(INPUT));          // down+up, zero duration
 //
-//   observe(t)      -> refine period and the position of a known boundary
-//   next_after(t)   -> the first boundary strictly after t
+// Both transitions land in the same call, so the key is down for ~0 us. CS2
+// samples keyboard state once per frame, so such a press is frequently never
+// seen by any frame sample. The input is not late -- it is invisible.
 //
-// The offset slider then shifts where inside the tick the pair lands, which is
-// the one thing that actually needs dialling in per machine.
+// ══ THE MODEL ═══════════════════════════════════════════════════════════
+//   * The server ticks (64/128). Subtick adds sub-tick timestamps on top.
+//   * The CLIENT computes those timestamps from its own per-frame input read.
+//   * Therefore the clock that limits us is FRAME time, not tick time.
+//
+// So a press must be HELD long enough to be sampled by at least one frame:
+// down -> hold_ms -> up. Then retry, because being grounded means the previous
+// hop failed and we need another attempt.
 #include "bhop.h"
 #include "memory.h"
 #include "offsets.h"
@@ -36,22 +37,17 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
-// 64-tick default, refined at runtime.
-constexpr double kDefaultTickMs = 15.625;
-
 std::atomic<bool>   g_stop{false}, g_started{false};
 std::atomic<bool>   g_enabled{false};
-std::atomic<bool>   g_tick_lock{true};
-std::atomic<double> g_offset_ms{0.0};
-std::atomic<int>    g_retry_ticks{1};
+std::atomic<double> g_hold_ms{10.0};    // spans a frame at up to ~100 fps
+std::atomic<double> g_retry_ms{16.0};   // about one 64-tick interval
 
 // Diagnostics.
-std::atomic<bool>  g_dbg_focus{false}, g_dbg_space{false};
-std::atomic<bool>  g_dbg_hook{false},  g_dbg_ground{false};
-std::atomic<bool>  g_dbg_suppress{false}, g_dbg_locked{false};
-std::atomic<int>   g_dbg_signals{0},   g_dbg_inj{0};
-std::atomic<double> g_dbg_last{0.0},   g_dbg_tick{kDefaultTickMs};
-std::atomic<double> g_dbg_phase{-1.0};
+std::atomic<bool>   g_dbg_focus{false}, g_dbg_space{false};
+std::atomic<bool>   g_dbg_hook{false},  g_dbg_ground{false};
+std::atomic<bool>   g_dbg_suppress{false}, g_dbg_pressing{false};
+std::atomic<int>    g_dbg_signals{0},   g_dbg_inj{0};
+std::atomic<double> g_dbg_last{0.0},    g_dbg_hold_used{0.0};
 
 // Keyboard hook.
 std::atomic<bool>  g_phys_space{false};
@@ -88,8 +84,9 @@ bool cs2_focused() {
 
 // ── keyboard hook ────────────────────────────────────────────────────────
 // Tracks the PHYSICAL spacebar (injected events carry LLKHF_INJECTED, so ours
-// are ignored) and swallows it while the engine drives, because a held +jump
-// cannot produce a new press edge.
+// are ignored) and swallows it while the engine drives. A held +jump cannot
+// produce a new press edge, so our injected edges must be the only ones the
+// game sees.
 LRESULT CALLBACK kb_proc(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
         const auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
@@ -164,6 +161,7 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     if (g_gw.hge_ok)  sig |= 4;
     g_dbg_signals.store(sig);
 
+    // Bitmask on the flag, never a whole-value comparison.
     bool ground;
     if (g_gw.flag_ok) ground = (fl & 1u) != 0u;
     else              ground = g_gw.z_ground;
@@ -173,96 +171,38 @@ bool sample_ground(const Memory& mem, uintptr_t pawn) {
     return ground;
 }
 
-// ── tick clock ───────────────────────────────────────────────────────────
-// Ground transitions can only occur on tick boundaries, so we timestamp them,
-// infer the period and phase, and predict future boundaries. This is what
-// replaces "press 15.625 ms after we noticed".
-struct TickClock {
-    bool   have       = false;
-    bool   converged  = false;
-    double period     = kDefaultTickMs;
-    double boundary   = 0.0;    // a boundary we believe in
-    double observed   = 0.0;    // last transition we fed in
-    int    samples    = 0;
+// ── injection: SEPARATE down and up transitions ──────────────────────────
+// This is the whole fix. The key goes down, stays down for hold_ms so at least
+// one frame samples it, and only then goes up.
+void key_down() {
+    INPUT in{};
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = VK_SPACE;
+    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
+    in.ki.dwExtraInfo = 0;
+    in.ki.time = 0;
+    SendInput(1, &in, sizeof(INPUT));
+}
 
-    // Feed a transition timestamp.
-    void observe(double t) {
-        if (!have) {
-            have = true;
-            boundary = t;
-            observed = t;
-            return;
-        }
-
-        const double dt = t - observed;
-        observed = t;
-
-        // Ignore gaps that aren't a plausible whole number of ticks.
-        if (dt < period * 0.4 || dt > period * 40.0) return;
-
-        const double n = std::floor(dt / period + 0.5);
-        if (n < 1.0) return;
-
-        // Refine the period toward the measured per-tick length.
-        const double measured = dt / n;
-        period = period * 0.8 + measured * 0.2;
-        if (period < 4.0)   period = 4.0;
-        if (period > 40.0)  period = 40.0;
-
-        // The transition happened at the boundary just before `t`, minus our
-        // detection latency. Re-anchor the grid to that boundary.
-        boundary = t;
-        if (++samples >= 4) converged = true;
-
-        g_dbg_tick.store(period);
-        g_dbg_locked.store(converged);
-    }
-
-    // First boundary strictly after t. If we have no grid, just return t.
-    double next_after(double t, double offset) const {
-        if (!have) return t + offset;
-
-        double b = boundary;
-        // Walk forward in tick steps until we pass t.
-        if (b <= t) {
-            const double need = (t - b) / period;
-            b += period * (std::floor(need) + 1.0);
-        }
-        return b + offset;
-    }
-
-    // Phase of t within the estimated tick, in ms. For diagnostics.
-    double phase_of(double t) const {
-        if (!have) return -1.0;
-        double d = std::fmod(t - boundary, period);
-        if (d < 0.0) d += period;
-        return d;
-    }
-};
-TickClock g_clock;
-
-// ── injection ────────────────────────────────────────────────────────────
-// SPACE only. Because the physical key is swallowed while driving, this is the
-// only space input the game sees -- so each pair is a clean, unambiguous jump.
-void key_pair() {
-    INPUT in[2]{};
-    in[0].type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_SPACE;
-    in[0].ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
-    in[0].ki.dwExtraInfo = 0;
-    in[0].ki.time = 0;
-
-    in[1] = in[0];
-    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    SendInput(2, in, sizeof(INPUT));
+void key_up() {
+    INPUT in{};
+    in.type = INPUT_KEYBOARD;
+    in.ki.wVk = VK_SPACE;
+    in.ki.wScan = static_cast<WORD>(MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC));
+    in.ki.dwFlags = KEYEVENTF_KEYUP;
+    in.ki.dwExtraInfo = 0;
+    in.ki.time = 0;
+    SendInput(1, &in, sizeof(INPUT));
 }
 
 void run_thread() {
     uintptr_t pawn = 0;
     double    pawn_at = 0.0, last_sample = 0.0;
     bool      ground = false, prev_ground = false;
-    double    next_fire = 0.0;
+
+    bool   pressed   = false;
+    double press_at  = 0.0;
+    double next_press = 0.0;
 
     while (!g_stop.load()) {
         wait_ms(1.0);
@@ -277,9 +217,12 @@ void run_thread() {
         g_suppress.store(driving);
         g_dbg_suppress.store(driving);
 
+        // ── not driving: release cleanly and reset ───────────────────────
         if (!driving) {
-            next_fire = 0.0;
+            if (pressed) { key_up(); pressed = false; }
+            next_press = 0.0;
             prev_ground = false;
+            g_dbg_pressing.store(false);
             continue;
         }
 
@@ -289,56 +232,58 @@ void run_thread() {
                 g_mem.client_dll + offsets::dwLocalPlayerPawn);
             pawn_at = now;
         }
-        if (!pawn) continue;
+        if (!pawn) {
+            if (pressed) { key_up(); pressed = false; }
+            continue;
+        }
 
-        // 2 ms sampling: fine enough to place a transition within a tick.
         if (now - last_sample >= 2.0) {
             last_sample = now;
-            const bool prev = ground;
             ground = sample_ground(g_mem, pawn);
-
-            // Every ground transition is a tick boundary, so feed the clock.
-            if (ground != prev) g_clock.observe(now);
         }
 
-        const bool tick_lock = g_tick_lock.load();
-        const double offset  = g_offset_ms.load();
-        const int    retry   = g_retry_ticks.load();
+        const double hold_ms  = g_hold_ms.load();
+        const double retry_ms = g_retry_ms.load();
 
-        // ── LANDING: arm the first press ─────────────────────────────────
-        // Rising edge of grounded. With tick lock we aim at the next boundary;
-        // without it we fire immediately, which is the old behaviour.
-        if (!prev_ground && ground) {
-            next_fire = tick_lock ? g_clock.next_after(now, offset) : now;
+        // ── release after the hold has elapsed ───────────────────────────
+        // Released as soon as the hold is up, regardless of ground state, so no
+        // matter what happens next the next press is a fresh edge.
+        if (pressed && (now - press_at) >= hold_ms) {
+            key_up();
+            pressed = false;
+            g_dbg_hold_used.store(now - press_at);
         }
-        prev_ground = ground;
 
-        // ── PRESS DECISIONS ─────────────────────────────────────────────
-        // While grounded, keep retrying: a missed hop leaves the flag true, and
-        // retrying is what stops that from ending the chain. While airborne,
-        // stay silent so the next landing is a fresh edge.
-        if (ground) {
-            if (next_fire <= 0.0) {
-                next_fire = tick_lock ? g_clock.next_after(now, offset) : now;
-            }
-            if (now >= next_fire) {
-                key_pair();
+        if (!ground) {
+            // Airborne: make sure we are not holding into the landing, because
+            // the landing press must be a clean rising edge.
+            if (pressed) { key_up(); pressed = false; }
+            next_press = 0.0;
+            prev_ground = false;
+            g_dbg_pressing.store(false);
+            continue;
+        }
+
+        // ── grounded: press, and keep retrying ───────────────────────────
+        // Retrying is what stops a missed hop from ending the chain: if we are
+        // still grounded, the previous attempt did not take, so try again.
+        if (!pressed) {
+            if (next_press <= 0.0) next_press = now;
+            if (now >= next_press) {
+                key_down();
+                pressed  = true;
+                press_at = now;
+                next_press = now + retry_ms;
                 g_dbg_inj.fetch_add(1);
                 g_dbg_last.store(now);
-                g_dbg_phase.store(g_clock.phase_of(now));
-
-                // Schedule the retry on the tick grid, N ticks ahead.
-                next_fire = tick_lock
-                    ? g_clock.next_after(now + 0.1, offset) +
-                          g_clock.period * (retry - 1)
-                    : now + kDefaultTickMs * retry;
             }
-        } else {
-            // Airborne: cancel any pending press so the landing is clean.
-            next_fire = 0.0;
         }
+
+        prev_ground = ground;
+        g_dbg_pressing.store(pressed);
     }
 
+    if (pressed) key_up();
     g_suppress.store(false);
 }
 
@@ -377,34 +322,31 @@ BhopDebug Bhop_GetDebug() {
     d.hook_ok     = g_dbg_hook.load();
     d.on_ground   = g_dbg_ground.load();
     d.suppressing = g_dbg_suppress.load();
+    d.pressing    = g_dbg_pressing.load();
     d.signals     = g_dbg_signals.load();
     d.injected    = g_dbg_inj.load();
 
     const double last = g_dbg_last.load();
     d.age_ms = (last <= 0.0) ? -1 : static_cast<int>(now_ms() - last);
 
-    d.locked     = g_dbg_locked.load();
-    d.tick_ms    = static_cast<float>(g_dbg_tick.load());
-    d.last_phase = static_cast<float>(g_dbg_phase.load());
+    d.hold_ms  = static_cast<float>(g_dbg_hold_used.load());
+    d.retry_ms = static_cast<float>(g_retry_ms.load());
     return d;
 }
 
-void  Bhop_SetEnabled(bool on)   { g_enabled.store(on); }
-bool  Bhop_Enabled()            { return g_enabled.load(); }
+void  Bhop_SetEnabled(bool on) { g_enabled.store(on); }
+bool  Bhop_Enabled()           { return g_enabled.load(); }
 
-void  Bhop_SetTickLock(bool on)  { g_tick_lock.store(on); }
-bool  Bhop_TickLock()           { return g_tick_lock.load(); }
-
-void  Bhop_SetOffsetMs(float ms) {
-    if (ms < 0.0f)  ms = 0.0f;
-    if (ms > 20.0f) ms = 20.0f;
-    g_offset_ms.store(static_cast<double>(ms));
+void  Bhop_SetHoldMs(float ms) {
+    if (ms < 1.0f)  ms = 1.0f;
+    if (ms > 40.0f) ms = 40.0f;
+    g_hold_ms.store(static_cast<double>(ms));
 }
-float Bhop_OffsetMs() { return static_cast<float>(g_offset_ms.load()); }
+float Bhop_HoldMs() { return static_cast<float>(g_hold_ms.load()); }
 
-void  Bhop_SetRetryTicks(int ticks) {
-    if (ticks < 1) ticks = 1;
-    if (ticks > 4) ticks = 4;
-    g_retry_ticks.store(ticks);
+void  Bhop_SetRetryMs(float ms) {
+    if (ms < 2.0f)  ms = 2.0f;
+    if (ms > 60.0f) ms = 60.0f;
+    g_retry_ms.store(static_cast<double>(ms));
 }
-int   Bhop_RetryTicks() { return g_retry_ticks.load(); }
+float Bhop_RetryMs() { return static_cast<float>(g_retry_ms.load()); }
