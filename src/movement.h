@@ -4,14 +4,17 @@
 
 // Jumpbug. CTRL injection only, no memory writes. Independent of bhop.
 //
-// Crouch during the fall, then uncrouch just before touchdown. The uncrouch is
-// what produces the bug.
+// MECHANIC: hold crouch during the fall, then RELEASE it as you touch down.
+// The release at touchdown is what produces the bug. Nothing else about the
+// timing matters much -- the release moment is the whole trick.
 //
-// GROUND DETECTION: m_fFlags bit 0 is the primary signal because it is
-// instance-accurate. A Z-stillness test is only a fallback, and only when
-// vertical velocity is also near zero -- a Z-stillness test on its own reads
-// the APEX of a jump as "grounded" (Z barely moves there), which corrupts the
-// reference height and makes the uncrouch fire early.
+// SO THE DEFAULT IS: uncrouch lead 0, meaning "release when the ground flag
+// says we landed". An earlier version released `uncrouch_lead` ms BEFORE the
+// predicted impact, which meant the release happened mid-air and there was no
+// release left to happen at touchdown -- the crouch was already up. That is why
+// it did nothing while the counter still climbed.
+//
+// Raise `uncrouch_lead` only to test releasing slightly early.
 struct MovementDebug {
     bool  enabled   = false;
     bool  on_ground = false;
@@ -19,7 +22,7 @@ struct MovementDebug {
     bool  armed     = false;
     float vz        = 0.0f;
     float tti       = -1.0f;
-    int   jumpbugs  = 0;
+    int   jumpbugs  = 0;   // crouch events started
 };
 
 void Movement_Init();
@@ -33,10 +36,11 @@ bool Movement_Jumpbug();
 void Movement_SetKey(int vk);
 int  Movement_Key();
 
-// Crouch this many ms before the predicted landing.
+// Press crouch when tti drops below this.
 void  Movement_SetCrouchLead(float ms);
 float Movement_CrouchLead();
 
-// Uncrouch this many ms before the predicted landing. This is the bug window.
+// Release crouch when tti drops below this. 0 = release on the ground flag,
+// which is the normal jumpbug.
 void  Movement_SetUncrouchLead(float ms);
 float Movement_UncrouchLead();
