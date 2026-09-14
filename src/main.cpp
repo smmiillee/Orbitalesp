@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -19,17 +21,15 @@
 #include "movement.h"
 #include "radar.h"
 
-// ══ NON-STATIC BY REQUIREMENT ════════════════════════════════════════════
-// aim.cpp declares g_esp, g_local_team, g_screen_w and g_screen_h as extern so
-// the trigger reuses the same ESP instance, the same local-team value and the
-// same viewport. A `static` at file scope gives INTERNAL linkage, so those
-// symbols would not exist for the linker at all -- that was the LNK2019 pair.
+// NON-STATIC BY REQUIREMENT: aim.cpp declares these extern, so they must have
+// external linkage. `static` at file scope would give internal linkage and the
+// linker would not see them at all.
 ESP g_esp;
 int g_screen_w = 1920;
 int g_screen_h = 1080;
 int g_local_team = 0;
 
-// These are extern'd by overlay.cpp.
+// extern'd by overlay.cpp
 bool g_menu_open = false;
 bool g_vsync = false;
 HWND g_cs2_hwnd = nullptr;
@@ -121,24 +121,31 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Menu skin -- bg and checkmark are the two new ones.
+    // Menu skin
     ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };
     ImVec4 menu_bg     = { 0.78f, 0.78f, 0.78f, 0.97f };
     ImVec4 menu_button = { 0.88f, 0.80f, 0.55f, 1.00f };
     ImVec4 menu_slider = { 0.55f, 0.55f, 0.55f, 1.00f };
     ImVec4 menu_check  = { 0.00f, 0.00f, 0.00f, 1.00f };
 
-    // Features
+    // Bhop -- timing locked in bhop.cpp, so only the toggle here.
     bool  bh_enabled = false;
-    bool  aim_enabled = false, aim_fire = true;
-    int   aim_key = 0;
-    float aim_radius = 1.4f;
-    bool  jb_enabled = false;
-    int   jb_key = 0;                 // 0 = unbound = off
-    float jb_crouch_lead = 31.0f;     // two ticks
-    float jb_uncrouch_height = 11.0f; // documented 9-11 unit window
 
+    // Triggerbot
+    bool  aim_enabled = false;
+    bool  aim_fire = true;
+    int   aim_key = 0;              // 0 = unbound = off
+    bool  aim_teamcheck = true;
+    bool  aim_vischeck = false;
     int   aim_delay = 0;
+
+    // Jumpbug
+    bool  jb_enabled = false;
+    int   jb_key = 0;               // 0 = unbound = off
+    float jb_crouch_lead = 31.0f;
+    float jb_uncrouch_height = 11.0f;
+
+    // Radar (tab hidden for now, values kept)
     int   radar_port = 3000;
     int   radar_sel = 0;
 } g_cfg;
@@ -151,9 +158,7 @@ static void save_config() {
     _wfopen_s(&f, path, L"w");
     if (!f) { OrbitalLog("config save FAILED"); return; }
 
-// The macro parameter is 'field', NOT 'f'. Using 'f' collides with the FILE*
-// argument, so fprintf(f, ...) expands to fprintf(esp_boxes, ...) and the field
-// name gets reported as an undeclared identifier.
+    // Parameter is 'field', NOT 'f' -- 'f' collides with the FILE* argument.
 #define W_B(field) fprintf(f, #field "=%d\n", g_cfg.field ? 1 : 0)
 #define W_I(field) fprintf(f, #field "=%d\n", g_cfg.field)
 #define W_F(field) fprintf(f, #field "=%.4f\n", g_cfg.field)
@@ -176,10 +181,14 @@ static void save_config() {
     W_C(menu_slider); W_C(menu_check);
 
     W_B(bh_enabled);
-    W_B(aim_enabled); W_B(aim_fire); W_I(aim_key); W_F(aim_radius);
+
+    W_B(aim_enabled); W_B(aim_fire); W_I(aim_key);
+    W_B(aim_teamcheck); W_B(aim_vischeck); W_I(aim_delay);
+
     W_B(jb_enabled); W_I(jb_key);
     W_F(jb_crouch_lead); W_F(jb_uncrouch_height);
-    W_I(aim_delay); W_I(radar_port); W_I(radar_sel);
+
+    W_I(radar_port); W_I(radar_sel);
 
 #undef W_B
 #undef W_I
@@ -214,44 +223,46 @@ static void load_config() {
             v = ImVec4(r, g, b, a);
         };
 
-        if      (!strcmp(key,"esp_boxes"))        asB(g_cfg.esp_boxes);
-        else if (!strcmp(key,"esp_skeleton"))     asB(g_cfg.esp_skeleton);
-        else if (!strcmp(key,"esp_head_dot"))     asB(g_cfg.esp_head_dot);
-        else if (!strcmp(key,"esp_name"))         asB(g_cfg.esp_name);
-        else if (!strcmp(key,"esp_weapon"))       asB(g_cfg.esp_weapon);
-        else if (!strcmp(key,"esp_health"))       asB(g_cfg.esp_health);
-        else if (!strcmp(key,"esp_distance"))     asB(g_cfg.esp_distance);
-        else if (!strcmp(key,"esp_bomb"))         asB(g_cfg.esp_bomb);
-        else if (!strcmp(key,"esp_show_enemies")) asB(g_cfg.esp_show_enemies);
-        else if (!strcmp(key,"esp_show_team"))    asB(g_cfg.esp_show_team);
-        else if (!strcmp(key,"box_thickness"))    asF(g_cfg.box_thickness);
-        else if (!strcmp(key,"team_colors"))      asB(g_cfg.team_colors);
-        else if (!strcmp(key,"color_enemy"))      asC(g_cfg.color_enemy);
-        else if (!strcmp(key,"color_team"))       asC(g_cfg.color_team);
-        else if (!strcmp(key,"color_box"))        asC(g_cfg.color_box);
-        else if (!strcmp(key,"color_skel"))       asC(g_cfg.color_skel);
-        else if (!strcmp(key,"color_head"))       asC(g_cfg.color_head);
-        else if (!strcmp(key,"color_name"))       asC(g_cfg.color_name);
-        else if (!strcmp(key,"color_weapon"))     asC(g_cfg.color_weapon);
-        else if (!strcmp(key,"color_dist"))       asC(g_cfg.color_dist);
-        else if (!strcmp(key,"color_bomb"))       asC(g_cfg.color_bomb);
-        else if (!strcmp(key,"color_carrier"))    asC(g_cfg.color_carrier);
-        else if (!strcmp(key,"menu_title"))       asC(g_cfg.menu_title);
-        else if (!strcmp(key,"menu_bg"))          asC(g_cfg.menu_bg);
-        else if (!strcmp(key,"menu_button"))      asC(g_cfg.menu_button);
-        else if (!strcmp(key,"menu_slider"))      asC(g_cfg.menu_slider);
-        else if (!strcmp(key,"menu_check"))       asC(g_cfg.menu_check);
-        else if (!strcmp(key,"bh_enabled"))       asB(g_cfg.bh_enabled);
-        else if (!strcmp(key,"aim_enabled"))      asB(g_cfg.aim_enabled);
-        else if (!strcmp(key,"aim_fire"))         asB(g_cfg.aim_fire);
-        else if (!strcmp(key,"aim_key"))          asI(g_cfg.aim_key);
-        else if (!strcmp(key,"aim_radius"))       asF(g_cfg.aim_radius);
-        else if (!strcmp(key,"jb_enabled"))       asB(g_cfg.jb_enabled);
-        else if (!strcmp(key,"jb_key"))           asI(g_cfg.jb_key);
-        else if (!strcmp(key,"jb_crouch_lead"))   asF(g_cfg.jb_crouch_lead);
-        else if (!strcmp(key,"jb_uncrouch_height")) asF(g_cfg.jb_uncrouch_height);
-        else if (!strcmp(key,"aim_delay"))        asI(g_cfg.aim_delay);
-        else if (!strcmp(key,"radar_port"))       asI(g_cfg.radar_port);
+        if      (!strcmp(key,"esp_boxes"))         asB(g_cfg.esp_boxes);
+        else if (!strcmp(key,"esp_skeleton"))      asB(g_cfg.esp_skeleton);
+        else if (!strcmp(key,"esp_head_dot"))      asB(g_cfg.esp_head_dot);
+        else if (!strcmp(key,"esp_name"))          asB(g_cfg.esp_name);
+        else if (!strcmp(key,"esp_weapon"))        asB(g_cfg.esp_weapon);
+        else if (!strcmp(key,"esp_health"))        asB(g_cfg.esp_health);
+        else if (!strcmp(key,"esp_distance"))      asB(g_cfg.esp_distance);
+        else if (!strcmp(key,"esp_bomb"))          asB(g_cfg.esp_bomb);
+        else if (!strcmp(key,"esp_show_enemies"))  asB(g_cfg.esp_show_enemies);
+        else if (!strcmp(key,"esp_show_team"))     asB(g_cfg.esp_show_team);
+        else if (!strcmp(key,"box_thickness"))     asF(g_cfg.box_thickness);
+        else if (!strcmp(key,"team_colors"))       asB(g_cfg.team_colors);
+        else if (!strcmp(key,"color_enemy"))       asC(g_cfg.color_enemy);
+        else if (!strcmp(key,"color_team"))        asC(g_cfg.color_team);
+        else if (!strcmp(key,"color_box"))         asC(g_cfg.color_box);
+        else if (!strcmp(key,"color_skel"))        asC(g_cfg.color_skel);
+        else if (!strcmp(key,"color_head"))        asC(g_cfg.color_head);
+        else if (!strcmp(key,"color_name"))        asC(g_cfg.color_name);
+        else if (!strcmp(key,"color_weapon"))      asC(g_cfg.color_weapon);
+        else if (!strcmp(key,"color_dist"))        asC(g_cfg.color_dist);
+        else if (!strcmp(key,"color_bomb"))        asC(g_cfg.color_bomb);
+        else if (!strcmp(key,"color_carrier"))     asC(g_cfg.color_carrier);
+        else if (!strcmp(key,"menu_title"))        asC(g_cfg.menu_title);
+        else if (!strcmp(key,"menu_bg"))           asC(g_cfg.menu_bg);
+        else if (!strcmp(key,"menu_button"))       asC(g_cfg.menu_button);
+        else if (!strcmp(key,"menu_slider"))       asC(g_cfg.menu_slider);
+        else if (!strcmp(key,"menu_check"))        asC(g_cfg.menu_check);
+        else if (!strcmp(key,"bh_enabled"))        asB(g_cfg.bh_enabled);
+        else if (!strcmp(key,"aim_enabled"))       asB(g_cfg.aim_enabled);
+        else if (!strcmp(key,"aim_fire"))          asB(g_cfg.aim_fire);
+        else if (!strcmp(key,"aim_key"))           asI(g_cfg.aim_key);
+        else if (!strcmp(key,"aim_teamcheck"))     asB(g_cfg.aim_teamcheck);
+        else if (!strcmp(key,"aim_vischeck"))      asB(g_cfg.aim_vischeck);
+        else if (!strcmp(key,"aim_delay"))         asI(g_cfg.aim_delay);
+        else if (!strcmp(key,"jb_enabled"))        asB(g_cfg.jb_enabled);
+        else if (!strcmp(key,"jb_key"))            asI(g_cfg.jb_key);
+        else if (!strcmp(key,"jb_crouch_lead"))    asF(g_cfg.jb_crouch_lead);
+        else if (!strcmp(key,"jb_uncrouch_height"))asF(g_cfg.jb_uncrouch_height);
+        else if (!strcmp(key,"radar_port"))        asI(g_cfg.radar_port);
+        else if (!strcmp(key,"radar_sel"))         asI(g_cfg.radar_sel);
     }
     fclose(f);
     OrbitalLog("config loaded");
@@ -350,7 +361,8 @@ static bool refresh_game_window() {
 }
 
 static void use_monitor_size() {
-    const int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    const int w = GetSystemMetrics(SM_CXSCREEN);
+    const int h = GetSystemMetrics(SM_CYSCREEN);
     if (w > 0 && h > 0) { g_screen_w = w; g_screen_h = h; }
 }
 
@@ -376,15 +388,19 @@ static constexpr int kSkeleton[][2] = {
 
 static void apply_feature_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
+
     Aim_SetEnabled(g_cfg.aim_enabled);
     Aim_SetFire(g_cfg.aim_fire);
     Aim_SetKey(g_cfg.aim_key);
-    Aim_SetRadius(g_cfg.aim_radius);
+    Aim_SetTeamCheck(g_cfg.aim_teamcheck);
+    Aim_SetVisCheck(g_cfg.aim_vischeck);
     Aim_SetDelay(g_cfg.aim_delay);
+
     Movement_SetJumpbug(g_cfg.jb_enabled);
     Movement_SetKey(g_cfg.jb_key);
     Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
     Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
+
     Radar_SetPort(g_cfg.radar_port);
     Radar_SetSelection(g_cfg.radar_sel);
 }
@@ -407,7 +423,8 @@ void memory_thread() {
             if (lp) g_local_team = g_mem.read<uint8_t>(lp + offsets::m_iTeamNum);
             g_esp.update_world(g_mem, g_mem.client_dll);
         }
-        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
+        wait_until(std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(8));
     }
 }
 
@@ -463,12 +480,13 @@ void render_esp(ImDrawList* dl) {
         }
 
         if (g_cfg.esp_health) {
-            const float bh2 = bh * (p.health / 100.0f);
-            const float bx = cx - bw / 2.0f - 6.0f;
+            const float bar_h = bh * (p.health / 100.0f);
+            const float bar_x = cx - bw / 2.0f - 6.0f;
             const ImU32 hp = IM_COL32((int)(255 * (1.0f - p.health / 100.0f)),
                                       (int)(255 * (p.health / 100.0f)), 0, 255);
-            dl->AddRectFilled({ bx, bot - bh2 }, { bx + 3.0f, bot }, hp);
-            dl->AddRect({ bx, top }, { bx + 3.0f, bot }, IM_COL32(0,0,0,180));
+            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp);
+            dl->AddRect({ bar_x, top }, { bar_x + 3.0f, bot },
+                        IM_COL32(0, 0, 0, 180));
         }
 
         if (g_cfg.esp_name && p.name[0]) {
@@ -488,7 +506,8 @@ void render_esp(ImDrawList* dl) {
             const ImVec2 sz = ImGui::CalcTextSize(tag);
             const float y = bot + gap +
                 ((g_cfg.esp_weapon && p.weapon[0]) ? lh + gap : 0.0f);
-            dl->AddText({ cx - sz.x * 0.5f, y }, col_of(g_cfg.color_carrier), tag);
+            dl->AddText({ cx - sz.x * 0.5f, y },
+                        col_of(g_cfg.color_carrier), tag);
         }
 
         if (g_cfg.esp_distance) {
@@ -526,7 +545,7 @@ static bool g_capture_wait_release = false;
 static const char* vk_name(int vk) {
     static char buf[32];
     switch (vk) {
-        case 0:            return "none (always)";
+        case 0:            return "not bound";
         case VK_LBUTTON:   return "MOUSE1";
         case VK_RBUTTON:   return "MOUSE2";
         case VK_MBUTTON:   return "MOUSE3";
@@ -547,8 +566,8 @@ static const char* vk_name(int vk) {
     return buf;
 }
 
-// Returns the newly pressed key, or 0. Everything must be released first so the
-// click that opened capture isn't recorded as the bind.
+// Returns the newly pressed key, or 0. Everything must be released first, so
+// the click that opened capture cannot be recorded as the bind itself.
 static int capture_poll() {
     if (g_capture == CAPTURE_NONE) return 0;
 
@@ -571,15 +590,12 @@ static int capture_poll() {
 }
 
 // label + current bind + a "set" button that captures the next input.
-//
-// UNBOUND MEANS OFF. There is no "always on": an unbound feature does nothing
-// until you bind it, which is shown in orange so it cannot be mistaken for
-// working.
+// UNBOUND MEANS OFF: there is no "always on".
 static void keybind_row(const char* label, int* vk, int target) {
     const bool unbound = (*vk == 0);
 
     ImGui::TextDisabled("%s", label);
-    ImGui::SameLine(150.0f);
+    ImGui::SameLine(140.0f);
 
     if (g_capture == target)
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "press any input...");
@@ -588,7 +604,7 @@ static void keybind_row(const char* label, int* vk, int target) {
     else
         ImGui::Text("%s", vk_name(*vk));
 
-    ImGui::SameLine(280.0f);
+    ImGui::SameLine(260.0f);
     char id[32];
     std::snprintf(id, sizeof(id), "set##%d", target);
     if (ImGui::SmallButton(id)) {
@@ -625,52 +641,52 @@ static void apply_captured(int vk) {
     g_capture = CAPTURE_NONE;
 }
 
-// ── colour rows: right-click copies, middle-click pastes ─────────────────
+// ── colour rows: swatch, right-click copy, middle-click paste, typed hex ──
 static char   g_copy_flash[64] = "";
 static double g_copy_flash_at = -1e9;
 
 // Accepts "#RRGGBB", "#RRGGBBAA", "R,G,B" or "R,G,B,A".
+static bool parse_color_text(const char* txt, ImVec4* out) {
+    unsigned r = 0, g = 0, b = 0, a = 255;
+    int got = 0;
+
+    while (*txt == ' ' || *txt == '\t' || *txt == '\r' || *txt == '\n') ++txt;
+
+    if (*txt == '#') {
+        sscanf_s(txt + 1, "%2x%2x%2x%2x", &r, &g, &b, &a);
+        got = 3;
+    } else {
+        got = sscanf_s(txt, "%u,%u,%u,%u", &r, &g, &b, &a);
+    }
+    if (got < 3) return false;
+
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    if (a > 255) a = 255;
+    out->x = r / 255.0f;
+    out->y = g / 255.0f;
+    out->z = b / 255.0f;
+    out->w = a / 255.0f;
+    return true;
+}
+
 static bool paste_color_from_clipboard(ImVec4* c) {
     if (!OpenClipboard(nullptr)) return false;
 
     bool ok = false;
     if (HANDLE h = GetClipboardData(CF_TEXT)) {
         if (const char* txt = (const char*)GlobalLock(h)) {
-            unsigned r = 0, g = 0, b = 0, a = 255;
-            int got = 0;
-
-            // Skip leading whitespace.
-            while (*txt == ' ' || *txt == '\t' || *txt == '\r' || *txt == '\n')
-                ++txt;
-
-            // sscanf_s is a Microsoft extension, NOT a std:: member -- so it
-            // must be unqualified here.
-            if (*txt == '#') {
-                sscanf_s(txt + 1, "%2x%2x%2x%2x", &r, &g, &b, &a);
-                got = (int)std::strlen(txt + 1) >= 8 ? 4 : 3;
-            } else {
-                got = sscanf_s(txt, "%u,%u,%u,%u", &r, &g, &b, &a);
-            }
-            if (got < 3) { r = g = b = 0; a = 255; got = 0; }
-
-            if (got >= 3) {
-                if (got < 4) a = 255;
-                if (r > 255) r = 255;
-                if (g > 255) g = 255;
-                if (b > 255) b = 255;
-                if (a > 255) a = 255;
-                c->x = r / 255.0f;
-                c->y = g / 255.0f;
-                c->z = b / 255.0f;
-                c->w = a / 255.0f;
-                ok = true;
-            }
+            ok = parse_color_text(txt, c);
             GlobalUnlock(h);
         }
     }
     CloseClipboard();
     return ok;
 }
+
+struct HexBuf { char text[16] = ""; };
+static std::map<std::string, HexBuf> g_hex_edit;
 
 static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::ColorEdit4(id, &c->x,
@@ -689,23 +705,51 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
                       label, hex);
         g_copy_flash_at = now_ms();
     }
-
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
         if (paste_color_from_clipboard(c))
-            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
-                          "%s  pasted", label);
+            std::snprintf(g_copy_flash, sizeof(g_copy_flash), "%s  pasted",
+                          label);
         else
             std::snprintf(g_copy_flash, sizeof(g_copy_flash),
                           "%s  clipboard had no colour", label);
         g_copy_flash_at = now_ms();
     }
-
     if (hovered)
-        ImGui::SetTooltip("right-click: copy %s\nmiddle-click: paste colour",
-                          hex);
+        ImGui::SetTooltip("right-click: copy %s\nmiddle-click: paste", hex);
 
     ImGui::SameLine();
     ImGui::Text("%s", label);
+
+    // ---- typed / pasted hex field ----
+    HexBuf& hb = g_hex_edit[id];
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(92.0f);
+    char idbuf[32];
+    std::snprintf(idbuf, sizeof(idbuf), "##hex%s", id);
+
+    const bool submitted = ImGui::InputText(
+        idbuf, hb.text, sizeof(hb.text),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+
+    if (submitted) {
+        if (parse_color_text(hb.text, c)) {
+            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
+                          "%s  set to %s", label, hb.text);
+            g_copy_flash_at = now_ms();
+        } else {
+            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
+                          "%s  could not parse \"%s\"", label, hb.text);
+            g_copy_flash_at = now_ms();
+        }
+    }
+
+    // Keep the field showing the live colour while it is not being edited.
+    if (!ImGui::IsItemActive())
+        std::snprintf(hb.text, sizeof(hb.text), "%s", hex);
+
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("type or paste a hex, then press Enter\n"
+                          "clipboard paste works with Ctrl+V here too");
 }
 
 // ── tabs ─────────────────────────────────────────────────────────────────
@@ -739,7 +783,8 @@ static void tab_esp() {
     ImGui::Spacing();
     ImGui::TextDisabled("[ Smoothing ]");
     ImGui::SetNextItemWidth(col_w - 16.0f);
-    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f, "%.0f ms");
+    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f,
+                       "%.0f ms");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Snapshot interpolation delay.\n"
                           "Higher = smoother, a touch more latency.\n"
@@ -747,9 +792,8 @@ static void tab_esp() {
 
     ImGui::Columns(1);
 
-    // Status for the two features still being brought up. Bones drive the
-    // skeleton AND the triggerbot, so if this says scanning the trigger cannot
-    // work regardless of its own code.
+    // Status for the parts still being brought up. Bones drive the skeleton AND
+    // the triggerbot, so if this says scanning the trigger cannot work.
     ImGui::Separator();
     if (g_esp.diag_bones_ok)
         ImGui::TextDisabled("bones: ok 0x%llX/0x%llX",
@@ -762,8 +806,7 @@ static void tab_esp() {
         ImGui::TextDisabled("weapon svc: 0x%llX (verified)",
             (unsigned long long)g_esp.diag_wsvc);
     else
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-                           "weapon svc: not found");
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "weapon svc: not found");
 
     if (g_esp.diag_defidx)
         ImGui::TextDisabled("def index off: 0x%X (calibrated)",
@@ -793,13 +836,20 @@ static void tab_aim() {
         ImGui::SetTooltip("Unticked: still detects and shows the indicator,\n"
                           "but never clicks. That makes it read-only.");
 
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##arad", &g_cfg.aim_radius, 0.2f, 6.0f,
-                           "radius %.2f%% of height"))
-        Aim_SetRadius(g_cfg.aim_radius);
+    if (ImGui::Checkbox("Team check", &g_cfg.aim_teamcheck))
+        Aim_SetTeamCheck(g_cfg.aim_teamcheck);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How close to the crosshair a bone must be.\n"
-                          "~1.4%% of height is head-sized.");
+        ImGui::SetTooltip("Do not fire at teammates.");
+
+    if (ImGui::Checkbox("Visibility check (approximate)", &g_cfg.aim_vischeck))
+        Aim_SetVisCheck(g_cfg.aim_vischeck);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Uses m_bSpottedByMask, which is RADAR state, not\n"
+                          "line of sight -- it reflects teammates' spotting.\n"
+                          "A real wall check needs a raycast, which an external\n"
+                          "cannot do. It SELF-DISABLES if the mask never reads\n"
+                          "nonzero, so it cannot silently block every shot.\n"
+                          "Smoke and flash are not detectable this way.");
 
     ImGui::SetNextItemWidth(240.0f);
     if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 600,
@@ -810,6 +860,8 @@ static void tab_aim() {
                           "measured from re-acquiring. 0 = instant.\n"
                           "The cooldown is separate and starts after firing.");
 
+    ImGui::TextDisabled("bone radii are hardcoded (no adjustment)");
+
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
 
@@ -817,23 +869,34 @@ static void tab_aim() {
     ImGui::Separator();
     if (ad.on_target)
         ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f },
-                           "on target: %s  (%.0f px)", ad.target_bone, ad.target_dist);
+                           "on target: %s  (%.0f px)", ad.target_bone,
+                           ad.target_dist);
     else
         ImGui::TextDisabled("on target: no");
-    ImGui::TextDisabled("firing: %s", ad.firing ? "yes" : "no");
+    ImGui::TextDisabled("firing: %s   blocked by: %s",
+                        ad.firing ? "yes" : "no", ad.blocked_by);
+
+    if (g_cfg.aim_vischeck) {
+        if (ad.vis_usable)
+            ImGui::TextDisabled("vis: active (%d/%d masks nonzero)",
+                                ad.vis_hits, ad.vis_samples);
+        else
+            ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+                "vis: DISABLED - mask always 0 (%d samples)", ad.vis_samples);
+    }
 }
 
 static void tab_movement() {
     ImGui::TextDisabled("[ Jumpbug ]");
-    ImGui::TextDisabled("injects CTRL; nothing is written to CS2");
+    ImGui::TextDisabled("injects CTRL + SPACE; nothing is written to CS2");
     ImGui::Separator();
 
     if (ImGui::Checkbox("Jumpbug", &g_cfg.jb_enabled))
         Movement_SetJumpbug(g_cfg.jb_enabled);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Crouches just before landing, holds through\n"
-                          "touchdown, releases after. Cancels fall damage\n"
-                          "reliably; gains height on frames that line up.");
+        ImGui::SetTooltip("Crouch during the fall, then uncrouch AND jump\n"
+                          "9-11 units above the ground. The uncrouch-then-jump\n"
+                          "order is what produces the bug.");
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.jb_key, CAPTURE_JUMPBUG);
@@ -851,10 +914,10 @@ static void tab_movement() {
                            "uncrouch at %.0f units above ground"))
         Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("This is the real timing control, and it is a HEIGHT\n"
-                          "rather than a delay, because the ms window depends on\n"
-                          "fall speed. The documented jumpbug window is 9-11\n"
-                          "units above the ground; 11 triggers on entry.");
+        ImGui::SetTooltip("The real timing control, and it is a HEIGHT rather\n"
+                          "than a delay, because the ms window depends on fall\n"
+                          "speed. The documented window is 9-11 units above\n"
+                          "the ground; 11 triggers on entry.");
 
     const MovementDebug md = Movement_GetDebug();
     ImGui::Separator();
@@ -871,7 +934,6 @@ static void tab_movement() {
     else
         ImGui::TextDisabled("game crouch: %s", md.game_ducked ? "yes" : "no");
 
-    // height is the number that decides the jumpbug, so it is shown always.
     ImGui::TextDisabled("height %.1f units   tti %.1f ms   jumpbugs %d",
         md.height, md.tti, md.jumpbugs);
 
@@ -891,67 +953,12 @@ static void tab_movement() {
     ImGui::Checkbox("V-Sync", &g_vsync);
 }
 
-static void tab_radar() {
-    const RadarInfo ri = Radar_Get();
-
-    ImGui::TextDisabled("[ Radar ]");
-    ImGui::TextDisabled("opens the dashboard in your browser");
-    ImGui::Separator();
-
-    // The radar is its OWN program: cs2_dashboard.exe, built from the
-    // orbitalweb repo (C++ / CMake, not Node). It must already be running.
-    ImGui::TextWrapped("Requires cs2_dashboard.exe from orbitalweb to be "
-                       "running. It serves the dashboard on port %d.", ri.port);
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ address ]");
-
-    // Pick-list instead of a guess. Entry 0 is always 127.0.0.1, which is
-    // correct when you are viewing the radar on the same PC as the server.
-    static const char* items[RadarInfo::kMaxAddr] = {};
-    for (int i = 0; i < ri.count && i < RadarInfo::kMaxAddr; ++i)
-        items[i] = ri.label[i];
-
-    ImGui::SetNextItemWidth(320.0f);
-    int sel = ri.selected;
-    if (ImGui::Combo("##raddr", &sel, items, ri.count)) {
-        g_cfg.radar_sel = sel;
-        Radar_SetSelection(sel);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("127.0.0.1 works when the browser is on THIS PC.\n"
-                          "Pick a LAN address for a phone or second PC.\n"
-                          "The dashboard shows the right IP in its console.");
-
-    ImGui::SetNextItemWidth(160.0f);
-    if (ImGui::SliderInt("##rport", &g_cfg.radar_port, 1024, 65535,
-                         "port %d"))
-        Radar_SetPort(g_cfg.radar_port);
-
-    ImGui::Text("url: %s", ri.url);
-
-    ImGui::Spacing();
-    if (ImGui::Button("[Start Radar]", { 200.0f, 0.0f }))
-        Radar_Start();
-
-    if (ri.opened)
-        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "opened in browser");
-    if (ri.failed)
-        ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f }, "could not open browser");
-
-    ImGui::Separator();
-    ImGui::TextDisabled("If the page does not load:");
-    ImGui::TextDisabled(" - is cs2_dashboard.exe running?");
-    ImGui::TextDisabled(" - on another PC, is port %d allowed through", ri.port);
-    ImGui::TextDisabled("   Windows Firewall on the server PC?");
-}
-
 static void tab_colors() {
     ImGui::Checkbox("Use team colours", &g_cfg.team_colors);
-    ImGui::TextDisabled("right-click any swatch to copy the hex");
+    ImGui::TextDisabled("right-click copy   middle-click paste   or type a hex");
     ImGui::Separator();
 
-    const float col_w = ImGui::GetContentRegionAvail().x * 0.5f;
+    const float col_w = ImGui::GetContentRegionAvail().x * 0.62f;
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
@@ -990,7 +997,7 @@ static void tab_colors() {
 static void tab_misc() {
     ImGui::TextDisabled("[ Config ]");
     ImGui::TextDisabled("orbital.cfg next to the exe");
-    ImGui::TextDisabled("also saved automatically on exit");
+    ImGui::TextDisabled("saved automatically on exit");
     ImGui::Spacing();
     ImGui::Spacing();
 
@@ -1006,10 +1013,17 @@ static void tab_misc() {
     }
     ImGui::SameLine();
     if (ImGui::Button("[Exit]", { bw, 0 })) g_running = false;
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ game window ]");
+    ImGui::TextDisabled("found: %s",
+        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "yes" : "NO");
+    ImGui::TextDisabled("viewport: %dx%d", g_screen_w, g_screen_h);
+    ImGui::TextDisabled("refresh: %d Hz", g_detected_hz);
 }
 
 void render_menu() {
-    // Menu skin, reapplied each frame so the pickers are live.
+    // Menu skin, reapplied every frame so the pickers are live.
     {
         ImGuiStyle& st = ImGui::GetStyle();
         st.Colors[ImGuiCol_TitleBg]       = g_cfg.menu_title;
@@ -1020,25 +1034,21 @@ void render_menu() {
         st.Colors[ImGuiCol_CheckMark]     = g_cfg.menu_check;
     }
 
-    // Keybind capture runs once per frame, before any widget is built, so the
-    // captured key cannot also trigger a button in the same frame.
+    // Keybind capture runs before any widget is built, so a captured key cannot
+    // also trigger a button in the same frame.
     {
         const int vk = capture_poll();
         if (vk) {
             if (vk == VK_ESCAPE) {
-                int* target = nullptr;
-                if (g_capture == CAPTURE_AIM)     target = &g_cfg.aim_key;
-                if (g_capture == CAPTURE_JUMPBUG) target = &g_cfg.jb_key;
-                if (target) *target = 0;
-                apply_captured(0);
+                g_capture = CAPTURE_NONE;
             } else {
                 apply_captured(vk);
             }
         }
     }
 
-    ImGui::SetNextWindowSize({ 620.0f, 560.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 520.0f, 320.0f }, { 1000.0f, 900.0f });
+    ImGui::SetNextWindowSize({ 640.0f, 560.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 540.0f, 320.0f }, { 1040.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital - Mars", nullptr);
 
@@ -1060,7 +1070,7 @@ void render_menu() {
         ImGui::EndTabBar();
     }
 
-    if (now_ms() - g_copy_flash_at < 1500.0)
+    if (now_ms() - g_copy_flash_at < 1600.0)
         ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "%s", g_copy_flash);
 
     ImGui::End();
