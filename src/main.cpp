@@ -842,9 +842,19 @@ static void tab_movement() {
     ImGui::Text("ground: %s   crouching: %s   armed: %s",
         md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no",
         md.armed ? "yes" : "no");
+
+    // game_ducked is the GAME's own crouch flag. If crouching is yes but
+    // game_ducked is no, our CTRL never reached the game and no timing change
+    // will help. If both are yes, the crouch is real and the timing is what to
+    // adjust.
+    if (md.crouching && !md.game_ducked)
+        ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f },
+                           "game does NOT see the crouch (CTRL not registering)");
+    else
+        ImGui::TextDisabled("game crouch: %s", md.game_ducked ? "yes" : "no");
+
     ImGui::TextDisabled("vz %.0f   tti %.1f ms   jumpbugs %d",
         md.vz, md.tti, md.jumpbugs);
-    ImGui::TextDisabled("no effect? the crouch must still be HELD at landing");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Bhop ]");
@@ -1026,7 +1036,6 @@ void render_menu() {
         if (ImGui::BeginTabItem("ESP"))      { tab_esp();      ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("AIM"))      { tab_aim();      ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("MOVEMENT")) { tab_movement(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("RADAR"))    { tab_radar();    ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("COLORS"))   { tab_colors();   ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("MISC"))     { tab_misc();     ImGui::EndTabItem(); }
         ImGui::EndTabBar();
