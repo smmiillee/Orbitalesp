@@ -1,156 +1,411 @@
 // --- src/main.cpp ---
 #include <Windows.h>
-#include <thread>
 #include <chrono>
+#include <cstdio>
+#include <thread>
+#include <vector>
+
 #include <imgui.h>
+
 #include "memory.h"
 #include "esp.h"
 #include "overlay.h"
 #include "offsets.h"
 #include "bhop.h"
 
-static Memory g_mem;
-static ESP    g_esp;
-static bool   g_running = true;
+static ESP g_esp;
+static bool g_running = true;
+bool g_menu_open = false;
+bool g_vsync = false;
+HWND g_cs2_hwnd = nullptr;
 
 struct Config {
-    bool   esp_boxes     = true;
-    bool   esp_health    = true;
-    bool   esp_distance  = true;
-    bool   enemy_only    = true;
-    float  box_thickness = 1.5f;
-    ImVec4 color_enemy   = { 1.0f, 0.2f, 0.2f, 1.0f };
-    ImVec4 color_team    = { 0.2f, 1.0f, 0.4f, 1.0f };
+    bool  esp_boxes    = true;
+    bool  esp_skeleton = true;
+    bool  esp_head_dot = true;
+    bool  esp_name     = true;
+    bool  esp_weapon   = true;
+    bool  esp_health   = true;
+    bool  esp_distance = true;
+    bool  esp_bomb     = true;
+    bool  esp_show_enemies = true;
+    bool  esp_show_team    = false;
+    float box_thickness = 0.5f;
+
+    bool   team_colors  = false;
+    ImVec4 color_enemy  = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_team   = { 0.20f, 0.90f, 0.35f, 1.00f };
+    ImVec4 color_box    = { 1.00f, 0.15f, 0.15f, 1.00f };
+    ImVec4 color_skel   = { 0.95f, 0.95f, 0.95f, 0.90f };
+    ImVec4 color_head   = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_name   = { 1.00f, 1.00f, 1.00f, 1.00f };
+    ImVec4 color_weapon = { 1.00f, 0.85f, 0.30f, 1.00f };
+    ImVec4 color_dist   = { 0.85f, 0.85f, 0.85f, 0.90f };
+    ImVec4 color_bomb   = { 1.00f, 0.45f, 0.00f, 1.00f };
+    ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
+
+    bool bhop_enabled    = true;
+    bool bhop_input_mode = true;
 } g_cfg;
 
-bool g_menu_open = false;
+static int  g_screen_w = 1920;
+static int  g_screen_h = 1080;
+static int  g_local_team = 0;
+static int  g_detected_hz = 0;
+static bool g_limit_fps = true;
+static int  g_fps_override = 0;
 
-static int g_screen_w = 1920;
-static int g_screen_h = 1080;
+static int query_refresh_rate(HWND game) {
+    if (!game) return 0;
+    HMONITOR mon = MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return 0;
 
-void memory_thread() {
-    while (g_running) {
-        if (g_mem.is_valid()) {
-            g_esp.update_world(g_mem, g_mem.base_address);
-            BhopTick();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) return 0;
+
+    const int hz = static_cast<int>(dm.dmDisplayFrequency);
+    return (hz < 30 || hz > 1000) ? 0 : hz;
+}
+
+static void wait_until(std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        const auto left = deadline - now;
+        if (left > std::chrono::milliseconds(2))
+            std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
+        else
+            std::this_thread::yield();
     }
 }
 
-void render_esp(ImDrawList* dl, int screen_w, int screen_h) {
-    auto players = g_esp.project(g_mem, g_mem.base_address, screen_w, screen_h);
+static constexpr int kSkeleton[][2] = {
+    { BONE_PELVIS,     BONE_SPINE_1    },
+    { BONE_SPINE_1,    BONE_SPINE_2    },
+    { BONE_SPINE_2,    BONE_CHEST      },
+    { BONE_CHEST,      BONE_NECK       },
+    { BONE_NECK,       BONE_HEAD       },
+    { BONE_NECK,       BONE_L_SHOULDER },
+    { BONE_L_SHOULDER, BONE_L_ELBOW    },
+    { BONE_L_ELBOW,    BONE_L_HAND     },
+    { BONE_NECK,       BONE_R_SHOULDER },
+    { BONE_R_SHOULDER, BONE_R_ELBOW    },
+    { BONE_R_ELBOW,    BONE_R_HAND     },
+    { BONE_PELVIS,     BONE_L_HIP      },
+    { BONE_L_HIP,      BONE_L_KNEE     },
+    { BONE_L_KNEE,     BONE_L_FOOT     },
+    { BONE_PELVIS,     BONE_R_HIP      },
+    { BONE_R_HIP,      BONE_R_KNEE     },
+    { BONE_R_KNEE,     BONE_R_FOOT     },
+};
+
+static bool find_cs2_window() {
+    g_cs2_hwnd = FindWindowA("SDL_app", nullptr);
+    if (!g_cs2_hwnd) return false;
+
+    RECT r{};
+    if (!GetClientRect(g_cs2_hwnd, &r)) return false;
+    if (r.right <= 0 || r.bottom <= 0) return false;
+
+    g_screen_w = r.right;
+    g_screen_h = r.bottom;
+    return true;
+}
+
+void memory_thread() {
+    while (g_running && !g_mem.attach(L"cs2.exe"))
+        wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+
+    Bhop_Init();
+    Bhop_SetInputMode(g_cfg.bhop_input_mode);
+
+    while (g_running) {
+        if (g_mem.is_valid()) {
+            const uintptr_t local_pawn = g_mem.read<uintptr_t>(
+                g_mem.client_dll + offsets::dwLocalPlayerPawn);
+            if (local_pawn)
+                g_local_team =
+                    g_mem.read<uint8_t>(local_pawn + offsets::m_iTeamNum);
+
+            g_esp.update_world(g_mem, g_mem.client_dll);
+        }
+        wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(8));
+    }
+}
+
+static ImU32 col_of(const ImVec4& c) { return ImGui::ColorConvertFloat4ToU32(c); }
+
+void render_esp(ImDrawList* dl) {
+    if (!g_mem.is_valid()) return;
+
+    const std::vector<PlayerESP> players =
+        g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
 
     for (const auto& p : players) {
-        if (g_cfg.enemy_only && p.team == 2) continue;
+        const bool is_teammate = (g_local_team != 0 && p.team == g_local_team);
+        const bool is_enemy    = !is_teammate;
 
-        ImVec4 col4 = (p.team == 3) ? g_cfg.color_enemy : g_cfg.color_team;
-        ImU32  col  = ImGui::ColorConvertFloat4ToU32(col4);
+        if (is_enemy    && !g_cfg.esp_show_enemies) continue;
+        if (is_teammate && !g_cfg.esp_show_team)    continue;
 
-        float cx  = p.screen_head.x;
-        float top = p.screen_top.y;
-        float bot = p.screen_feet.y;
-        float bh  = bot - top;
-        float bw  = bh * 0.45f;
+        const ImVec4 team_col = is_enemy ? g_cfg.color_enemy : g_cfg.color_team;
+        auto pick = [&](const ImVec4& own) -> ImU32 {
+            return col_of(g_cfg.team_colors ? team_col : own);
+        };
 
-        if (cx < 0 || cx > screen_w || top < 0 || bot > screen_h) continue;
+        const float cx  = p.screen_head.x;
+        const float top = p.screen_top.y;
+        const float bot = p.screen_feet.y;
+        const float bh  = p.box_h;
+        const float bw  = p.box_w;
+
+        if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
+        if (bot < 0 || top > g_screen_h) continue;
 
         if (g_cfg.esp_boxes) {
-            dl->AddRect(
-                { cx - bw / 2.0f, top },
-                { cx + bw / 2.0f, bot },
-                col, 0.0f, 0, g_cfg.box_thickness
-            );
+            dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
+                        pick(g_cfg.color_box), 0.0f, 0, g_cfg.box_thickness);
         }
 
-        float label_y = top - 14.0f;
+        if (g_cfg.esp_skeleton && p.has_bones) {
+            const ImU32 sk = pick(g_cfg.color_skel);
+            for (const auto& link : kSkeleton) {
+                const int a = link[0], b = link[1];
+                if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
+                dl->AddLine({ p.bones[a].x, p.bones[a].y },
+                            { p.bones[b].x, p.bones[b].y },
+                            sk, g_cfg.box_thickness);
+            }
+        }
+
+        if (g_cfg.esp_head_dot) {
+            float r = bh * 0.035f;
+            if (r < 2.5f) r = 2.5f;
+            if (r > 6.0f) r = 6.0f;
+            dl->AddCircleFilled({ p.screen_head.x, p.screen_head.y }, r,
+                                pick(g_cfg.color_head), 16);
+        }
 
         if (g_cfg.esp_health) {
-            float bar_h  = bh * (p.health / 100.0f);
-            float bar_x  = cx - bw / 2.0f - 6.0f;
-            ImU32 hp_col = IM_COL32(
-                (int)(255 * (1.0f - p.health / 100.0f)),
-                (int)(255 * (p.health / 100.0f)),
-                0, 255
-            );
-            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp_col);
-            dl->AddRect({ bar_x, top }, { bar_x + 3.0f, bot }, IM_COL32(0, 0, 0, 180));
+            const float bar_h = bh * (p.health / 100.0f);
+            const float bar_x = cx - bw / 2.0f - 6.0f;
+            const ImU32 hp = IM_COL32((int)(255 * (1.0f - p.health / 100.0f)),
+                                      (int)(255 * (p.health / 100.0f)), 0, 255);
+            dl->AddRectFilled({ bar_x, bot - bar_h }, { bar_x + 3.0f, bot }, hp);
+            dl->AddRect({ bar_x, top }, { bar_x + 3.0f, bot },
+                        IM_COL32(0, 0, 0, 180));
+        }
+
+        if (g_cfg.esp_name && p.name[0]) {
+            const ImVec2 sz = ImGui::CalcTextSize(p.name);
+            dl->AddText({ cx - sz.x * 0.5f, top - 30.0f },
+                        pick(g_cfg.color_name), p.name);
+        }
+
+        if (g_cfg.esp_weapon && p.weapon[0]) {
+            const ImVec2 sz = ImGui::CalcTextSize(p.weapon);
+            dl->AddText({ cx - sz.x * 0.5f, top - 16.0f },
+                        pick(g_cfg.color_weapon), p.weapon);
+        }
+
+        if (g_cfg.esp_bomb && p.has_bomb) {
+            const char* tag = "C4";
+            const ImVec2 sz = ImGui::CalcTextSize(tag);
+            dl->AddText({ cx - sz.x * 0.5f, bot + 4.0f },
+                        col_of(g_cfg.color_carrier), tag);
         }
 
         if (g_cfg.esp_distance) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.0fm", p.distance);
-            dl->AddText({ cx - 12.0f, label_y }, IM_COL32(255, 255, 255, 200), buf);
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "%.0fm", p.distance);
+            dl->AddText({ cx + bw / 2.0f + 4.0f, top },
+                        col_of(g_cfg.color_dist), buf);
         }
     }
 
-    // Bomb
-    BombESP bomb = g_esp.project_bomb(g_mem, g_mem.base_address, screen_w, screen_h);
-    if (bomb.active) {
-        dl->AddCircle({ bomb.screen.x, bomb.screen.y }, 8.0f,
-            IM_COL32(255, 200, 0, 255), 16, 2.0f);
-        dl->AddText({ bomb.screen.x + 10.0f, bomb.screen.y - 7.0f },
-            IM_COL32(255, 200, 0, 255), "[C4]");
+    if (g_cfg.esp_bomb) {
+        const BombESP b =
+            g_esp.project_bomb(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+        if (b.active) {
+            const ImU32 c = col_of(g_cfg.color_bomb);
+            float h = std::fabs(b.screen_top.y - b.screen.y);
+            if (h < 6.0f) h = 6.0f;
+
+            dl->AddRect({ b.screen.x - h / 2.0f, b.screen_top.y },
+                        { b.screen.x + h / 2.0f, b.screen.y }, c, 0.0f, 0,
+                        g_cfg.box_thickness);
+            dl->AddText({ b.screen.x - 7.0f, b.screen_top.y - 16.0f }, c, "C4");
+
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "%.0fm", b.distance);
+            dl->AddText({ b.screen.x - 14.0f, b.screen.y + 2.0f }, c, buf);
+        }
     }
 }
 
-void render_menu() {
-    ImGui::SetNextWindowSize({ 300, 380 }, ImGuiCond_Once);
-    ImGui::SetNextWindowPos({ 30, 30 }, ImGuiCond_Once);
-    ImGui::Begin("Orbital", nullptr, ImGuiWindowFlags_NoResize);
-
-    if (!g_mem.is_valid())
-        ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "CS2 not found");
-    else
-        ImGui::TextColored({ 0.4f, 1.0f, 0.4f, 1.0f }, "Attached");
-
-    ImGui::SeparatorText("ESP");
-    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
-    ImGui::Checkbox("Health",     &g_cfg.esp_health);
-    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
-    ImGui::Checkbox("Enemy Only", &g_cfg.enemy_only);
-
-    ImGui::SeparatorText("Colors");
-    ImGui::ColorEdit4("Enemy", &g_cfg.color_enemy.x, ImGuiColorEditFlags_NoInputs);
-    ImGui::ColorEdit4("Team",  &g_cfg.color_team.x,  ImGuiColorEditFlags_NoInputs);
-
-    ImGui::SeparatorText("Style");
-    ImGui::SliderFloat("Thickness", &g_cfg.box_thickness, 0.5f, 4.0f);
-
-    ImGui::SeparatorText("Bhop");
-    ImGui::Checkbox("Enabled (hold SPACE)", &g_bhop_cfg.enabled);
-
-    ImGui::BeginDisabled(!g_bhop_cfg.enabled);
-    if (ImGui::RadioButton("Standard", g_bhop_cfg.mode == 0)) g_bhop_cfg.mode = 0;
+static void color_row(const char* id, const char* label, ImVec4* c) {
+    ImGui::ColorEdit4(id, &c->x,
+        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
     ImGui::SameLine();
-    if (ImGui::RadioButton("64fps",    g_bhop_cfg.mode == 1)) g_bhop_cfg.mode = 1;
+    ImGui::Text("%s", label);
+}
 
-    if (g_bhop_cfg.mode == 0)
-        ImGui::TextDisabled("1ms timer + scroll on land");
-    else {
-        ImGui::TextDisabled("fps_max 64 + scroll on land");
-        ImGui::TextColored({ 1.0f, 0.85f, 0.0f, 1.0f }, "Caps framerate to 64!");
+static void tab_esp() {
+    const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
+    ImGui::Columns(2, nullptr, false);
+    ImGui::SetColumnWidth(0, col_w);
+
+    ImGui::TextDisabled("[ Visuals ]");
+    ImGui::Checkbox("Boxes",      &g_cfg.esp_boxes);
+    ImGui::Checkbox("Skeleton",   &g_cfg.esp_skeleton);
+    ImGui::Checkbox("Head dot",   &g_cfg.esp_head_dot);
+    ImGui::Checkbox("Name",       &g_cfg.esp_name);
+    ImGui::Checkbox("Weapon",     &g_cfg.esp_weapon);
+    ImGui::Checkbox("Health bar", &g_cfg.esp_health);
+    ImGui::Checkbox("Distance",   &g_cfg.esp_distance);
+    ImGui::Checkbox("Bomb (C4)",  &g_cfg.esp_bomb);
+
+    ImGui::Spacing();
+    ImGui::Checkbox("Show enemies",   &g_cfg.esp_show_enemies);
+    ImGui::Checkbox("Show teammates", &g_cfg.esp_show_team);
+
+    ImGui::NextColumn();
+
+    ImGui::TextDisabled("[ Style ]");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##thick", &g_cfg.box_thickness, 0.5f, 3.0f,
+                       "thickness %.1f px");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Smoothing ]");
+    ImGui::SetNextItemWidth(col_w - 16.0f);
+    ImGui::SliderFloat("##interp", &g_esp.interp_delay_ms, 0.0f, 90.0f, "%.0f ms");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Snapshot interpolation delay.\n"
+                          "Higher = smoother, a touch more latency.\n"
+                          "30-45 ms is the sweet spot; 0 disables it.");
+
+    ImGui::Columns(1);
+}
+
+static void tab_misc() {
+    ImGui::TextDisabled("[ Bhop ]");
+    ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled);
+    if (ImGui::Checkbox("Input mode (no offsets)", &g_cfg.bhop_input_mode))
+        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+
+    const BhopDebug bd = Bhop_GetDebug();
+
+    if (g_cfg.bhop_input_mode) {
+        ImGui::Text("mode: synthesised spacebar");
+        ImGui::TextDisabled("auto-jumps while grounded");
+    } else {
+        ImGui::Text("button: 0x%06llX  %s",
+            (unsigned long long)bd.offset,
+            bd.locked ? "[locked]" : (bd.scanning ? "[scanning]" : "[idle]"));
+        if (!bd.locked)
+            ImGui::TextDisabled("hold WASD or SPACE to confirm the address");
     }
-    ImGui::EndDisabled();
+
+    ImGui::Text("ground: %s   focused: %s",
+        bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO");
+    ImGui::TextDisabled("signals: %s%s%s",
+        (bd.signals & 1) ? "z " : "",
+        (bd.signals & 2) ? "flag " : "",
+        (bd.signals & 4) ? "hge" : "");
 
     ImGui::Separator();
-    ImGui::TextDisabled("INSERT - menu   END/F9 - exit");
+    ImGui::TextDisabled("[ Frame rate ]");
+    ImGui::Text("panel refresh: %d Hz", g_detected_hz);
+    ImGui::Checkbox("Limit to refresh rate", &g_limit_fps);
+    ImGui::SetNextItemWidth(180.0f);
+    ImGui::SliderInt("##cap", &g_fps_override, 0, 500,
+        g_fps_override ? "cap %d fps" : "cap auto (refresh)");
+    ImGui::Checkbox("V-Sync", &g_vsync);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("entities: %d", g_esp.diag_slots);
+}
+
+static void tab_colors() {
+    ImGui::Checkbox("Use team colours", &g_cfg.team_colors);
+    ImGui::Separator();
+
+    const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
+    ImGui::Columns(2, nullptr, false);
+    ImGui::SetColumnWidth(0, col_w);
+
+    color_row("##ce", "Enemy",        &g_cfg.color_enemy);
+    color_row("##ct", "Team",         &g_cfg.color_team);
+    color_row("##cb", "Boxes",        &g_cfg.color_box);
+    color_row("##cs", "Skeleton",     &g_cfg.color_skel);
+    color_row("##ch", "Head dot",     &g_cfg.color_head);
+
+    ImGui::NextColumn();
+
+    color_row("##cn", "Name",         &g_cfg.color_name);
+    color_row("##cw", "Weapon",       &g_cfg.color_weapon);
+    color_row("##cd", "Distance",     &g_cfg.color_dist);
+    color_row("##cc", "Bomb",         &g_cfg.color_bomb);
+    color_row("##cr", "Bomb carrier", &g_cfg.color_carrier);
+
+    ImGui::Columns(1);
+}
+
+void render_menu() {
+    ImGui::SetNextWindowSize({ 560.0f, 420.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 760.0f });
+    ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
+    ImGui::Begin("Orbital", nullptr);
+
+    if (!g_mem.is_valid()) {
+        ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
+    } else {
+        ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
+            "[ attached  %dx%d  %d Hz  %d players ]",
+            g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::BeginTabBar("##orbital_tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabItem("ESP"))    { tab_esp();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("MISC"))   { tab_misc();   ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("COLORS")) { tab_colors(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::Separator();
+
+    const float btn_w =
+        (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f)
+        / 3.0f;
+
+    if (ImGui::Button("[Reset]", { btn_w, 0 })) {
+        g_cfg = Config{};
+        g_esp.interp_delay_ms = 35.0f;
+        Bhop_SetInputMode(g_cfg.bhop_input_mode);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("[Rescan bhop]", { btn_w, 0 })) Bhop_Rescan();
+    ImGui::SameLine();
+    if (ImGui::Button("[Exit]", { btn_w, 0 })) g_running = false;
+
+    ImGui::TextDisabled("INSERT - menu    F9 - exit");
 
     ImGui::End();
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    while (!g_mem.attach(L"cs2.exe"))
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+    Overlay::enable_dpi_awareness();
 
-    HWND cs2 = FindWindowA("SDL_app", nullptr);
-    if (cs2) {
-        RECT r{};
-        if (GetClientRect(cs2, &r) && r.right > 0) {
-            g_screen_w = r.right;
-            g_screen_h = r.bottom;
-        }
-    }
+    while (!find_cs2_window())
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    g_detected_hz = query_refresh_rate(g_cs2_hwnd);
 
     Overlay overlay;
     if (!overlay.create(g_screen_w, g_screen_h)) return 1;
@@ -166,18 +421,49 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
-        if (GetAsyncKeyState(VK_END)    & 1) g_running   = false;
-        if (GetAsyncKeyState(VK_F9)     & 1) g_running   = false;
+        if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
+
+        if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
+            RECT r{};
+            if (GetClientRect(g_cs2_hwnd, &r) && r.right > 0 && r.bottom > 0) {
+                g_screen_w = r.right;
+                g_screen_h = r.bottom;
+            }
+            overlay.sync_to_game();
+        }
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        render_esp(dl, g_screen_w, g_screen_h);
+        render_esp(dl);
         if (g_menu_open) render_menu();
         overlay.end_frame();
+
+        static auto next_hz = std::chrono::steady_clock::now();
+        const auto now_tp = std::chrono::steady_clock::now();
+        if (now_tp >= next_hz) {
+            const int hz = query_refresh_rate(g_cs2_hwnd);
+            if (hz) g_detected_hz = hz;
+            next_hz = now_tp + std::chrono::seconds(2);
+        }
+
+        if (!g_vsync) {
+            int cap = 0;
+            if (g_limit_fps)
+                cap = (g_fps_override > 0) ? g_fps_override : g_detected_hz;
+
+            if (cap > 0) {
+                static auto next = std::chrono::steady_clock::now();
+                next += std::chrono::microseconds(1000000 / cap);
+                const auto now = std::chrono::steady_clock::now();
+                if (next < now) next = now;
+                wait_until(next);
+            }
+        }
     }
 
     g_running = false;
     mem_t.join();
+    Bhop_Shutdown();
     overlay.cleanup();
     g_mem.detach();
     return 0;
