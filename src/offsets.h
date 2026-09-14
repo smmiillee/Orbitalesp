@@ -1,9 +1,9 @@
 // --- src/offsets.h ---
 // Client build: 2026-09.
 //
-// VERIFIED against the working Orbital Radar (smmiillee/orbitalweb,
-// src/memory_reader.cpp) -- that file is the source of truth, since its own
-// models/*.h only carries the four globals.
+// VERIFIED values come from the working Orbital Radar (smmiillee/orbitalweb,
+// src/memory_reader.cpp), which reads this same client.dll build. That file is
+// the source of truth -- its own models/*.h carries only the four globals.
 #pragma once
 #include <cstdint>
 
@@ -45,8 +45,8 @@ namespace offsets {
 
     // ── active weapon + item definition (VERIFIED) ────────────────────────
     // The radar's PRIMARY weapon path is the definition index, self-tested
-    // against the local player's own weapon. The designer-name string is only
-    // the fallback -- I originally had this the wrong way round.
+    // against the local player's own weapon; the designer-name string is only
+    // the fallback.
     constexpr uintptr_t m_hActiveWeapon = 0x60;
 
     // C_EconItem layout: AttributeManager and Item are EMBEDDED structs, so the
@@ -56,7 +56,7 @@ namespace offsets {
     constexpr uintptr_t m_iItemDefinitionIndex = 0x1BA;
     constexpr uint16_t  kItemDefC4             = 49;
 
-    // Designer-name fallback chain: entity + 0x10 -> firstLevel,
+    // Designer-name fallback: entity + 0x10 -> firstLevel,
     // firstLevel + 0x20 -> char* ("weapon_ak47").
     constexpr uintptr_t m_designerLvl1 = 0x10;
     constexpr uintptr_t m_designerPtr  = 0x20;
@@ -66,14 +66,6 @@ namespace offsets {
     // player's Z (m_vOldOrigin) before being trusted.
     constexpr uintptr_t m_fFlags        = 0x3F4;
     constexpr uintptr_t m_hGroundEntity = 0x530;
-
-    // ── BHOP jump button ──────────────────────────────────────────────────
-    // Not verifiable from a dump: the button block and the globals live in
-    // different regions, so a global delta means nothing for buttons. bhop.cpp
-    // finds it at runtime and requires a held key to confirm it.
-    constexpr uintptr_t dwForceJump = 0x2095490;
-    constexpr uintptr_t kJumpScanLo = 0x2060000;
-    constexpr uintptr_t kJumpScanHi = 0x20E0000;
 
     // ── skeleton ──────────────────────────────────────────────────────────
     constexpr uintptr_t m_boneStride   = 0x20;
