@@ -80,10 +80,9 @@ struct Config {
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
     // Bhop -- single engine, SPACE only, no memory writes.
-    bool  bh_enabled    = false;
-    bool  bh_tick_lock  = true;
-    float bh_offset_ms  = 0.0f;
-    int   bh_retry      = 1;
+    bool  bh_enabled  = false;
+    float bh_hold_ms  = 10.0f;
+    float bh_retry_ms = 16.0f;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -227,9 +226,8 @@ static constexpr int kSkeleton[][2] = {
 
 static void apply_bhop_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
-    Bhop_SetTickLock(g_cfg.bh_tick_lock);
-    Bhop_SetOffsetMs(g_cfg.bh_offset_ms);
-    Bhop_SetRetryTicks(g_cfg.bh_retry);
+    Bhop_SetHoldMs(g_cfg.bh_hold_ms);
+    Bhop_SetRetryMs(g_cfg.bh_retry_ms);
 }
 
 void memory_thread() {
@@ -448,37 +446,30 @@ static void tab_misc() {
     ImGui::Separator();
     ImGui::TextDisabled("[ Timing ]");
 
-    if (ImGui::Checkbox("Align to game tick", &g_cfg.bh_tick_lock))
-        Bhop_SetTickLock(g_cfg.bh_tick_lock);
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderFloat("##hold", &g_cfg.bh_hold_ms, 1.0f, 40.0f,
+                           "hold key for %.1f ms"))
+        Bhop_SetHoldMs(g_cfg.bh_hold_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Presses are aimed at a predicted tick boundary instead\n"
-                          "of a fixed interval from when the landing was detected.\n"
-                          "Detection happens INSIDE a tick, so an interval-based\n"
-                          "retry drifts in phase -- which is why it stopped\n"
-                          "hopping cleanly. Untick to compare.");
+        ImGui::SetTooltip("How long the key stays DOWN per press.\n\n"
+                          "This is the important one. The old code sent down and\n"
+                          "up together, so the key was never down during any\n"
+                          "frame sample -- the press was invisible, not mistimed.\n\n"
+                          "It must exceed one frame: 144 fps is 6.9 ms/frame,\n"
+                          "60 fps is 16.7 ms. Raise this if hops still miss.");
 
     ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##offset", &g_cfg.bh_offset_ms, 0.0f, 20.0f,
-                           "offset %.1f ms"))
-        Bhop_SetOffsetMs(g_cfg.bh_offset_ms);
+    if (ImGui::SliderFloat("##retry", &g_cfg.bh_retry_ms, 2.0f, 60.0f,
+                           "retry every %.1f ms"))
+        Bhop_SetRetryMs(g_cfg.bh_retry_ms);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Where inside the tick the press lands.\n"
-                          "0 = right on the boundary. This is the control to\n"
-                          "sweep: try 0, 2, 4, 6, 8 and see which hops cleanest.");
+        ImGui::SetTooltip("Interval between presses while grounded.\n"
+                          "Retrying is what stops a missed hop from ending\n"
+                          "the chain. About one tick (15.6 ms) is a good start.\n"
+                          "Keep it comfortably larger than the hold.");
 
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderInt("##retry", &g_cfg.bh_retry, 1, 4,
-                         "retry every %d tick(s)"))
-        Bhop_SetRetryTicks(g_cfg.bh_retry);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How often to retry while grounded.\n"
-                          "1 = every tick, which is the most persistent.");
-
-    ImGui::TextDisabled("tick clock: %s  %.3f ms",
-        bd.locked ? "locked" : "warming up",
-        bd.tick_ms > 0.0f ? bd.tick_ms : 15.625f);
-    if (bd.last_phase >= 0.0f)
-        ImGui::TextDisabled("last press: %.1f ms into the tick", bd.last_phase);
+    ImGui::TextDisabled("pressing: %s   last hold %.1f ms",
+        bd.pressing ? "yes" : "no", bd.hold_ms);
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
