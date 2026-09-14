@@ -22,9 +22,8 @@ HWND g_cs2_hwnd = nullptr;
 
 // ── logging ──────────────────────────────────────────────────────────────
 // Every init step is logged, because the failure modes here are SILENT: a
-// blocked startup loop or a self-hiding window both look identical from
-// outside -- process alive, nothing drawn, INSERT apparently dead. The log
-// says which one it was.
+// blocked startup loop, a wrongly-chosen window, or a self-hiding overlay all
+// look identical from outside. The log says which one it was.
 static FILE* g_log = nullptr;
 
 static void open_log() {
@@ -63,7 +62,6 @@ struct Config {
     bool  esp_health   = true;
     bool  esp_distance = true;
     bool  esp_bomb     = true;
-    // Teammates are OFF by default -- most people only want enemies.
     bool  esp_show_enemies = true;
     bool  esp_show_team    = false;
     float box_thickness = 0.5f;
@@ -81,11 +79,16 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Bhop -- injection only, so nothing here writes to cs2.exe.
-    bool  bhop_enabled     = true;
-    bool  bhop_scroll      = true;    // wheel spam (recommended)
-    bool  bhop_key_inject  = false;   // key edge (second chance)
-    float bhop_interval_ms = 8.0f;
+    // Bhop -- five independent engines, nothing writes to cs2.exe.
+    bool  bh_scroll_si   = true;
+    bool  bh_key_si      = false;
+    bool  bh_key_si_del  = false;
+    bool  bh_scroll_me   = false;
+    bool  bh_fps64       = false;
+    float bh_scroll_ms   = 8.0f;
+    float bh_delay_ms    = 15.625f;
+    int   bh_inject_key  = VK_F20;
+    int   bh_fps_target  = 64;
 } g_cfg;
 
 static int  g_screen_w = 1920;
@@ -122,21 +125,12 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
     }
 }
 
-#include <cwchar>   // wcsstr, for the window-title check below
-
 // ── game window lookup ───────────────────────────────────────────────────
-// *** THIS WAS THE "NOTHING RENDERS" BUG ***
 // FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
-// keep the game window in front of its own detached console. The failing build's
-// log read "client 192x456" -- that is the console, not the game. The overlay
-// then glued itself to that tiny window, so every ESP coordinate was computed
-// against a 192x456 viewport and the 580x520 menu was larger than its own
-// window. Nothing visible on the game, process healthy, INSERT apparently dead.
-//
-// So we no longer take the first match. We enumerate every SDL window, log all
-// of them, and pick the best: titled ones first, then largest client area, with
-// anything too small to be a game viewport heavily penalised. A 192x456 console
-// can never outrank a real 1680x1024 game.
+// keep the game window in front of its own detached console. Taking the first
+// match landed us on a 192x456 console window. So we enumerate every SDL
+// window, log all of them, and pick the best: titled first, then largest client
+// area, with small windows penalised so a console can never outrank the game.
 struct WindowCand {
     HWND hwnd;
     int  w, h;
@@ -162,7 +156,8 @@ static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
 
     wchar_t title[128]{};
     GetWindowTextW(h, title, 127);
-    const bool titled = (std::wcsstr(title, L"Counter-Strike") != nullptr);
+    const bool titled =
+        (wcsstr(title, L"Counter-Strike") != nullptr);
 
     list->push_back(WindowCand{ h, w, hh, titled });
     OrbitalLog("  sdl window 0x%p client %dx%d titled=%d", h, w, hh,
@@ -176,23 +171,18 @@ static HWND locate_game_window() {
 
     HWND best = nullptr;
     long long best_score = -1;
-
     for (const WindowCand& c : cands) {
         long long score = static_cast<long long>(c.w) * c.h;
-        if (!c.titled)                     score /= 4;   // console, etc.
-        if (c.w < 640 || c.h < 480)        score /= 4;   // too small to be it
+        if (!c.titled)              score /= 4;
+        if (c.w < 640 || c.h < 480) score /= 4;
         if (score > best_score) { best_score = score; best = c.hwnd; }
     }
-
     if (best) return best;
 
-    // Last resort: the old behaviour.
     HWND h = FindWindowA("SDL_app", nullptr);
     return (h && IsWindow(h)) ? h : nullptr;
 }
 
-// Refresh g_cs2_hwnd and the client size. Returns true if we have a live game
-// window with a sane client rect.
 static bool refresh_game_window() {
     if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
         RECT r{};
@@ -212,18 +202,16 @@ static bool refresh_game_window() {
     g_cs2_hwnd = h;
     g_screen_w = r.right;
     g_screen_h = r.bottom;
-    OrbitalLog("game window found: 0x%p client %dx%d", h, g_screen_w, g_screen_h);
+    OrbitalLog("game window chosen: 0x%p client %dx%d", h, g_screen_w, g_screen_h);
     return true;
 }
 
-// Fallback size if no game window exists yet: the primary monitor's bounds.
 static void use_monitor_size() {
     const int w = GetSystemMetrics(SM_CXSCREEN);
     const int h = GetSystemMetrics(SM_CYSCREEN);
     if (w > 0 && h > 0) { g_screen_w = w; g_screen_h = h; }
 }
 
-// Skeleton links, using the current (post animgraph_2_beta) bone map.
 static constexpr int kSkeleton[][2] = {
     { BONE_PELVIS,     BONE_SPINE_1    },
     { BONE_SPINE_1,    BONE_SPINE_2    },
@@ -246,13 +234,17 @@ static constexpr int kSkeleton[][2] = {
 
 // Push the whole bhop config into the module, so the two can never drift apart.
 static void apply_bhop_config() {
-    Bhop_SetEnabled(g_cfg.bhop_enabled);
-    Bhop_SetScroll(g_cfg.bhop_scroll);
-    Bhop_SetKeyInject(g_cfg.bhop_key_inject);
-    Bhop_SetScrollInterval(g_cfg.bhop_interval_ms);
+    Bhop_SetEngine(BHOP_SCROLL_SI,  g_cfg.bh_scroll_si);
+    Bhop_SetEngine(BHOP_KEY_SI,     g_cfg.bh_key_si);
+    Bhop_SetEngine(BHOP_KEY_SI_DEL, g_cfg.bh_key_si_del);
+    Bhop_SetEngine(BHOP_SCROLL_ME,  g_cfg.bh_scroll_me);
+    Bhop_SetEngine(BHOP_FPS64,      g_cfg.bh_fps64);
+    Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
+    Bhop_SetDelayMs(g_cfg.bh_delay_ms);
+    Bhop_SetInjectKey(g_cfg.bh_inject_key);
+    Bhop_SetFpsTarget(g_cfg.bh_fps_target);
 }
 
-// Reader thread: world samples. Bhop owns its own thread.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
@@ -307,8 +299,6 @@ void render_esp(ImDrawList* dl) {
         if (cx + bw / 2.0f < 0 || cx - bw / 2.0f > g_screen_w) continue;
         if (bot < 0 || top > g_screen_h) continue;
 
-        // Text spacing scales with the box and is CLAMPED, so labels stay just
-        // outside the box at every distance.
         float gap = bh * 0.06f;
         if (gap < 2.0f) gap = 2.0f;
         if (gap > 8.0f) gap = 8.0f;
@@ -403,7 +393,7 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::Text("%s", label);
 }
 
-// ── tabs (unchanged structure: ESP | MISC | COLORS) ──────────────────────
+// ── tabs ─────────────────────────────────────────────────────────────────
 
 static void tab_esp() {
     const float col_w = ImGui::GetContentRegionAvail().x / 2.0f;
@@ -443,52 +433,148 @@ static void tab_esp() {
     ImGui::Columns(1);
 }
 
+// ── MISC: five independent bhop engines ──────────────────────────────────
+
+static void engine_row(int engine, const char* label, const char* tip,
+                       bool* cfg_flag) {
+    if (ImGui::Checkbox(label, cfg_flag))
+        Bhop_SetEngine(engine, *cfg_flag);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+
+    const BhopDebug d = Bhop_GetDebug();
+    ImGui::SameLine(300.0f);
+    if (d.active[engine]) {
+        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f }, "running");
+    } else {
+        ImGui::TextDisabled("-");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d", d.injected[engine]);
+}
+
 static void tab_misc() {
-    ImGui::TextDisabled("[ Bhop ]");
-    ImGui::TextDisabled("HOLD SPACE to bhop - no auto-jump");
-    ImGui::TextDisabled("injection only - no writes to CS2");
+    ImGui::TextDisabled("[ Bhop ]  HOLD SPACE - no auto-jump");
+    ImGui::TextDisabled("all engines inject input; none write to CS2");
+    ImGui::Separator();
 
-    if (ImGui::Checkbox("Bhop", &g_cfg.bhop_enabled))
-        Bhop_SetEnabled(g_cfg.bhop_enabled);
+    engine_row(BHOP_SCROLL_SI, "1. Scroll - SendInput",
+        "Spams mouse-wheel events while the gate is held.\n"
+        "Several events per tick, so one lands in the window.\n"
+        "Needs the scroll bind in game (see below).",
+        &g_cfg.bh_scroll_si);
 
-    if (ImGui::Checkbox("Scroll injection", &g_cfg.bhop_scroll))
-        Bhop_SetScroll(g_cfg.bhop_scroll);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Spams mouse-wheel events while you hold the gate.\n"
-                          "Timing-agnostic: several events per game tick, so\n"
-                          "one falls in the landing window. Needs mwheel bound\n"
-                          "to +jump in game - see the binds below.");
+    engine_row(BHOP_KEY_SI, "2. Key pair - SendInput",
+        "Injects one F20 down+up pair per observed landing.\n"
+        "A lot of VK codes are ignored by CS2; F13-F24 are unused\n"
+        "by the game and are accepted. Needs the F-key bind.",
+        &g_cfg.bh_key_si);
 
-    if (ImGui::Checkbox("Key edge (extra chance)", &g_cfg.bhop_key_inject))
-        Bhop_SetKeyInject(g_cfg.bhop_key_inject);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Also presses a key once per observed landing.\n"
-                          "Second chance alongside scroll spam.");
+    engine_row(BHOP_KEY_SI_DEL, "3. Key pair - one tick delay",
+        "Same as 2, but waits one client tick (15.625 ms) after the\n"
+        "ground flag appears. Valve has changed when a landing jump\n"
+        "is accepted more than once; this is the fix for builds\n"
+        "where an immediate jump is swallowed.",
+        &g_cfg.bh_key_si_del);
 
-    ImGui::SetNextItemWidth(200.0f);
-    if (ImGui::SliderFloat("##scrollms", &g_cfg.bhop_interval_ms, 2.0f, 30.0f,
-                           "scroll every %.0f ms"))
-        Bhop_SetScrollInterval(g_cfg.bhop_interval_ms);
+    engine_row(BHOP_SCROLL_ME, "4. Scroll - mouse_event",
+        "Wheel spam through the older mouse_event API. Travels a\n"
+        "different path through the Windows input stack than\n"
+        "SendInput, so if CS2 filters one it may not filter the other.",
+        &g_cfg.bh_scroll_me);
+
+    engine_row(BHOP_FPS64, "5. 64 FPS tick-aligned",
+        "Types fps_max 64 into the CS2 console, then injects\n"
+        "tick-aligned key pairs. At 64 fps your frames line up 1:1\n"
+        "with the server tick, so the input lands in the tick you\n"
+        "intend. Disabling this restores fps_max 0.",
+        &g_cfg.bh_fps64);
 
     const BhopDebug bd = Bhop_GetDebug();
 
+    ImGui::Columns(2, nullptr, false);
+    ImGui::SetColumnWidth(0, 260.0f);
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ Tuning ]");
+    ImGui::SetNextItemWidth(230.0f);
+    if (ImGui::SliderFloat("##scrollms", &g_cfg.bh_scroll_ms, 2.0f, 30.0f,
+                           "scroll every %.0f ms"))
+        Bhop_SetScrollInterval(g_cfg.bh_scroll_ms);
+
+    ImGui::SetNextItemWidth(230.0f);
+    if (ImGui::SliderFloat("##delayms", &g_cfg.bh_delay_ms, 0.0f, 40.0f,
+                           "delay %.3f ms"))
+        Bhop_SetDelayMs(g_cfg.bh_delay_ms);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("One tick is 15.625 ms.");
+
+    static const struct { const char* name; int vk; } kKeys[] = {
+        { "F20", VK_F20 }, { "F19", VK_F19 }, { "F18", VK_F18 },
+        { "APPS (menu key)", VK_APPS }, { "RIGHT", VK_RIGHT },
+        { "SPACE", VK_SPACE }, { "ALT", VK_MENU },
+    };
+    int cur = 0;
+    for (int i = 0; i < IM_ARRAYSIZE(kKeys); ++i)
+        if (kKeys[i].vk == g_cfg.bh_inject_key) cur = i;
+
+    ImGui::SetNextItemWidth(230.0f);
+    if (ImGui::Combo("##key", &cur, [](void* d, int i, const char** out) {
+            auto* arr = static_cast<decltype(kKeys)*>(d);
+            *out = arr[i].name; return true;
+        }, (void*)kKeys, IM_ARRAYSIZE(kKeys))) {
+        g_cfg.bh_inject_key = kKeys[cur].vk;
+        Bhop_SetInjectKey(g_cfg.bh_inject_key);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Key injected by engines 2, 3 and 5.\n"
+                          "Some VK codes are ignored by CS2 - if a key does\n"
+                          "nothing, try another. You must bind it in game.");
+
+    ImGui::SetNextItemWidth(230.0f);
+    if (ImGui::SliderInt("##fps", &g_cfg.bh_fps_target, 32, 300,
+                         "fps_max %d"))
+        Bhop_SetFpsTarget(g_cfg.bh_fps_target);
+
+    ImGui::NextColumn();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("[ State ]");
     ImGui::Text("ground: %s   focused: %s   space: %s",
         bd.on_ground ? "YES" : "no", bd.focused ? "yes" : "NO",
         bd.space_held ? "held" : "-");
-    ImGui::TextDisabled("scrolls %d   key edges %d   %s%s",
-        bd.scrolls, bd.edges,
-        bd.driving ? "[driving] " : "",
-        bd.suppressing ? "[space swallowed]" : "");
-
+    ImGui::TextDisabled("signals: %s%s%s",
+        (bd.signals & 1) ? "z " : "",
+        (bd.signals & 2) ? "flag " : "",
+        (bd.signals & 4) ? "hge" : "");
+    if (bd.suppressing)
+        ImGui::TextDisabled("space swallowed while driving");
     if (!bd.hook_ok)
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f },
-                           "key hook failed - space gate may misbehave");
+                           "key hook failed - gate may misbehave");
+    if (bd.fps_cmd_sent)
+        ImGui::TextDisabled("fps_max %d sent", bd.fps_target);
 
-    ImGui::Spacing();
-    ImGui::TextDisabled("[ console binds - paste in CS2 console ]");
-    ImGui::TextDisabled("alias +jh \"+jump;+jump\"");
-    ImGui::TextDisabled("alias -jh \"-jump;-jump;-jump\"");
-    ImGui::TextDisabled("bind mwheelup +jh ; bind mwheeldown +jh");
+    ImGui::Columns(1);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("[ in-game binds - paste one line at a time ]");
+    if (ImGui::BeginChild("##binds", { 0.0f, 108.0f }, true)) {
+        ImGui::TextDisabled("// scroll engines (1 and 4)");
+        ImGui::Text("alias +jh \"+jump;+jump\"");
+        ImGui::Text("alias -jh \"-jump;-jump;-jump\"");
+        ImGui::Text("bind mwheelup +jh");
+        ImGui::Text("bind mwheeldown +jh");
+        ImGui::TextDisabled("// key engines (2, 3 and 5)");
+        ImGui::Text("bind F20 +jump");
+    }
+    ImGui::EndChild();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The doubled +jump/-jump is the desubtick trick:\n"
+                          "each wheel input fires the command several times,\n"
+                          "so the engine gets more chances to register an edge.\n"
+                          "Plain mwheel +jump is unreliable post-July-2025.\n"
+                          "If 'bind F20' errors, CS2 cannot bind that key --\n"
+                          "pick a different one in the Tuning list.");
 
     ImGui::Separator();
     ImGui::TextDisabled("[ Frame rate ]");
@@ -501,7 +587,7 @@ static void tab_misc() {
 
     ImGui::Separator();
     ImGui::TextDisabled("game window: %s",
-                        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "found" : "NOT FOUND");
+        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "found" : "NOT FOUND");
     ImGui::TextDisabled("entities: %d slots", g_esp.diag_slots);
     ImGui::TextDisabled("weapon defIdx chain: %s (mine=%d)",
                         g_esp.diag_defidx ? "ok" : "not detected",
@@ -539,8 +625,8 @@ static void tab_colors() {
 }
 
 void render_menu() {
-    ImGui::SetNextWindowSize({ 580.0f, 520.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 440.0f, 280.0f }, { 900.0f, 800.0f });
+    ImGui::SetNextWindowSize({ 640.0f, 620.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 520.0f, 340.0f }, { 1000.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital", nullptr);
 
@@ -583,17 +669,14 @@ void render_menu() {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     OrbitalLog("=== orbital start ===");
 
-    // MUST be first: before any window exists in this process.
     Overlay::enable_dpi_awareness();
     OrbitalLog("dpi awareness set");
 
-    // Try for the game window, but NEVER block on it. A missing window is a
-    // state we operate in, not a hang -- the old build spun here forever and
-    // looked like a dead process with a working menu.
     bool have_game = false;
     for (int i = 0; i < 20 && !have_game; ++i) {
         have_game = refresh_game_window();
-        if (!have_game) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (!have_game)
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     if (!have_game) {
         OrbitalLog("game window NOT found after 5s - using monitor size");
@@ -627,20 +710,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (GetAsyncKeyState(VK_INSERT) & 1) g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9) & 1)     g_running   = false;
 
-        // Re-locate the game window if it is missing or was restarted, and keep
-        // the overlay glued to its client area.
         refresh_game_window();
         overlay.sync_to_game();
 
         overlay.begin_frame();
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
-        if (!g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) {
-            // Visible status, so "nothing is drawn" is never ambiguous again.
-            dl->AddText({ 20.0f, 20.0f }, IM_COL32(255, 200, 0, 255),
-                        "Orbital running - waiting for cs2.exe window");
-            dl->AddText({ 20.0f, 40.0f }, IM_COL32(255, 200, 0, 255),
-                        "INSERT - menu    F9 - exit");
+        {
+            const bool game_ok = (g_cs2_hwnd && IsWindow(g_cs2_hwnd));
+            char line1[192], line2[192];
+            std::snprintf(line1, sizeof(line1),
+                "Orbital | viewport %dx%d | game %s",
+                g_screen_w, g_screen_h, game_ok ? "ok" : "MISSING");
+            std::snprintf(line2, sizeof(line2),
+                "%d slots  %d players  |  INSERT menu  F9 exit",
+                g_esp.diag_slots, g_esp.players_alive);
+
+            const ImU32 c1 = game_ok ? IM_COL32(120, 255, 120, 255)
+                                     : IM_COL32(255, 170, 0, 255);
+            const float y0 = static_cast<float>(g_screen_h) - 30.0f;
+            dl->AddText({ 8.0f, y0 },        c1, line1);
+            dl->AddText({ 8.0f, y0 + 14.0f }, c1, line2);
         }
 
         render_esp(dl);
