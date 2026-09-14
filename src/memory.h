@@ -2,10 +2,8 @@
 #pragma once
 #include <Windows.h>
 #include <TlHelp32.h>
-#include <cstddef>
 #include <cstdint>
 #include <string>
-#include <type_traits>
 
 class Memory {
 public:
@@ -16,32 +14,29 @@ public:
     bool attach(const std::wstring& process_name);
     void detach();
 
-    template <typename T>
+    template<typename T>
     T read(uintptr_t address) const {
-        static_assert(std::is_trivially_copyable_v<T>, "read<T> requires trivially copyable T");
         T value{};
-        if (process_handle)
-            ReadProcessMemory(process_handle,
-                reinterpret_cast<LPCVOID>(address), &value, sizeof(T), nullptr);
+        ReadProcessMemory(process_handle,
+            reinterpret_cast<LPCVOID>(address),
+            &value, sizeof(T), nullptr);
         return value;
     }
 
-    template <typename T>
-    void write(uintptr_t address, const T& value) const {
-        static_assert(std::is_trivially_copyable_v<T>, "write<T> requires trivially copyable T");
-        if (process_handle)
-            WriteProcessMemory(process_handle,
-                reinterpret_cast<LPVOID>(address), &value, sizeof(T), nullptr);
+    template<typename T>
+    void write(uintptr_t address, T value) const {
+        WriteProcessMemory(process_handle,
+            reinterpret_cast<LPVOID>(address),
+            &value, sizeof(T), nullptr);
     }
 
-    // Bulk read into a caller buffer; false on any failure.
-    bool read_bytes(uintptr_t address, void* out, std::size_t size) const {
-        if (!process_handle) return false;
+    bool read_bytes(uintptr_t address, void* buf, size_t size) const {
+        SIZE_T bytes_read = 0;
         return ReadProcessMemory(process_handle,
-            reinterpret_cast<LPCVOID>(address), out, size, nullptr) == TRUE;
+            reinterpret_cast<LPCVOID>(address),
+            buf, size, &bytes_read) && bytes_read == size;
     }
 
-    // Exactly what your working build had.
     bool is_valid() const {
         return process_handle != nullptr && client_dll != 0;
     }
