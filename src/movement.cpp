@@ -1,5 +1,26 @@
 // --- src/movement.cpp ---
-// Jumpbug. CTRL injection only, no memory writes.
+// Jumpbug: JUMP + CROUCH. SPACE and CTRL injection only, no memory writes.
+// Independent of the Bhop toggle.
+//
+// ══ WHAT A JUMPBUG ACTUALLY IS ══════════════════════════════════════════
+// You are falling. You crouch, then RELEASE the crouch as you press jump at
+// touchdown. The crouch->stand transition in the same frame as the landing is
+// what the game resolves as a jump, which negates fall damage and can gain
+// height.
+//
+// My previous version only crouched and never jumped, which cannot work -- a
+// jumpbug without the jump is just a crouch. This uses the SAME prediction and
+// jump timing as bhop.cpp (lead 8 ms, hold 12 ms, retry 16 ms) and adds the two
+// crouch timings on top.
+//
+// ══ THE THREE TIMINGS ════════════════════════════════════════════════════
+//   crouch lead   - start holding CTRL this early in the fall
+//   uncrouch lead - release CTRL this close to touchdown (0 = on the flag)
+//   jump          - locked to the bhop values, since it is the same mechanic
+//
+// The crouch must still be HELD when the jump fires, or there is no transition
+// to exploit. So uncrouch lead of 0 (release on the ground flag) is correct,
+// and the jump fires at the same moment.
 #include "movement.h"
 #include "memory.h"
 #include "offsets.h"
@@ -17,17 +38,23 @@ extern HWND g_cs2_hwnd;
 
 namespace {
 
-std::atomic<bool>  g_stop{false}, g_started{false};
-std::atomic<bool>  g_on{false};
-std::atomic<int>   g_key{0};
-std::atomic<float> g_crouch_lead{200.0f};
-std::atomic<float> g_uncrouch_lead{0.0f};   // 0 == release on landing
+// Jump timing, same as bhop.cpp.
+constexpr double kJumpLeadMs  = 8.0;
+constexpr double kJumpHoldMs  = 12.0;
+constexpr double kJumpRetryMs = 16.0;
 
 constexpr float kMinFallSpeed = 40.0f;
 constexpr float kMaxTtiMs     = 1200.0f;
 
+std::atomic<bool>  g_stop{false}, g_started{false};
+std::atomic<bool>  g_on{false};
+std::atomic<int>   g_key{0};
+std::atomic<float> g_crouch_lead{120.0f};
+std::atomic<float> g_uncrouch_lead{0.0f};
+
 std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false};
 std::atomic<bool>  g_dbg_armed{false},  g_dbg_ducked{false};
+std::atomic<bool>  g_dbg_jumping{false};
 std::atomic<float> g_dbg_vz{0.0f}, g_dbg_tti{-1.0f};
 std::atomic<int>   g_dbg_n{0};
 
@@ -58,23 +85,25 @@ bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
-void ctrl_down() {
+// Separate down/up so the key is genuinely held rather than a zero-width pulse.
+void key_down(int vk) {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
-    in.ki.wVk = VK_CONTROL;
-    in.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+    in.ki.wVk = (WORD)vk;
+    in.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     SendInput(1, &in, sizeof(INPUT));
 }
 
-void ctrl_up() {
+void key_up(int vk) {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
-    in.ki.wVk = VK_CONTROL;
-    in.ki.wScan = (WORD)MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC);
+    in.ki.wVk = (WORD)vk;
+    in.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     in.ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// ---- prediction, same structure as bhop.cpp ----
 struct Watch {
     bool   has_prev = false;
     float  prev_z = 0.0f;
@@ -94,13 +123,8 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     const float z = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
     const uint32_t flags = mem.read<uint32_t>(pawn + offsets::m_fFlags);
 
-    const bool flag_ground = (flags & 1u) != 0u;   // FL_ONGROUND
-
-    // FL_DUCKING is bit 2. Reading it tells us whether the crouch we injected
-    // actually reached the game -- without this, "bad timing" and "the key
-    // never registered" are indistinguishable.
-    const bool ducked = (flags & 4u) != 0u;
-    g_dbg_ducked.store(ducked);
+    const bool flag_ground = (flags & 1u) != 0u;
+    g_dbg_ducked.store((flags & 4u) != 0u);   // FL_DUCKING
 
     if (!g_w.has_prev) {
         g_w.has_prev = true;
@@ -151,7 +175,11 @@ void run_thread() {
     double pawn_at = 0.0;
 
     bool crouching = false;
-    bool armed = false;
+    bool armed = false;        // crouch already started this airtime
+    bool jump_down = false;
+    double jump_at = 0.0;
+    double next_jump = 0.0;
+    bool jumped = false;       // predicted jump already fired this airtime
 
     while (!g_stop.load()) {
         wait_ms(1.0);
@@ -161,10 +189,13 @@ void run_thread() {
                           (key == 0 || (GetAsyncKeyState(key) & 0x8000));
 
         if (!g_mem.is_valid() || !gate) {
-            if (crouching) { ctrl_up(); crouching = false; }
+            if (crouching)  { key_up(VK_CONTROL); crouching = false; }
+            if (jump_down)  { key_up(VK_SPACE);   jump_down = false; }
             armed = false;
+            jumped = false;
             g_dbg_crouch.store(false);
             g_dbg_armed.store(false);
+            g_dbg_jumping.store(false);
             continue;
         }
 
@@ -178,37 +209,69 @@ void run_thread() {
 
         update_watch(g_mem, pawn);
 
-        // On the ground: release and re-arm. If we were still crouching when we
-        // landed, this release IS the jumpbug.
+        // Release the jump hold once its window elapses, regardless of state.
+        if (jump_down && (now - jump_at) >= kJumpHoldMs) {
+            key_up(VK_SPACE);
+            jump_down = false;
+        }
+
         if (g_w.on_ground) {
-            if (crouching) { ctrl_up(); crouching = false; }
+            // Landing. Release the crouch HERE -- that release, simultaneous
+            // with the jump, is the jumpbug itself.
+            if (crouching) { key_up(VK_CONTROL); crouching = false; }
             armed = false;
+            jumped = false;
             g_dbg_crouch.store(false);
             g_dbg_armed.store(false);
+
+            // Retry the jump while grounded, exactly like bhop does, so a
+            // missed landing self-corrects instead of ending the chain.
+            if (next_jump <= 0.0) next_jump = now;
+            if (now >= next_jump && !jump_down) {
+                key_down(VK_SPACE);
+                jump_down = true;
+                jump_at = now;
+                next_jump = now + kJumpRetryMs;
+                g_dbg_jumping.store(true);
+            }
             continue;
         }
 
+        next_jump = 0.0;
+
         const float tti = g_w.tti;
 
+        // ---- crouch early in the fall ----
         if (!armed && !crouching && tti >= 0.0f &&
             tti <= g_crouch_lead.load()) {
-            ctrl_down();
+            key_down(VK_CONTROL);
             crouching = true;
             armed = true;
             g_dbg_n.fetch_add(1);
         }
 
+        // ---- optional early uncrouch. 0 = release on the ground flag above ----
         const float release = g_uncrouch_lead.load();
         if (release > 0.0f && crouching && tti >= 0.0f && tti <= release) {
-            ctrl_up();
+            key_up(VK_CONTROL);
             crouching = false;
+        }
+
+        // ---- predicted jump, so the press is down at touchdown ----
+        if (!jumped && tti >= 0.0f && tti <= kJumpLeadMs && !jump_down) {
+            key_down(VK_SPACE);
+            jump_down = true;
+            jump_at = now;
+            jumped = true;
+            g_dbg_jumping.store(true);
         }
 
         g_dbg_crouch.store(crouching);
         g_dbg_armed.store(armed);
     }
 
-    if (crouching) ctrl_up();
+    if (crouching) key_up(VK_CONTROL);
+    if (jump_down) key_up(VK_SPACE);
 }
 
 } // namespace
@@ -236,6 +299,7 @@ MovementDebug Movement_GetDebug() {
     d.crouching   = g_dbg_crouch.load();
     d.game_ducked = g_dbg_ducked.load();
     d.armed       = g_dbg_armed.load();
+    d.jumping     = g_dbg_jumping.load();
     d.vz          = g_dbg_vz.load();
     d.tti         = g_dbg_tti.load();
     d.jumpbugs    = g_dbg_n.load();
