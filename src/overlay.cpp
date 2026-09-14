@@ -6,45 +6,23 @@
 #include <imgui_impl_dx11.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
-extern bool g_menu_open;
-extern bool g_vsync;
-extern HWND g_cs2_hwnd;
 
 LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    // Eat WM_SETCURSOR so Windows never changes it to the loading arrow
-    if (msg == WM_SETCURSOR) { SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW)); return TRUE; }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void Overlay::enable_dpi_awareness() {
-    // Per-monitor-v2 if the OS has it, else system-aware. This has to happen
-    // before the first HWND exists in this process, which is why it is called
-    // at the top of WinMain.
-    using SetDpiCtxFn = BOOL (WINAPI*)(HANDLE);
-    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
-        auto fn = reinterpret_cast<SetDpiCtxFn>(
-            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
-        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
-        if (fn && fn(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))))
-            return;
-    }
-    SetProcessDPIAware();
-}
-
 bool Overlay::create(int width, int height) {
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = wnd_proc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW); // arrow, never hourglass
-    wc.lpszClassName = L"OrbitalESP_Overlay";
-    if (!RegisterClassExW(&wc)) return false;
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = wnd_proc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"OrbitalESP";
+    RegisterClassExW(&wc);
 
     hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-        | WS_EX_TOOLWINDOW, // <-- hides from taskbar and alt-tab list
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"OrbitalESP",
         WS_POPUP,
         0, 0, width, height,
@@ -52,201 +30,65 @@ bool Overlay::create(int width, int height) {
     );
     if (!hwnd) return false;
 
-    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
 
-    MARGINS m{ -1, -1, -1, -1 };
+    MARGINS m{ -1 };
     DwmExtendFrameIntoClientArea(hwnd, &m);
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    if (!init_dx11(width, height)) return false;
-    if (!create_rtv()) return false;
-
-    width_  = width;
-    height_ = height;
+    if (!create_device())        return false;
+    if (!create_render_target()) return false;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange; // we manage cursor
-
-    // ── BramptonHook-style theme ──────────────────────────────────────────────
-    ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding = 0.0f;
-    s.ChildRounding = 0.0f;
-    s.FrameRounding = 0.0f;
-    s.GrabRounding = 0.0f;
-    s.PopupRounding = 0.0f;
-    s.ScrollbarRounding = 0.0f;
-    s.TabRounding = 0.0f;
-    s.WindowBorderSize = 1.0f;
-    s.FrameBorderSize = 1.0f;
-    s.WindowPadding = { 8.0f, 6.0f };
-    s.FramePadding = { 4.0f, 3.0f };
-    s.ItemSpacing = { 6.0f, 4.0f };
-    s.ItemInnerSpacing = { 4.0f, 4.0f };
-    s.IndentSpacing = 14.0f;
-    s.ScrollbarSize = 12.0f;
-    s.GrabMinSize = 8.0f;
-
-    // Classic Win95/early-2000s cheat panel palette
-    ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg] = { 0.78f, 0.78f, 0.78f, 0.97f }; // light grey bg
-    c[ImGuiCol_ChildBg] = { 0.82f, 0.82f, 0.82f, 1.00f };
-    c[ImGuiCol_PopupBg] = { 0.80f, 0.80f, 0.80f, 1.00f };
-    c[ImGuiCol_Border] = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_BorderShadow] = { 0.00f, 0.00f, 0.00f, 0.00f };
-    c[ImGuiCol_FrameBg] = { 1.00f, 1.00f, 1.00f, 1.00f }; // white input boxes
-    c[ImGuiCol_FrameBgHovered] = { 0.90f, 0.90f, 0.90f, 1.00f };
-    c[ImGuiCol_FrameBgActive] = { 0.85f, 0.85f, 0.85f, 1.00f };
-    c[ImGuiCol_TitleBg] = { 0.00f, 0.00f, 0.50f, 1.00f }; // dark blue title
-    c[ImGuiCol_TitleBgActive] = { 0.00f, 0.00f, 0.70f, 1.00f };
-    c[ImGuiCol_TitleBgCollapsed] = { 0.00f, 0.00f, 0.40f, 1.00f };
-    c[ImGuiCol_MenuBarBg] = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_ScrollbarBg] = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_ScrollbarGrab] = { 0.50f, 0.50f, 0.50f, 1.00f };
-    c[ImGuiCol_ScrollbarGrabHovered] = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_ScrollbarGrabActive] = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_CheckMark] = { 0.00f, 0.00f, 0.00f, 1.00f }; // black checkmark
-    c[ImGuiCol_SliderGrab] = { 0.55f, 0.55f, 0.55f, 1.00f };
-    c[ImGuiCol_SliderGrabActive] = { 0.35f, 0.35f, 0.35f, 1.00f };
-    c[ImGuiCol_Button] = { 0.88f, 0.80f, 0.55f, 1.00f }; // tan/gold buttons
-    c[ImGuiCol_ButtonHovered] = { 0.95f, 0.88f, 0.65f, 1.00f };
-    c[ImGuiCol_ButtonActive] = { 0.75f, 0.68f, 0.45f, 1.00f };
-    c[ImGuiCol_Header] = { 0.70f, 0.70f, 0.70f, 1.00f };
-    c[ImGuiCol_HeaderHovered] = { 0.65f, 0.65f, 0.65f, 1.00f };
-    c[ImGuiCol_HeaderActive] = { 0.60f, 0.60f, 0.60f, 1.00f };
-    c[ImGuiCol_Separator] = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_SeparatorHovered] = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_SeparatorActive] = { 0.20f, 0.20f, 0.20f, 1.00f };
-    c[ImGuiCol_ResizeGrip] = { 0.60f, 0.60f, 0.60f, 1.00f };
-    c[ImGuiCol_ResizeGripHovered] = { 0.50f, 0.50f, 0.50f, 1.00f };
-    c[ImGuiCol_ResizeGripActive] = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_Tab] = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_TabHovered] = { 0.85f, 0.85f, 0.85f, 1.00f };
-    c[ImGuiCol_TabActive] = { 0.90f, 0.90f, 0.90f, 1.00f };
-    c[ImGuiCol_Text] = { 0.00f, 0.00f, 0.00f, 1.00f }; // black text
-    c[ImGuiCol_TextDisabled] = { 0.45f, 0.45f, 0.45f, 1.00f };
-
+    ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(device, context);
 
     return true;
 }
 
-// Glue the overlay to the game's client area, and resize the swap chain if the
-// game's resolution changed. Without this, a windowed/borderless game that
-// isn't at (0,0) or that changes resolution silently misaligns every box.
-void Overlay::sync_to_game() {
-    if (!hwnd || !g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) return;
-
-    RECT rc{};
-    if (!GetClientRect(g_cs2_hwnd, &rc)) return;
-
-    POINT tl{ 0, 0 };
-    if (!ClientToScreen(g_cs2_hwnd, &tl)) return;
-
-    const int w = rc.right - rc.left;
-    const int h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
-
-    RECT cur{};
-    GetWindowRect(hwnd, &cur);
-    if (cur.left != tl.x || cur.top != tl.y ||
-        (cur.right - cur.left) != w || (cur.bottom - cur.top) != h) {
-        SetWindowPos(hwnd, HWND_TOPMOST, tl.x, tl.y, w, h, SWP_NOACTIVATE);
-    }
-
-    if (w != width_ || h != height_) resize_buffers(w, h);
-}
-
-bool Overlay::resize_buffers(int width, int height) {
-    if (!swapchain || !context) return false;
-
-    context->OMSetRenderTargets(0, nullptr, nullptr);
-    release_rtv();
-
-    if (FAILED(swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
-                                        DXGI_FORMAT_UNKNOWN, 0)))
-        return false;
-
-    width_  = width;
-    height_ = height;
-    return create_rtv();
-}
-
-void Overlay::update_visibility_and_input() {
-    HWND fg = GetForegroundWindow();
-    const bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
-
-    if (!cs2_focused) {
-        if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
-        return;
-    }
-    if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
-
-    // The overlay NEVER activates. It keeps WS_EX_NOACTIVATE at all times and
-    // only toggles click-through, so CS2 retains keyboard focus even while the
-    // menu is open. The previous version called SetForegroundWindow(hwnd) and
-    // cleared WS_EX_NOACTIVATE when the menu opened, which took focus away from
-    // the game and never gave it back -- so the bhop's "is CS2 focused?" gate
-    // stayed false and bhop did nothing at all.
-    //
-    // WS_EX_NOACTIVATE still allows the window to receive mouse clicks, so the
-    // menu stays fully usable.
-    LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-    if (g_menu_open) {
-        ex &= ~WS_EX_TRANSPARENT;
-        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
-    } else {
-        ex |= WS_EX_TRANSPARENT;
-    }
-    ex |= WS_EX_NOACTIVATE;
-    SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
-}
-
-bool Overlay::init_dx11(int width, int height) {
+bool Overlay::create_device() {
     DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = (UINT)width;
-    sd.BufferDesc.Height = (UINT)height;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 0;
+    sd.BufferCount                        = 2;
+    sd.BufferDesc.Width                   = 0;
+    sd.BufferDesc.Height                  = 0;
+    sd.BufferDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator   = 144;
     sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.Flags                              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow                       = hwnd;
+    sd.SampleDesc.Count                   = 1;
+    sd.Windowed                           = TRUE;
+    sd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
-    D3D_FEATURE_LEVEL level;
+    D3D_FEATURE_LEVEL feature_level;
     constexpr D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
 
     return SUCCEEDED(D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
         0, levels, 1, D3D11_SDK_VERSION,
-        &sd, &swapchain, &device, &level, &context
+        &sd, &swapchain, &device, &feature_level, &context
     ));
 }
 
-bool Overlay::create_rtv() {
-    ID3D11Texture2D* buf = nullptr;
-    swapchain->GetBuffer(0, IID_PPV_ARGS(&buf));
-    if (!buf) return false;
-    device->CreateRenderTargetView(buf, nullptr, &rtv);
-    buf->Release();
+bool Overlay::create_render_target() {
+    ID3D11Texture2D* back_buffer = nullptr;
+    swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+    if (!back_buffer) return false;
+    device->CreateRenderTargetView(back_buffer, nullptr, &rtv);
+    back_buffer->Release();
     return rtv != nullptr;
 }
 
-void Overlay::release_rtv() {
+void Overlay::release_render_target() {
     if (rtv) { rtv->Release(); rtv = nullptr; }
 }
 
 void Overlay::begin_frame() {
-    update_visibility_and_input();
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -254,28 +96,21 @@ void Overlay::begin_frame() {
 
 void Overlay::end_frame() {
     ImGui::Render();
-    constexpr float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    constexpr float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     context->OMSetRenderTargets(1, &rtv, nullptr);
-    context->ClearRenderTargetView(rtv, clear);
+    context->ClearRenderTargetView(rtv, clear_color);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-    // *** THIS WAS THE MOUSE-MISALIGNMENT BUG ***
-    // It used to be Present(1, 0), i.e. vsync forced on, so the overlay was
-    // locked to 60 Hz while the game ran at 200-400. Every box was drawn with
-    // a view matrix up to ~16 ms old, so during a fast mouse flick the boxes
-    // visibly trailed the players. Uncapped, the matrix is only ~4 ms stale.
-    // The main loop caps the uncapped rate at 240 Hz so the GPU stays sane.
-    swapchain->Present(g_vsync ? 1 : 0, 0);
+    swapchain->Present(1, 0);
 }
 
 void Overlay::cleanup() {
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    release_rtv();
+    release_render_target();
     if (swapchain) { swapchain->Release(); swapchain = nullptr; }
-    if (context) { context->Release(); context = nullptr; }
-    if (device) { device->Release(); device = nullptr; }
-    if (hwnd) { DestroyWindow(hwnd); hwnd = nullptr; }
+    if (context)   { context->Release();   context   = nullptr; }
+    if (device)    { device->Release();    device    = nullptr; }
+    if (hwnd)      { DestroyWindow(hwnd);  hwnd      = nullptr; }
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 }
