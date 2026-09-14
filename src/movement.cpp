@@ -26,7 +26,8 @@ std::atomic<float> g_uncrouch_lead{0.0f};   // 0 == release on landing
 constexpr float kMinFallSpeed = 40.0f;
 constexpr float kMaxTtiMs     = 1200.0f;
 
-std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false}, g_dbg_armed{false};
+std::atomic<bool>  g_dbg_ground{false}, g_dbg_crouch{false};
+std::atomic<bool>  g_dbg_armed{false},  g_dbg_ducked{false};
 std::atomic<float> g_dbg_vz{0.0f}, g_dbg_tti{-1.0f};
 std::atomic<int>   g_dbg_n{0};
 
@@ -57,8 +58,6 @@ bool cs2_focused() {
     return g_cs2_hwnd && GetForegroundWindow() == g_cs2_hwnd;
 }
 
-// Separate down/up calls, so the key is genuinely held rather than a zero-width
-// pulse the game's per-frame sampling could miss.
 void ctrl_down() {
     INPUT in{};
     in.type = INPUT_KEYBOARD;
@@ -76,7 +75,6 @@ void ctrl_up() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// ---- prediction ----
 struct Watch {
     bool   has_prev = false;
     float  prev_z = 0.0f;
@@ -94,8 +92,15 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     const double now = now_ms();
 
     const float z = mem.read<float>(pawn + offsets::m_vOldOrigin + 8);
-    const bool  flag_ground =
-        (mem.read<uint32_t>(pawn + offsets::m_fFlags) & 1u) != 0u;
+    const uint32_t flags = mem.read<uint32_t>(pawn + offsets::m_fFlags);
+
+    const bool flag_ground = (flags & 1u) != 0u;   // FL_ONGROUND
+
+    // FL_DUCKING is bit 2. Reading it tells us whether the crouch we injected
+    // actually reached the game -- without this, "bad timing" and "the key
+    // never registered" are indistinguishable.
+    const bool ducked = (flags & 4u) != 0u;
+    g_dbg_ducked.store(ducked);
 
     if (!g_w.has_prev) {
         g_w.has_prev = true;
@@ -120,10 +125,6 @@ void update_watch(const Memory& mem, uintptr_t pawn) {
     g_w.prev_z = z;
     g_w.prev_t = now;
 
-    // The flag is the primary ground signal, because it is instance-accurate.
-    // A Z-stillness test alone reads the APEX of a jump as "grounded" (Z barely
-    // moves up there), which would overwrite ground_z with the apex height and
-    // collapse tti to zero -- so it is only accepted when velocity is also slow.
     const bool slow = std::fabs(g_w.vz) < 30.0f;
     g_w.on_ground = flag_ground || (z_still && slow);
 
@@ -177,24 +178,18 @@ void run_thread() {
 
         update_watch(g_mem, pawn);
 
-        const float tti    = g_w.tti;
-        const float release = g_uncrouch_lead.load();
-
         // On the ground: release and re-arm. If we were still crouching when we
-        // landed, this release IS the jumpbug -- which is exactly what happens
-        // with the default uncrouch lead of 0.
+        // landed, this release IS the jumpbug.
         if (g_w.on_ground) {
-            if (crouching) {
-                ctrl_up();
-                crouching = false;
-            }
+            if (crouching) { ctrl_up(); crouching = false; }
             armed = false;
             g_dbg_crouch.store(false);
             g_dbg_armed.store(false);
             continue;
         }
 
-        // Crouch once, early in the fall.
+        const float tti = g_w.tti;
+
         if (!armed && !crouching && tti >= 0.0f &&
             tti <= g_crouch_lead.load()) {
             ctrl_down();
@@ -203,8 +198,7 @@ void run_thread() {
             g_dbg_n.fetch_add(1);
         }
 
-        // Optional early release. With the default of 0 this never fires, and
-        // the release happens on the ground flag instead.
+        const float release = g_uncrouch_lead.load();
         if (release > 0.0f && crouching && tti >= 0.0f && tti <= release) {
             ctrl_up();
             crouching = false;
@@ -237,13 +231,14 @@ void Movement_Shutdown() {
 
 MovementDebug Movement_GetDebug() {
     MovementDebug d;
-    d.enabled   = g_on.load();
-    d.on_ground = g_dbg_ground.load();
-    d.crouching = g_dbg_crouch.load();
-    d.armed     = g_dbg_armed.load();
-    d.vz        = g_dbg_vz.load();
-    d.tti       = g_dbg_tti.load();
-    d.jumpbugs  = g_dbg_n.load();
+    d.enabled     = g_on.load();
+    d.on_ground   = g_dbg_ground.load();
+    d.crouching   = g_dbg_crouch.load();
+    d.game_ducked = g_dbg_ducked.load();
+    d.armed       = g_dbg_armed.load();
+    d.vz          = g_dbg_vz.load();
+    d.tti         = g_dbg_tti.load();
+    d.jumpbugs    = g_dbg_n.load();
     return d;
 }
 
