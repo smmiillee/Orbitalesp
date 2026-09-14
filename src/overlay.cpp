@@ -7,16 +7,13 @@
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 extern bool g_menu_open;
-extern HWND g_cs2_hwnd;
 extern bool g_vsync;
-
-void Overlay::enable_dpi_awareness() {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-}
+extern HWND g_cs2_hwnd;
 
 LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    // Eat WM_SETCURSOR so Windows never changes it to the loading arrow
     if (msg == WM_SETCURSOR) {
         SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
         return TRUE;
@@ -24,15 +21,27 @@ LRESULT CALLBACK Overlay::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-bool Overlay::create(int width, int height) {
-    width_  = width;
-    height_ = height;
+void Overlay::enable_dpi_awareness() {
+    // Per-monitor-v2 if the OS has it, else system-aware. This has to happen
+    // before the first HWND exists in this process, which is why it is called
+    // at the top of WinMain.
+    using SetDpiCtxFn = BOOL (WINAPI*)(HANDLE);
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        auto fn = reinterpret_cast<SetDpiCtxFn>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+        if (fn && fn(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4))))
+            return;
+    }
+    SetProcessDPIAware();
+}
 
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc   = wnd_proc;
-    wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.hCursor       = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+bool Overlay::create(int width, int height) {
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"OrbitalESP_Overlay";
     if (!RegisterClassExW(&wc)) return false;
 
@@ -55,7 +64,10 @@ bool Overlay::create(int width, int height) {
     UpdateWindow(hwnd);
 
     if (!init_dx11(width, height)) return false;
-    if (!create_rtv())             return false;
+    if (!create_rtv()) return false;
+
+    width_  = width;
+    height_ = height;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -63,61 +75,62 @@ bool Overlay::create(int width, int height) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
+    // ── early-2000s cheat panel theme ─────────────────────────────────────
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowRounding      = 0.0f;
-    s.ChildRounding       = 0.0f;
-    s.FrameRounding       = 0.0f;
-    s.GrabRounding        = 0.0f;
-    s.PopupRounding       = 0.0f;
-    s.ScrollbarRounding   = 0.0f;
-    s.TabRounding         = 0.0f;
-    s.WindowBorderSize    = 1.0f;
-    s.FrameBorderSize     = 1.0f;
-    s.WindowPadding       = { 8.0f, 6.0f };
-    s.FramePadding        = { 4.0f, 3.0f };
-    s.ItemSpacing         = { 6.0f, 4.0f };
-    s.ItemInnerSpacing    = { 4.0f, 4.0f };
-    s.IndentSpacing       = 14.0f;
-    s.ScrollbarSize       = 12.0f;
-    s.GrabMinSize         = 8.0f;
+    s.WindowRounding = 0.0f;
+    s.ChildRounding = 0.0f;
+    s.FrameRounding = 0.0f;
+    s.GrabRounding = 0.0f;
+    s.PopupRounding = 0.0f;
+    s.ScrollbarRounding = 0.0f;
+    s.TabRounding = 0.0f;
+    s.WindowBorderSize = 1.0f;
+    s.FrameBorderSize = 1.0f;
+    s.WindowPadding = { 8.0f, 6.0f };
+    s.FramePadding = { 4.0f, 3.0f };
+    s.ItemSpacing = { 6.0f, 4.0f };
+    s.ItemInnerSpacing = { 4.0f, 4.0f };
+    s.IndentSpacing = 14.0f;
+    s.ScrollbarSize = 12.0f;
+    s.GrabMinSize = 8.0f;
 
     ImVec4* c = s.Colors;
-    c[ImGuiCol_WindowBg]             = { 0.78f, 0.78f, 0.78f, 0.97f };
-    c[ImGuiCol_ChildBg]              = { 0.82f, 0.82f, 0.82f, 1.00f };
-    c[ImGuiCol_PopupBg]              = { 0.80f, 0.80f, 0.80f, 1.00f };
-    c[ImGuiCol_Border]               = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_BorderShadow]         = { 0.00f, 0.00f, 0.00f, 0.00f };
-    c[ImGuiCol_FrameBg]              = { 1.00f, 1.00f, 1.00f, 1.00f };
-    c[ImGuiCol_FrameBgHovered]       = { 0.90f, 0.90f, 0.90f, 1.00f };
-    c[ImGuiCol_FrameBgActive]        = { 0.85f, 0.85f, 0.85f, 1.00f };
-    c[ImGuiCol_TitleBg]              = { 0.00f, 0.00f, 0.50f, 1.00f };
-    c[ImGuiCol_TitleBgActive]        = { 0.00f, 0.00f, 0.70f, 1.00f };
-    c[ImGuiCol_TitleBgCollapsed]     = { 0.00f, 0.00f, 0.40f, 1.00f };
-    c[ImGuiCol_MenuBarBg]            = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_ScrollbarBg]          = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_ScrollbarGrab]        = { 0.50f, 0.50f, 0.50f, 1.00f };
+    c[ImGuiCol_WindowBg] = { 0.78f, 0.78f, 0.78f, 0.97f };
+    c[ImGuiCol_ChildBg] = { 0.82f, 0.82f, 0.82f, 1.00f };
+    c[ImGuiCol_PopupBg] = { 0.80f, 0.80f, 0.80f, 1.00f };
+    c[ImGuiCol_Border] = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_BorderShadow] = { 0.00f, 0.00f, 0.00f, 0.00f };
+    c[ImGuiCol_FrameBg] = { 1.00f, 1.00f, 1.00f, 1.00f };
+    c[ImGuiCol_FrameBgHovered] = { 0.90f, 0.90f, 0.90f, 1.00f };
+    c[ImGuiCol_FrameBgActive] = { 0.85f, 0.85f, 0.85f, 1.00f };
+    c[ImGuiCol_TitleBg] = { 0.00f, 0.00f, 0.50f, 1.00f };
+    c[ImGuiCol_TitleBgActive] = { 0.00f, 0.00f, 0.70f, 1.00f };
+    c[ImGuiCol_TitleBgCollapsed] = { 0.00f, 0.00f, 0.40f, 1.00f };
+    c[ImGuiCol_MenuBarBg] = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_ScrollbarBg] = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_ScrollbarGrab] = { 0.50f, 0.50f, 0.50f, 1.00f };
     c[ImGuiCol_ScrollbarGrabHovered] = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_ScrollbarGrabActive]  = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_CheckMark]            = { 0.00f, 0.00f, 0.00f, 1.00f };
-    c[ImGuiCol_SliderGrab]           = { 0.55f, 0.55f, 0.55f, 1.00f };
-    c[ImGuiCol_SliderGrabActive]     = { 0.35f, 0.35f, 0.35f, 1.00f };
-    c[ImGuiCol_Button]               = { 0.88f, 0.80f, 0.55f, 1.00f };
-    c[ImGuiCol_ButtonHovered]        = { 0.95f, 0.88f, 0.65f, 1.00f };
-    c[ImGuiCol_ButtonActive]         = { 0.75f, 0.68f, 0.45f, 1.00f };
-    c[ImGuiCol_Header]               = { 0.70f, 0.70f, 0.70f, 1.00f };
-    c[ImGuiCol_HeaderHovered]        = { 0.65f, 0.65f, 0.65f, 1.00f };
-    c[ImGuiCol_HeaderActive]         = { 0.60f, 0.60f, 0.60f, 1.00f };
-    c[ImGuiCol_Separator]            = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_SeparatorHovered]     = { 0.30f, 0.30f, 0.30f, 1.00f };
-    c[ImGuiCol_SeparatorActive]      = { 0.20f, 0.20f, 0.20f, 1.00f };
-    c[ImGuiCol_ResizeGrip]           = { 0.60f, 0.60f, 0.60f, 1.00f };
-    c[ImGuiCol_ResizeGripHovered]    = { 0.50f, 0.50f, 0.50f, 1.00f };
-    c[ImGuiCol_ResizeGripActive]     = { 0.40f, 0.40f, 0.40f, 1.00f };
-    c[ImGuiCol_Tab]                  = { 0.75f, 0.75f, 0.75f, 1.00f };
-    c[ImGuiCol_TabHovered]           = { 0.85f, 0.85f, 0.85f, 1.00f };
-    c[ImGuiCol_TabActive]            = { 0.90f, 0.90f, 0.90f, 1.00f };
-    c[ImGuiCol_Text]                 = { 0.00f, 0.00f, 0.00f, 1.00f };
-    c[ImGuiCol_TextDisabled]         = { 0.45f, 0.45f, 0.45f, 1.00f };
+    c[ImGuiCol_ScrollbarGrabActive] = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_CheckMark] = { 0.00f, 0.00f, 0.00f, 1.00f };
+    c[ImGuiCol_SliderGrab] = { 0.55f, 0.55f, 0.55f, 1.00f };
+    c[ImGuiCol_SliderGrabActive] = { 0.35f, 0.35f, 0.35f, 1.00f };
+    c[ImGuiCol_Button] = { 0.88f, 0.80f, 0.55f, 1.00f };
+    c[ImGuiCol_ButtonHovered] = { 0.95f, 0.88f, 0.65f, 1.00f };
+    c[ImGuiCol_ButtonActive] = { 0.75f, 0.68f, 0.45f, 1.00f };
+    c[ImGuiCol_Header] = { 0.70f, 0.70f, 0.70f, 1.00f };
+    c[ImGuiCol_HeaderHovered] = { 0.65f, 0.65f, 0.65f, 1.00f };
+    c[ImGuiCol_HeaderActive] = { 0.60f, 0.60f, 0.60f, 1.00f };
+    c[ImGuiCol_Separator] = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_SeparatorHovered] = { 0.30f, 0.30f, 0.30f, 1.00f };
+    c[ImGuiCol_SeparatorActive] = { 0.20f, 0.20f, 0.20f, 1.00f };
+    c[ImGuiCol_ResizeGrip] = { 0.60f, 0.60f, 0.60f, 1.00f };
+    c[ImGuiCol_ResizeGripHovered] = { 0.50f, 0.50f, 0.50f, 1.00f };
+    c[ImGuiCol_ResizeGripActive] = { 0.40f, 0.40f, 0.40f, 1.00f };
+    c[ImGuiCol_Tab] = { 0.75f, 0.75f, 0.75f, 1.00f };
+    c[ImGuiCol_TabHovered] = { 0.85f, 0.85f, 0.85f, 1.00f };
+    c[ImGuiCol_TabActive] = { 0.90f, 0.90f, 0.90f, 1.00f };
+    c[ImGuiCol_Text] = { 0.00f, 0.00f, 0.00f, 1.00f };
+    c[ImGuiCol_TextDisabled] = { 0.45f, 0.45f, 0.45f, 1.00f };
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(device, context);
@@ -125,34 +138,50 @@ bool Overlay::create(int width, int height) {
     return true;
 }
 
-// Keep the overlay window glued to the CS2 client area.
-// Called every frame from main.cpp so the overlay follows if the window moves.
+// Glue the overlay to the game's client area, and resize the swap chain if the
+// game's resolution changed. Without this, a windowed/borderless game that
+// isn't at (0,0) or that changes resolution silently misaligns every box.
 void Overlay::sync_to_game() {
-    if (!g_cs2_hwnd || !hwnd) return;
+    if (!hwnd || !g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) return;
 
-    RECT r{};
-    if (!GetClientRect(g_cs2_hwnd, &r)) return;
-    if (r.right <= 0 || r.bottom <= 0) return;
+    RECT rc{};
+    if (!GetClientRect(g_cs2_hwnd, &rc)) return;
 
     POINT tl{ 0, 0 };
-    ClientToScreen(g_cs2_hwnd, &tl);
+    if (!ClientToScreen(g_cs2_hwnd, &tl)) return;
 
-    const int w = r.right;
-    const int h = r.bottom;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
 
-    SetWindowPos(hwnd, HWND_TOPMOST, tl.x, tl.y, w, h,
-                 SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-
-    if (w != width_ || h != height_) {
-        width_  = w;
-        height_ = h;
-        resize_buffers(w, h);
+    RECT cur{};
+    GetWindowRect(hwnd, &cur);
+    if (cur.left != tl.x || cur.top != tl.y ||
+        (cur.right - cur.left) != w || (cur.bottom - cur.top) != h) {
+        SetWindowPos(hwnd, HWND_TOPMOST, tl.x, tl.y, w, h, SWP_NOACTIVATE);
     }
+
+    if (w != width_ || h != height_) resize_buffers(w, h);
+}
+
+bool Overlay::resize_buffers(int width, int height) {
+    if (!swapchain || !context) return false;
+
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    release_rtv();
+
+    if (FAILED(swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
+                                        DXGI_FORMAT_UNKNOWN, 0)))
+        return false;
+
+    width_  = width;
+    height_ = height;
+    return create_rtv();
 }
 
 void Overlay::update_visibility_and_input() {
     HWND fg = GetForegroundWindow();
-    bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
+    const bool cs2_focused = (fg == g_cs2_hwnd || fg == hwnd);
 
     if (!cs2_focused) {
         if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
@@ -160,34 +189,39 @@ void Overlay::update_visibility_and_input() {
     }
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
 
+    // The overlay NEVER activates. It keeps WS_EX_NOACTIVATE at all times and
+    // only toggles click-through, so CS2 retains keyboard focus even while the
+    // menu is open. Clearing WS_EX_NOACTIVATE and calling SetForegroundWindow
+    // used to steal focus from the game and never give it back, which silently
+    // disabled any focus-gated feature.
+    //
+    // WS_EX_NOACTIVATE still allows the window to receive mouse clicks, so the
+    // menu stays fully usable.
     LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
     if (g_menu_open) {
         ex &= ~WS_EX_TRANSPARENT;
-        ex &= ~WS_EX_NOACTIVATE;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
         SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
-        SetForegroundWindow(hwnd);
     } else {
         ex |= WS_EX_TRANSPARENT;
-        ex |= WS_EX_NOACTIVATE;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
     }
+    ex |= WS_EX_NOACTIVATE;
+    SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
 }
 
 bool Overlay::init_dx11(int width, int height) {
     DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount                        = 2;
-    sd.BufferDesc.Width                   = (UINT)width;
-    sd.BufferDesc.Height                  = (UINT)height;
-    sd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator   = 0;
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = (UINT)width;
+    sd.BufferDesc.Height = (UINT)height;
+    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 0;
     sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags                              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow                       = hwnd;
-    sd.SampleDesc.Count                   = 1;
-    sd.Windowed                           = TRUE;
-    sd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hwnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
     D3D_FEATURE_LEVEL level;
     constexpr D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
@@ -197,13 +231,6 @@ bool Overlay::init_dx11(int width, int height) {
         0, levels, 1, D3D11_SDK_VERSION,
         &sd, &swapchain, &device, &level, &context
     ));
-}
-
-bool Overlay::resize_buffers(int width, int height) {
-    release_rtv();
-    swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
-                             DXGI_FORMAT_UNKNOWN, 0);
-    return create_rtv();
 }
 
 bool Overlay::create_rtv() {
@@ -232,6 +259,11 @@ void Overlay::end_frame() {
     context->OMSetRenderTargets(1, &rtv, nullptr);
     context->ClearRenderTargetView(rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    // Present was hardcoded as Present(1, 0) -- vsync forced on -- which locked
+    // the overlay to the refresh rate while the game ran far faster, so every
+    // box was drawn with a view matrix up to a full refresh stale. Uncapped, the
+    // matrix is only a few ms stale. The main loop caps the uncapped rate.
     swapchain->Present(g_vsync ? 1 : 0, 0);
 }
 
@@ -241,8 +273,8 @@ void Overlay::cleanup() {
     ImGui::DestroyContext();
     release_rtv();
     if (swapchain) { swapchain->Release(); swapchain = nullptr; }
-    if (context)   { context->Release();   context   = nullptr; }
-    if (device)    { device->Release();    device    = nullptr; }
-    if (hwnd)      { DestroyWindow(hwnd);  hwnd      = nullptr; }
+    if (context) { context->Release(); context = nullptr; }
+    if (device) { device->Release(); device = nullptr; }
+    if (hwnd) { DestroyWindow(hwnd); hwnd = nullptr; }
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 }
