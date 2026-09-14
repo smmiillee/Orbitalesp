@@ -16,8 +16,11 @@
 
 extern HWND g_cs2_hwnd;
 
-// The ESP instance lives in main.cpp.
+// The ESP instance and the local team both live in main.cpp. g_local_team is
+// already refreshed there every reader tick from the local pawn, so the trigger
+// reuses it instead of duplicating the state.
 extern ESP g_esp;
+extern int g_local_team;
 
 namespace {
 
@@ -141,7 +144,7 @@ void run_thread() {
 
         for (const PlayerESP& p : players) {
             if (p.team == 0) continue;
-            if (p.team == g_esp.local_team_now) continue;   // never teammates
+            if (g_local_team != 0 && p.team == g_local_team) continue;  // never teammates
 
             for (const Hit& h : kHits) {
                 if (!p.bone_ok[h.bone]) continue;
