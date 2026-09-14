@@ -81,35 +81,36 @@ public:
 
     int players_alive = 0;
 
-    // Status for features still being brought up. Bones drive the skeleton AND
-    // the triggerbot, so this stays until both are confirmed.
+    // Status for features still being brought up.
     bool      diag_bones_ok = false;
     uintptr_t diag_bone_node = 0, diag_bone_arr = 0;
     bool      diag_wsvc_ok = false;
     uintptr_t diag_wsvc = 0;
+    uintptr_t diag_c4_ent = 0;
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
 
 private:
+    struct C4Cand { bool on_node = true; uintptr_t off = 0; };
+
     struct Calib {
         uintptr_t chunk_off = offsets::kChunkOff;
         uintptr_t slot_stride = offsets::kSlotStride;
+
         uintptr_t bone_node = 0, bone_arr = 0;
         bool bones_ok = false;
         int  bone_fail = 0, probe_cd = 0;
 
-        // Weapon services offset. Held in Calib for symmetry; currently the
-        // radar-verified constant, not a discovered value.
-        uintptr_t wsvc = offsets::m_pWeaponServices;
-        bool      wsvc_ok = true;
+        uintptr_t wsvc = 0;
+        bool      wsvc_ok = false;
+        double    wsvc_try = 0.0;
 
-        // Planted C4 node offset, verified by a long stable run.
-        uintptr_t c4_off = 0;
-        bool c4_ok = false;
-        Vec3 c4_last{};
+        C4Cand c4_cand{};
+        bool   c4_ok = false;
+        Vec3   c4_last{};
         double c4_last_t = 0.0;
-        int  c4_stable = 0;
+        int    c4_stable = 0;
     } c_;
 
     std::vector<Track> tracks_;
