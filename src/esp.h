@@ -87,6 +87,7 @@ public:
     bool      diag_wsvc_ok = false;
     uintptr_t diag_wsvc = 0;
     uintptr_t diag_c4_ent = 0;
+    int       diag_defidx = 0;   // discovered def-index offset, 0 if not yet
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
@@ -105,6 +106,9 @@ private:
         uintptr_t wsvc = 0;
         bool      wsvc_ok = false;
         double    wsvc_try = 0.0;
+
+        // Def-index calibration is retried on a timer until it succeeds.
+        double defidx_try = -1e9;
 
         C4Cand c4_cand{};
         bool   c4_ok = false;
