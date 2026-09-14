@@ -98,6 +98,12 @@ private:
         uintptr_t bone_node = 0, bone_arr = 0;
         bool bones_ok = false;
         int  bone_fail = 0, probe_cd = 0;
+
+        // Weapon services offset. Held in Calib for symmetry; currently the
+        // radar-verified constant, not a discovered value.
+        uintptr_t wsvc = offsets::m_pWeaponServices;
+        bool      wsvc_ok = true;
+
         // Planted C4 node offset, verified by a long stable run.
         uintptr_t c4_off = 0;
         bool c4_ok = false;
