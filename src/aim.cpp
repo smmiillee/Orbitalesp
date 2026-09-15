@@ -1,4 +1,5 @@
 // --- src/aim.cpp ---
+// Triggerbot. Detection is read-only; firing injects a click.
 #include "aim.h"
 #include "esp.h"
 #include "memory.h"
@@ -22,8 +23,8 @@ extern int g_screen_h;
 namespace {
 
 // ---- HARDCODED BONE RADII ----
-// Authored against a 1080p reference and scaled by actual height, so the
-// behaviour is identical at any resolution without a user control.
+// Authored against a 1080p reference and scaled by actual height, so behaviour
+// is identical at any resolution. No user adjustment, as requested.
 struct Hit { int bone; const char* name; float radius_px_at_1080; };
 constexpr Hit kHits[] = {
     { BONE_HEAD,    "head",   14.0f },
@@ -50,8 +51,15 @@ std::atomic<int>   g_vis_samples{0}, g_vis_hits{0};
 
 std::thread g_thread;
 
+// The click must be held long enough to be sampled by a frame.
 constexpr double kClickMs = 12.0;
-constexpr double kCoolMs  = 120.0;
+
+// *** THIS WAS THE "DELAYED EVEN AT 0 ms" CAUSE ***
+// 120 ms of cooldown after every shot meant the effective cadence on a held
+// target was 120 ms regardless of the delay slider. The cooldown is now small --
+// just enough that one engagement is one bullet -- and the DELAY is the only
+// meaningful timing gate.
+constexpr double kCoolMs = 16.0;
 
 double now_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -85,7 +93,8 @@ void mouse(bool down) {
     SendInput(1, &in, sizeof(INPUT));
 }
 
-// Radar-spotted mask for a pawn. APPROXIMATE visibility, see aim.h.
+// Radar-spotted mask. APPROXIMATE visibility, see aim.h -- this is radar state,
+// not line of sight, so it cannot know what YOU can see.
 uint32_t spotted_mask(const Memory& mem, uintptr_t pawn) {
     return mem.read<uint32_t>(
         pawn + offsets::m_entitySpottedState + offsets::m_bSpottedByMask);
@@ -98,7 +107,7 @@ void run_thread() {
     double target_since = 0.0;
 
     // The vis check proves itself by ever reading a nonzero mask. Until it has,
-    // it is treated as untrustworthy and does not block firing.
+    // it is untrustworthy and does not block firing.
     bool vis_trusted = false;
 
     while (!g_stop.load()) {
@@ -125,13 +134,14 @@ void run_thread() {
             g_dbg_firing.store(false);
         }
 
-        // Cooldown clears the acquisition timer, so the full delay elapses
-        // after the cooldown ends rather than appearing to count from the
-        // previous shot.
         const double now = now_ms();
         if (now < next_shot) {
-            target_since = 0.0;
-            g_dbg_held.store(0);
+            // Do NOT clear target_since here. Clearing it meant the delay could
+            // never accumulate while a target was continuously held, so the
+            // delay appeared ignored. It keeps counting now, and the cooldown is
+            // short enough (16 ms) not to mask it.
+            if (target_since > 0.0)
+                g_dbg_held.store((int)(now - target_since));
             continue;
         }
 
@@ -156,12 +166,10 @@ void run_thread() {
             if (p.team == 0) continue;
 
             if (g_teamcheck.load() && g_local_team != 0 &&
-                p.team == g_local_team) {
-                // Only reported as a block if we were actually aiming at them.
+                p.team == g_local_team)
                 continue;
-            }
 
-            // Which hardcoded bone windows is the crosshair inside?
+            // Which hardcoded bone window is the crosshair inside?
             const Hit* in_bone = nullptr;
             for (const Hit& h : kHits) {
                 if (!p.bone_ok[h.bone]) continue;
@@ -180,15 +188,14 @@ void run_thread() {
             found = true;
 
             // ---- approximate visibility ----
-            if (g_vischeck.load()) {
+            if (g_vischeck.load() && p.pawn) {
                 const uint32_t mask = spotted_mask(g_mem, p.pawn);
                 ++g_vis_samples;
                 if (mask != 0) {
                     ++g_vis_hits;
-                    vis_trusted = true;   // the offset reads something real
+                    vis_trusted = true;
                 }
 
-                // Only enforce once the check has proved it works.
                 if (vis_trusted) {
                     if (mask == 0) {
                         blocked = true;
@@ -196,8 +203,6 @@ void run_thread() {
                         continue;
                     }
                     has_vis = true;
-                } else {
-                    g_dbg_visable.store(false);
                 }
             } else {
                 has_vis = true;
@@ -221,6 +226,8 @@ void run_thread() {
         const int held = (int)(now - target_since);
         g_dbg_held.store(held);
 
+        // With delay 0 this fires on the very next iteration, so 0 ms is
+        // genuinely instant rather than gated by anything else.
         if (held < g_delay.load()) continue;
 
         if (g_fire.load() && local_pawn) {
