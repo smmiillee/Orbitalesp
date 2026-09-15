@@ -121,12 +121,13 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Menu skin
-    ImVec4 menu_title  = { 0.00f, 0.00f, 0.70f, 1.00f };
-    ImVec4 menu_bg     = { 0.78f, 0.78f, 0.78f, 0.97f };
-    ImVec4 menu_button = { 0.88f, 0.80f, 0.55f, 1.00f };
-    ImVec4 menu_slider = { 0.55f, 0.55f, 0.55f, 1.00f };
-    ImVec4 menu_check  = { 0.00f, 0.00f, 0.00f, 1.00f };
+    // Menu skin. menu_button drives buttons AND sliders together; menu_checkbox
+    // is the box behind the check mark.
+    ImVec4 menu_title    = { 0.00f, 0.00f, 0.70f, 1.00f };
+    ImVec4 menu_bg       = { 0.78f, 0.78f, 0.78f, 0.97f };
+    ImVec4 menu_button   = { 0.88f, 0.80f, 0.55f, 1.00f };
+    ImVec4 menu_check    = { 0.00f, 0.00f, 0.00f, 1.00f };
+    ImVec4 menu_checkbox = { 1.00f, 1.00f, 1.00f, 1.00f };
 
     // Bhop -- timing locked in bhop.cpp, so only the toggle here.
     bool  bh_enabled = false;
@@ -178,7 +179,7 @@ static void save_config() {
     W_C(color_carrier);
 
     W_C(menu_title); W_C(menu_bg); W_C(menu_button);
-    W_C(menu_slider); W_C(menu_check);
+    W_C(menu_check); W_C(menu_checkbox);
 
     W_B(bh_enabled);
 
@@ -248,8 +249,8 @@ static void load_config() {
         else if (!strcmp(key,"menu_title"))        asC(g_cfg.menu_title);
         else if (!strcmp(key,"menu_bg"))           asC(g_cfg.menu_bg);
         else if (!strcmp(key,"menu_button"))       asC(g_cfg.menu_button);
-        else if (!strcmp(key,"menu_slider"))       asC(g_cfg.menu_slider);
         else if (!strcmp(key,"menu_check"))        asC(g_cfg.menu_check);
+        else if (!strcmp(key,"menu_checkbox"))     asC(g_cfg.menu_checkbox);
         else if (!strcmp(key,"bh_enabled"))        asB(g_cfg.bh_enabled);
         else if (!strcmp(key,"aim_enabled"))       asB(g_cfg.aim_enabled);
         else if (!strcmp(key,"aim_fire"))          asB(g_cfg.aim_fire);
@@ -641,7 +642,9 @@ static void apply_captured(int vk) {
     g_capture = CAPTURE_NONE;
 }
 
-// ── colour rows: swatch, right-click copy, middle-click paste, typed hex ──
+// ── colour rows: right-click copy, middle-click paste ────────────────────
+// The typed hex field is GONE. Text entry did not work in this build and the
+// colour picker itself already accepts direct entry, so this is simpler.
 static char   g_copy_flash[64] = "";
 static double g_copy_flash_at = -1e9;
 
@@ -685,9 +688,7 @@ static bool paste_color_from_clipboard(ImVec4* c) {
     return ok;
 }
 
-struct HexBuf { char text[16] = ""; };
-static std::map<std::string, HexBuf> g_hex_edit;
-
+// One swatch. Right-click copies the hex, middle-click pastes one.
 static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::ColorEdit4(id, &c->x,
         ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
@@ -719,37 +720,6 @@ static void color_row(const char* id, const char* label, ImVec4* c) {
 
     ImGui::SameLine();
     ImGui::Text("%s", label);
-
-    // ---- typed / pasted hex field ----
-    HexBuf& hb = g_hex_edit[id];
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(92.0f);
-    char idbuf[32];
-    std::snprintf(idbuf, sizeof(idbuf), "##hex%s", id);
-
-    const bool submitted = ImGui::InputText(
-        idbuf, hb.text, sizeof(hb.text),
-        ImGuiInputTextFlags_EnterReturnsTrue);
-
-    if (submitted) {
-        if (parse_color_text(hb.text, c)) {
-            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
-                          "%s  set to %s", label, hb.text);
-            g_copy_flash_at = now_ms();
-        } else {
-            std::snprintf(g_copy_flash, sizeof(g_copy_flash),
-                          "%s  could not parse \"%s\"", label, hb.text);
-            g_copy_flash_at = now_ms();
-        }
-    }
-
-    // Keep the field showing the live colour while it is not being edited.
-    if (!ImGui::IsItemActive())
-        std::snprintf(hb.text, sizeof(hb.text), "%s", hex);
-
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("type or paste a hex, then press Enter\n"
-                          "clipboard paste works with Ctrl+V here too");
 }
 
 // ── tabs ─────────────────────────────────────────────────────────────────
@@ -983,13 +953,13 @@ static void tab_colors() {
     ImGui::Columns(2, nullptr, false);
     ImGui::SetColumnWidth(0, col_w);
 
-    color_row("##mt", "Title bar",    &g_cfg.menu_title);
-    color_row("##mm", "Background",   &g_cfg.menu_bg);
-    color_row("##mb", "Buttons",      &g_cfg.menu_button);
+    color_row("##mt", "Title bar",      &g_cfg.menu_title);
+    color_row("##mm", "Background",     &g_cfg.menu_bg);
+    color_row("##mb", "Buttons + sliders", &g_cfg.menu_button);
 
     ImGui::NextColumn();
-    color_row("##ms", "Slider bg",    &g_cfg.menu_slider);
-    color_row("##mk", "Check marks",  &g_cfg.menu_check);
+    color_row("##mk", "Check marks",    &g_cfg.menu_check);
+    color_row("##mx", "Checkmark Box",  &g_cfg.menu_checkbox);
 
     ImGui::Columns(1);
 }
@@ -1029,9 +999,17 @@ void render_menu() {
         st.Colors[ImGuiCol_TitleBg]       = g_cfg.menu_title;
         st.Colors[ImGuiCol_TitleBgActive] = g_cfg.menu_title;
         st.Colors[ImGuiCol_WindowBg]      = g_cfg.menu_bg;
+        // Buttons and sliders share one colour.
         st.Colors[ImGuiCol_Button]        = g_cfg.menu_button;
-        st.Colors[ImGuiCol_SliderGrab]    = g_cfg.menu_slider;
+        st.Colors[ImGuiCol_ButtonHovered] = g_cfg.menu_button;
+        st.Colors[ImGuiCol_ButtonActive]  = g_cfg.menu_button;
+        st.Colors[ImGuiCol_SliderGrab]    = g_cfg.menu_button;
+        st.Colors[ImGuiCol_SliderGrabActive] = g_cfg.menu_button;
         st.Colors[ImGuiCol_CheckMark]     = g_cfg.menu_check;
+        // The box behind the check mark.
+        st.Colors[ImGuiCol_FrameBg]        = g_cfg.menu_checkbox;
+        st.Colors[ImGuiCol_FrameBgHovered] = g_cfg.menu_checkbox;
+        st.Colors[ImGuiCol_FrameBgActive]  = g_cfg.menu_checkbox;
     }
 
     // Keybind capture runs before any widget is built, so a captured key cannot
