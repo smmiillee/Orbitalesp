@@ -823,12 +823,17 @@ static void tab_aim() {
 
     ImGui::SetNextItemWidth(240.0f);
     if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 600,
-                         "delay %d ms"))
+                         "reaction %d ms"))
         Aim_SetDelay(g_cfg.aim_delay);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Target must stay acquired this long before firing,\n"
-                          "measured from re-acquiring. 0 = instant.\n"
-                          "The cooldown is separate and starts after firing.");
+        ImGui::SetTooltip("Reaction time before the FIRST shot after acquiring\n"
+                          "a target. 0 = fire on the next loop iteration (1 ms).\n\n"
+                          "It does NOT gate sustained fire. While the crosshair\n"
+                          "stays on target the button is HELD, so the game fires\n"
+                          "at the weapon's own rate of fire -- the maximum\n"
+                          "possible. Release the arm key or leave the target and\n"
+                          "the button is released, so re-entering is a fresh edge\n"
+                          "for semi-automatic weapons.");
 
     ImGui::TextDisabled("bone radii are hardcoded (no adjustment)");
 
