@@ -132,13 +132,10 @@ struct Config {
     // Bhop -- timing locked in bhop.cpp, so only the toggle here.
     bool  bh_enabled = false;
 
-    // Triggerbot
+    // Triggerbot. Team check, vis check and firing are hardcoded in aim.cpp,
+    // so only the enable flag and the arm key are configured.
     bool  aim_enabled = false;
-    bool  aim_fire = true;
     int   aim_key = 0;              // 0 = unbound = off
-    bool  aim_teamcheck = true;
-    bool  aim_vischeck = false;
-    int   aim_delay = 0;
 
     // Jumpbug
     bool  jb_enabled = false;
@@ -183,8 +180,7 @@ static void save_config() {
 
     W_B(bh_enabled);
 
-    W_B(aim_enabled); W_B(aim_fire); W_I(aim_key);
-    W_B(aim_teamcheck); W_B(aim_vischeck); W_I(aim_delay);
+    W_B(aim_enabled); W_I(aim_key);
 
     W_B(jb_enabled); W_I(jb_key);
     W_F(jb_crouch_lead); W_F(jb_uncrouch_height);
@@ -253,11 +249,7 @@ static void load_config() {
         else if (!strcmp(key,"menu_checkbox"))     asC(g_cfg.menu_checkbox);
         else if (!strcmp(key,"bh_enabled"))        asB(g_cfg.bh_enabled);
         else if (!strcmp(key,"aim_enabled"))       asB(g_cfg.aim_enabled);
-        else if (!strcmp(key,"aim_fire"))          asB(g_cfg.aim_fire);
         else if (!strcmp(key,"aim_key"))           asI(g_cfg.aim_key);
-        else if (!strcmp(key,"aim_teamcheck"))     asB(g_cfg.aim_teamcheck);
-        else if (!strcmp(key,"aim_vischeck"))      asB(g_cfg.aim_vischeck);
-        else if (!strcmp(key,"aim_delay"))         asI(g_cfg.aim_delay);
         else if (!strcmp(key,"jb_enabled"))        asB(g_cfg.jb_enabled);
         else if (!strcmp(key,"jb_key"))            asI(g_cfg.jb_key);
         else if (!strcmp(key,"jb_crouch_lead"))    asF(g_cfg.jb_crouch_lead);
@@ -367,35 +359,11 @@ static void use_monitor_size() {
     if (w > 0 && h > 0) { g_screen_w = w; g_screen_h = h; }
 }
 
-static constexpr int kSkeleton[][2] = {
-    { BONE_PELVIS,     BONE_SPINE_1    },
-    { BONE_SPINE_1,    BONE_SPINE_2    },
-    { BONE_SPINE_2,    BONE_CHEST      },
-    { BONE_CHEST,      BONE_NECK       },
-    { BONE_NECK,       BONE_HEAD       },
-    { BONE_NECK,       BONE_L_SHOULDER },
-    { BONE_L_SHOULDER, BONE_L_ELBOW    },
-    { BONE_L_ELBOW,    BONE_L_HAND     },
-    { BONE_NECK,       BONE_R_SHOULDER },
-    { BONE_R_SHOULDER, BONE_R_ELBOW    },
-    { BONE_R_ELBOW,    BONE_R_HAND     },
-    { BONE_PELVIS,     BONE_L_HIP      },
-    { BONE_L_HIP,      BONE_L_KNEE     },
-    { BONE_L_KNEE,     BONE_L_FOOT     },
-    { BONE_PELVIS,     BONE_R_HIP      },
-    { BONE_R_HIP,      BONE_R_KNEE     },
-    { BONE_R_KNEE,     BONE_R_FOOT     },
-};
-
 static void apply_feature_config() {
     Bhop_SetEnabled(g_cfg.bh_enabled);
 
     Aim_SetEnabled(g_cfg.aim_enabled);
-    Aim_SetFire(g_cfg.aim_fire);
     Aim_SetKey(g_cfg.aim_key);
-    Aim_SetTeamCheck(g_cfg.aim_teamcheck);
-    Aim_SetVisCheck(g_cfg.aim_vischeck);
-    Aim_SetDelay(g_cfg.aim_delay);
 
     Movement_SetJumpbug(g_cfg.jb_enabled);
     Movement_SetKey(g_cfg.jb_key);
@@ -462,12 +430,17 @@ void render_esp(ImDrawList* dl) {
             dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
                         pick(g_cfg.color_box), 0.0f, 0, g_cfg.box_thickness);
 
+        // The skeleton we draw IS the triggerbot's wireframe mesh. One shared
+        // table (kBoneLinks in esp.h) so the two can never disagree about which
+        // limbs exist.
         if (g_cfg.esp_skeleton && p.has_bones) {
             const ImU32 sk = pick(g_cfg.color_skel);
-            for (const auto& l : kSkeleton) {
-                if (!p.bone_ok[l[0]] || !p.bone_ok[l[1]]) continue;
-                dl->AddLine({ p.bones[l[0]].x, p.bones[l[0]].y },
-                            { p.bones[l[1]].x, p.bones[l[1]].y },
+            for (int i = 0; i < kBoneLinkCount; ++i) {
+                const int a = kBoneLinks[i].a;
+                const int b = kBoneLinks[i].b;
+                if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
+                dl->AddLine({ p.bones[a].x, p.bones[a].y },
+                            { p.bones[b].x, p.bones[b].y },
                             sk, g_cfg.box_thickness);
             }
         }
@@ -779,8 +752,8 @@ static void tab_esp() {
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "weapon svc: not found");
 
     if (g_esp.diag_defidx)
-        ImGui::TextDisabled("def index off: 0x%X (calibrated)",
-                            g_esp.diag_defidx);
+        ImGui::TextDisabled("def index off: 0x%X (calibrated)  x%d",
+                            g_esp.diag_defidx, g_esp.diag_defidx_n);
     else
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
                            "def index: calibrating...");
@@ -800,42 +773,11 @@ static void tab_aim() {
     if (ImGui::Checkbox("Triggerbot", &g_cfg.aim_enabled))
         Aim_SetEnabled(g_cfg.aim_enabled);
 
-    if (ImGui::Checkbox("Firing (injects left click)", &g_cfg.aim_fire))
-        Aim_SetFire(g_cfg.aim_fire);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Unticked: still detects and shows the indicator,\n"
-                          "but never clicks. That makes it read-only.");
-
-    if (ImGui::Checkbox("Team check", &g_cfg.aim_teamcheck))
-        Aim_SetTeamCheck(g_cfg.aim_teamcheck);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Do not fire at teammates.");
-
-    if (ImGui::Checkbox("Visibility check (approximate)", &g_cfg.aim_vischeck))
-        Aim_SetVisCheck(g_cfg.aim_vischeck);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Uses m_bSpottedByMask, which is RADAR state, not\n"
-                          "line of sight -- it reflects teammates' spotting.\n"
-                          "A real wall check needs a raycast, which an external\n"
-                          "cannot do. It SELF-DISABLES if the mask never reads\n"
-                          "nonzero, so it cannot silently block every shot.\n"
-                          "Smoke and flash are not detectable this way.");
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 600,
-                         "reaction %d ms"))
-        Aim_SetDelay(g_cfg.aim_delay);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Reaction time before the FIRST shot after acquiring\n"
-                          "a target. 0 = fire on the next loop iteration (1 ms).\n\n"
-                          "It does NOT gate sustained fire. While the crosshair\n"
-                          "stays on target the button is HELD, so the game fires\n"
-                          "at the weapon's own rate of fire -- the maximum\n"
-                          "possible. Release the arm key or leave the target and\n"
-                          "the button is released, so re-entering is a fresh edge\n"
-                          "for semi-automatic weapons.");
-
-    ImGui::TextDisabled("bone radii are hardcoded (no adjustment)");
+    ImGui::TextDisabled("team check: ON (hardcoded)");
+    ImGui::TextDisabled("vis check:  ON (hardcoded)");
+    ImGui::TextDisabled("firing:     ON (hardcoded)");
+    ImGui::TextDisabled("hit test:   wireframe mesh (all bone links)");
+    ImGui::TextDisabled("shot pacing: hardcoded per weapon");
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
@@ -850,15 +792,16 @@ static void tab_aim() {
         ImGui::TextDisabled("on target: no");
     ImGui::TextDisabled("firing: %s   blocked by: %s",
                         ad.firing ? "yes" : "no", ad.blocked_by);
+    ImGui::TextDisabled("weapon id: %d", ad.weapon_id);
 
-    if (g_cfg.aim_vischeck) {
-        if (ad.vis_usable)
-            ImGui::TextDisabled("vis: active (%d/%d masks nonzero)",
-                                ad.vis_hits, ad.vis_samples);
-        else
-            ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-                "vis: DISABLED - mask always 0 (%d samples)", ad.vis_samples);
-    }
+    // vis check state, since it can turn itself off
+    if (ad.vis_usable)
+        ImGui::TextDisabled("vis: active (%d/%d masks nonzero)",
+                            ad.vis_hits, ad.vis_samples);
+    else
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+            "vis: NOT trusted yet - mask always 0 (%d samples)",
+            ad.vis_samples);
 }
 
 static void tab_movement() {
