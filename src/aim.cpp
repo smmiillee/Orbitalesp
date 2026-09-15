@@ -172,16 +172,26 @@ void run_thread() {
     double target_since = 0.0;   // when the current target was acquired
 
     while (!g_stop.load()) {
-        std::this_thread::yield();
-
         const int k = g_key.load();
         const bool gate = g_on.load() && g_mem.is_valid() && cs2_focused() &&
                           k != 0 && ((GetAsyncKeyState(k) & 0x8000) != 0);
 
+        // *** FPS FIX: THE LOOP USED TO SPIN ***
+        // This was an unbounded `yield()` loop at TIME_CRITICAL priority, and
+        // each iteration called project() -- which takes the ESP mutex and does
+        // a ReadProcessMemory for the view matrix. That is thousands of syscalls
+        // and lock acquisitions per second, competing with the render thread for
+        // the same mutex on the same core. It was the single biggest cost this
+        // process added to the game's frame time.
+        //
+        // Now: idle sleeps 10 ms (essentially free), and while armed it runs at
+        // 2 ms -- 500 Hz, which is far faster than any weapon's cycle time and
+        // well above what a triggerbot needs.
         if (!gate) {
             if (held) { mouse_up(); held = false; }
             g_firing.store(false);
             target_since = 0.0;
+            wait_ms(10.0);
             continue;
         }
 
@@ -294,6 +304,14 @@ void run_thread() {
             held = false;
             g_firing.store(false);
         }
+    }
+
+    // Throttle while armed too, so the armed loop cannot become a spin.
+    wait_ms(2.0);
+    }
+
+    // Throttle while armed too, so the armed loop cannot become a spin.
+    wait_ms(2.0);
     }
 
     if (held) mouse_up();
