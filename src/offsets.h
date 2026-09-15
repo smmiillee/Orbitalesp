@@ -77,6 +77,23 @@ namespace offsets {
     constexpr uint32_t  kFlagDucking    = 1u << 2;
     constexpr uint32_t  kGroundEntityNone = 0xFFFFFFFFu;
 
+    // ── model hitboxes ────────────────────────────────────────────────────
+    // VERIFIED: CHitBox field layout, from Valve's schema dump
+    // (SteamTracking/GameTracking-CS2, modellib/CHitBox.h).
+    constexpr uintptr_t kHitBoxStride      = 0x50;
+    constexpr uintptr_t kHitBoxMinBounds   = 0x18;  // Vector
+    constexpr uintptr_t kHitBoxMaxBounds   = 0x24;  // Vector
+    constexpr uintptr_t kHitBoxShapeRadius = 0x30;  // float32
+    constexpr uintptr_t kHitBoxBoneHash    = 0x34;  // uint32
+    constexpr uintptr_t kHitBoxGroupId     = 0x38;  // int32
+    constexpr uintptr_t kHitBoxShapeType   = 0x3C;  // uint8
+    constexpr uintptr_t kHitBoxIndex       = 0x48;  // uint16
+
+    // CModelState::m_hModel -- a CStrongHandle, NOT a plain pointer, so it must
+    // be resolved through the resource system. The deref chain is unverified;
+    // hitbox.cpp tries several depths and validates the result.
+    constexpr uintptr_t m_hModel = 0xA0;
+
     // ── visibility (APPROXIMATE, see aim.cpp) ─────────────────────────────
     // m_entitySpottedState is RADAR state, not line of sight. Schema-confirmed
     // offset for a current build:
