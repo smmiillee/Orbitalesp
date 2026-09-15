@@ -94,6 +94,15 @@ namespace offsets {
     // hitbox.cpp tries several depths and validates the result.
     constexpr uintptr_t m_hModel = 0xA0;
 
+    // ── CGameSceneNode -> CModelState ─────────────────────────────────────
+    // NOT a single value. m_modelState has shipped as 0x140, 0x150, 0x160 and
+    // 0x190 across builds, and on THIS build the bone array resolved at
+    // node+0x1C0 -- which is inconsistent with 0x190 + 0x80 = 0x210. So the
+    // hitbox code tries every candidate and validates, rather than assuming one.
+    constexpr uintptr_t kModelStateCand[] = { 0x140, 0x150, 0x160, 0x170, 0x190 };
+    constexpr int       kModelStateCandCount =
+        static_cast<int>(sizeof(kModelStateCand) / sizeof(kModelStateCand[0]));
+
     // ── visibility (APPROXIMATE, see aim.cpp) ─────────────────────────────
     // m_entitySpottedState is RADAR state, not line of sight. Schema-confirmed
     // offset for a current build:
