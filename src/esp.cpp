@@ -146,22 +146,26 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
 }
 
 // ===========================================================================
-// DEF-INDEX SELF-CALIBRATION, ACROSS WEAPON CLASSES
+// DEF-INDEX CALIBRATION
 //
-// Some weapons render as "#0" and others as lowercase designer names ("ak47").
-// The lowercase ones prove the DESIGNER chain works and that the def-index read
-// returns 0.
+// Some weapons render as "#0", others as lowercase designer names. The lowercase
+// ones prove the designer chain works and that the def-index read returns 0.
 //
-// A single global offset was not enough: m_iItemDefinitionIndex does NOT sit at
-// the same place on every weapon class. C_CSWeaponBase subclasses are distinct
-// types, so an offset calibrated from rifles reads 0 for pistols -- which is
-// exactly the "mostly pistols show #0" symptom.
+// A single offset is not enough: m_iItemDefinitionIndex does not sit at the same
+// place on every weapon class, so an offset calibrated from rifles reads 0 for
+// pistols. We therefore keep a LIST of offsets and try them all per weapon.
 //
-// So we keep a LIST of candidate offsets, calibrated by agreement with the
-// designer name, and try them all per weapon.
+// ROUND-1 PROBLEM, AND THE FIX
+// Calibration needs weapons to sample. It previously only sampled ENEMY pawns,
+// so before enough enemies had distinct weapons there was nothing to learn from
+// and it stayed "calibrating..." for the first rounds.
+//
+// Now the LOCAL player is always included, so there is always at least one
+// weapon to sample from round 1, and the retry is fast (250 ms) until something
+// is found, then slow (20 s) to KEEP learning as weapons change each round.
 // ===========================================================================
 
-constexpr int kMaxDefOff = 6;
+constexpr int kMaxDefOff = 8;
 
 uintptr_t g_def_offs[kMaxDefOff] = {};
 int       g_def_off_n = 0;
@@ -235,11 +239,7 @@ bool plausible_id_val(int id) {
            (id >= 500 && id <= 600);
 }
 
-bool g_defidx_done = false;
-
 uint16_t item_def_index(const Memory& mem, uintptr_t w) {
-    // Every calibrated candidate is tried, so a pistol offset and a rifle
-    // offset can both work.
     for (int i = 0; i < g_def_off_n; ++i) {
         const uint16_t v = mem.read<uint16_t>(w + g_def_offs[i]);
         if (v >= 1 && v <= 700) return v;
@@ -259,19 +259,29 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
 
 struct DefSample { uintptr_t w; int expect; };
 
-// Sample every DISTINCT designer name we can see, so more than one weapon class
-// is represented.
+// Sample every DISTINCT designer name available, including the local player.
 int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                    uintptr_t stride, const std::vector<uintptr_t>& pawns,
+                    uintptr_t stride, uintptr_t local_pawn,
+                    const std::vector<uintptr_t>& pawns,
                     DefSample* out, int max_out) {
     int n = 0;
-    char seen[16][24] = {};
+    char seen[24][24] = {};
     int  seen_n = 0;
 
+    // Local player FIRST: always present, so calibration can work round 1.
+    uintptr_t list[64];
+    int list_n = 0;
+    if (local_pawn) list[list_n++] = local_pawn;
     for (uintptr_t p : pawns) {
+        if (list_n >= 64) break;
+        if (p != local_pawn) list[list_n++] = p;
+    }
+
+    for (int pi = 0; pi < list_n; ++pi) {
         if (n >= max_out) break;
 
-        const uintptr_t ws = mem.read<uintptr_t>(p + offsets::m_pWeaponServices);
+        const uintptr_t ws =
+            mem.read<uintptr_t>(list[pi] + offsets::m_pWeaponServices);
         if (!valid_ptr(ws)) continue;
 
         const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
@@ -287,7 +297,7 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         for (int i = 0; i < seen_n; ++i)
             if (std::strcmp(seen[i], dn) == 0) { dup = true; break; }
         if (dup) continue;
-        if (seen_n < 16) std::snprintf(seen[seen_n++], 24, "%s", dn);
+        if (seen_n < 24) std::snprintf(seen[seen_n++], 24, "%s", dn);
 
         out[n].w = w;
         out[n].expect = designer_id(dn);
@@ -296,14 +306,14 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     return n;
 }
 
-// Calibrate a LIST of offsets. Any offset whose value agrees with a designer
-// reference is kept, so pistol offsets and rifle offsets can both be learned.
+// Merge any newly agreeing offsets into the list. Called repeatedly so offsets
+// for weapon classes that appear later are still learned.
 void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                      uintptr_t stride,
+                      uintptr_t stride, uintptr_t local_pawn,
                       const std::vector<uintptr_t>& pawns) {
     DefSample samples[24];
-    const int n = collect_samples(mem, el, chunk_off, stride, pawns,
-                                  samples, 24);
+    const int n = collect_samples(mem, el, chunk_off, stride, local_pawn,
+                                  pawns, samples, 24);
     if (n == 0) return;
 
     struct Best { uintptr_t off; int matches; int score; };
@@ -326,9 +336,6 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
             cands[cand_n++] = Best{ off, matches, score };
     }
 
-    // Keep the best few, ordered by agreement then plausibility. Several are
-    // needed because different weapon classes hold the field in different
-    // places.
     for (int i = 0; i < cand_n && g_def_off_n < kMaxDefOff; ++i) {
         int best = i;
         for (int j = i + 1; j < cand_n; ++j) {
@@ -341,7 +348,7 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         cands[i] = cands[best];
         cands[best] = tmp;
 
-        // Skip an offset that duplicates a value we already hold.
+        // Skip an offset that duplicates a value already held.
         bool dup = false;
         for (int k = 0; k < g_def_off_n; ++k) {
             const int a = mem.read<uint16_t>(samples[0].w + g_def_offs[k]);
@@ -420,6 +427,31 @@ bool ESP::world_to_screen(const Vec3& world, Vec2& screen,
     return true;
 }
 
+// Local player's active weapon def index, for the triggerbot's per-weapon
+// shot interval. Declared in esp.h.
+int ESP_LocalWeaponId(const Memory& mem, uintptr_t client_base) {
+    const uintptr_t lp =
+        mem.read<uintptr_t>(client_base + offsets::dwLocalPlayerPawn);
+    if (!valid_ptr(lp)) return 0;
+
+    const uintptr_t el =
+        mem.read<uintptr_t>(client_base + offsets::dwEntityList);
+    if (!valid_ptr(el)) return 0;
+
+    const uintptr_t ws = mem.read<uintptr_t>(lp + offsets::m_pWeaponServices);
+    if (!valid_ptr(ws)) return 0;
+
+    const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
+    if (!h || h == 0xFFFFFFFFu) return 0;
+
+    const uintptr_t w = resolve_handle(mem, el,
+                                       offsets::kChunkOff,
+                                       offsets::kSlotStride, h);
+    if (!valid_ptr(w)) return 0;
+
+    return item_def_index(mem, w);
+}
+
 void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     const double now = now_ms();
 
@@ -443,7 +475,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static double info_at  = -1e9;
     static bool   layout_locked = false;
 
-    // ---- pawn list ----
     if (now - slots_at > 100.0) {
         slots_at = now;
 
@@ -486,15 +517,15 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         else           pawns.clear();
     }
 
-    // ---- weapon services ----
-    if (!c_.wsvc_ok && now - c_.wsvc_try > 1000.0) {
+    if (!c_.wsvc_ok && now - c_.wsvc_try > 500.0) {
         c_.wsvc_try = now;
 
         std::vector<uintptr_t> probe = pawns;
         if (probe.empty()) probe.push_back(local_pawn);
+        probe.push_back(local_pawn);
 
         static const uintptr_t kCand[] = { 0x1208, 0x11E0, 0x11D8, 0x11E8,
-                                           0x1200, 0x1210 };
+                                           0x1200, 0x1210, 0x13F0 };
         bool found = false;
 
         for (uintptr_t off : kCand) {
@@ -507,7 +538,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 if (wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride, p, off))
                     ++extra;
             }
-            if (extra >= 1) {
+            if (extra >= 1 || probe.size() == 1) {
                 c_.wsvc = off; c_.wsvc_ok = true; found = true;
                 break;
             }
@@ -518,13 +549,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 if (!wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride,
                                 local_pawn, off))
                     continue;
-                int extra = 0;
-                for (uintptr_t p : probe) {
-                    if (p == local_pawn) continue;
-                    if (wsvc_valid(mem, el, c_.chunk_off, c_.slot_stride, p, off))
-                        ++extra;
-                }
-                if (extra >= 1) { c_.wsvc = off; c_.wsvc_ok = true; break; }
+                c_.wsvc = off; c_.wsvc_ok = true; break;
             }
         }
     }
@@ -532,19 +557,20 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_wsvc_ok = c_.wsvc_ok;
     diag_wsvc = c_.wsvc;
 
-    // ---- def-index offsets, calibrated from designer names ----
-    if (!g_defidx_done && c_.wsvc_ok && !pawns.empty() &&
-        now - c_.defidx_try > 2000.0) {
-        c_.defidx_try = now;
-
-        calibrate_defidx(mem, el, c_.chunk_off, c_.slot_stride, pawns);
-        if (g_def_off_n > 0) {
-            g_defidx_done = true;
-            diag_defidx = (int)g_def_offs[0];
+    // ---- def-index offsets ----
+    // Fast retry (250 ms) until something is found, then slow (20 s) to keep
+    // learning as weapons change between rounds.
+    {
+        const double retry = (g_def_off_n == 0) ? 250.0 : 20000.0;
+        if (c_.wsvc_ok && now - c_.defidx_try > retry) {
+            c_.defidx_try = now;
+            calibrate_defidx(mem, el, c_.chunk_off, c_.slot_stride,
+                             local_pawn, pawns);
+            if (g_def_off_n > 0) diag_defidx = (int)g_def_offs[0];
+            diag_defidx_n = g_def_off_n;
         }
     }
 
-    // ---- bone chain: seeds, then bounded scan ----
     if (!c_.bones_ok || c_.bone_fail > 250) {
         if (c_.probe_cd > 0) {
             --c_.probe_cd;
@@ -565,6 +591,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 { 0x330, 0x240 }, { 0x338, 0x240 },
                 { 0x330, 0x210 }, { 0x338, 0x210 },
                 { 0x330, 0x1E0 }, { 0x338, 0x1E0 },
+                { 0x330, 0x1C0 }, { 0x338, 0x1C0 },
             };
 
             for (const Seed& s : kSeeds) {
@@ -601,7 +628,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             }
 
             if (found) { c_.bones_ok = true; c_.bone_fail = 0; }
-            c_.probe_cd = 375;
+            c_.probe_cd = 125;
         }
     }
 
@@ -609,7 +636,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_bone_node = c_.bone_node;
     diag_bone_arr  = c_.bone_arr;
 
-    // ---- sample every live pawn ----
     std::vector<Track> fresh;
     fresh.reserve(pawns.size());
     int bone_hits = 0;
@@ -678,7 +704,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     if (c_.bones_ok && !pawns.empty() && bone_hits == 0) ++c_.bone_fail;
     else                                                c_.bone_fail = 0;
 
-    // ---- names, weapons, carrier ----
     static uintptr_t s_carrier = 0;
 
     if (now - info_at > 300.0) {
@@ -724,8 +749,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 continue;
             }
 
-            // Carried C4 is not the ACTIVE weapon, so once we know who the
-            // carrier is we keep marking them until they are no longer them.
             if (t.pawn == s_carrier) t.has_bomb = true;
 
             const char* nm = weapon_name(id);
@@ -744,7 +767,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         }
     }
 
-    // ---- planted C4 ----
     bool bomb_on = false;
     Vec3 bomb{};
 
