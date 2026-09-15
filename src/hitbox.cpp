@@ -103,69 +103,72 @@ bool Hitbox_Get(const Memory& mem, uintptr_t pawn, HitboxSetResult& out) {
         mem.read<uintptr_t>(pawn + offsets::m_pGameSceneNode);
     if (!valid_ptr(node)) return false;
 
-    const uintptr_t model_state = node + offsets::m_modelState;
-    if (!valid_ptr(model_state)) return false;
+    g_attempts.fetch_add(1);
 
-    // ---- attempt 1: resolve m_hModel (CStrongHandle) and scan for the set ----
-    // A CStrongHandle is not a plain pointer, so a few dereference depths are
-    // tried. Whatever we land on still has to pass validate_set(), which is what
-    // keeps a wrong deref from being used.
-    const uintptr_t handle =
-        mem.read<uintptr_t>(model_state + offsets::m_hModel);
-    if (!valid_ptr(handle)) {
-        g_status = "m_hModel handle not readable";
-        g_attempts.fetch_add(1);
-        return false;
-    }
+    // ---- try every candidate model-state offset, not just one ----
+    // m_modelState has shipped as several different values, so a single guess
+    // would fail on some builds. Whatever we land on still has to pass
+    // validate_set(), which is what keeps a wrong offset from being used.
+    for (int ci = 0; ci < offsets::kModelStateCandCount; ++ci) {
+        const uintptr_t model_state =
+            node + offsets::kModelStateCand[ci];
+        if (!valid_ptr(model_state)) continue;
 
-    uintptr_t models[4] = { handle, 0, 0, 0 };
-    models[1] = mem.read<uintptr_t>(handle);
-    if (valid_ptr(models[1]))
-        models[2] = mem.read<uintptr_t>(models[1]);
-    if (valid_ptr(models[2]))
-        models[3] = mem.read<uintptr_t>(models[2]);
+        // A CStrongHandle is not a plain pointer, so several dereference depths
+        // are tried.
+        const uintptr_t handle =
+            mem.read<uintptr_t>(model_state + offsets::m_hModel);
+        if (!valid_ptr(handle)) continue;
 
-    for (int mi = 0; mi < 4; ++mi) {
-        const uintptr_t model = models[mi];
-        if (!valid_ptr(model)) continue;
+        uintptr_t models[4] = { handle, 0, 0, 0 };
+        models[1] = mem.read<uintptr_t>(handle);
+        if (valid_ptr(models[1]))
+            models[2] = mem.read<uintptr_t>(models[1]);
+        if (valid_ptr(models[2]))
+            models[3] = mem.read<uintptr_t>(models[2]);
 
-        // Scan the model for a count + array-pointer pair that validates. The
-        // count is a small int followed closely by a pointer to the array.
-        for (uintptr_t off = 0x0; off <= 0x400; off += 4) {
-            const int count = mem.read<int>(model + off);
-            if (count < 8 || count > 40) continue;
+        for (int mi = 0; mi < 4; ++mi) {
+            const uintptr_t model = models[mi];
+            if (!valid_ptr(model)) continue;
 
-            for (uintptr_t poff = off + 4; poff <= off + 0x20; poff += 4) {
-                const uintptr_t arr = mem.read<uintptr_t>(model + poff);
-                if (!valid_ptr(arr)) continue;
-                if (!validate_set(mem, arr, count)) continue;
+            // Scan for a count + array-pointer pair that validates. The count is
+            // a small int followed closely by a pointer to the array.
+            for (uintptr_t off = 0x0; off <= 0x400; off += 4) {
+                const int count = mem.read<int>(model + off);
+                if (count < 8 || count > 40) continue;
 
-                // Validated. Read it out.
-                out.count = count;
-                for (int i = 0; i < count && i < 24; ++i) {
-                    RawHitbox h{};
-                    read_hitbox(mem, arr + (uintptr_t)i * 0x50, h);
+                for (uintptr_t poff = off + 4; poff <= off + 0x20; poff += 4) {
+                    const uintptr_t arr = mem.read<uintptr_t>(model + poff);
+                    if (!valid_ptr(arr)) continue;
+                    if (!validate_set(mem, arr, count)) continue;
 
-                    // Local bounds are in bone space. Without a verified bone
-                    // index we cannot transform yet, so store the local box and
-                    // leave bone unresolved; the caller falls back to the mesh.
-                    out.box[i].a    = h.min;
-                    out.box[i].b    = h.max;
-                    out.box[i].radius = h.radius;
-                    out.box[i].group  = h.group;
-                    out.box[i].bone   = -1;
+                    // Validated. Read it out.
+                    out.count = count;
+                    for (int i = 0; i < count && i < 24; ++i) {
+                        RawHitbox h{};
+                        read_hitbox(mem, arr + (uintptr_t)i * 0x50, h);
+
+                        // Local bounds are in bone space. Without a verified
+                        // parent-bone index we cannot transform them, so the box
+                        // is stored and bone left unresolved -- see the header.
+                        // Feeding half-reconstructed boxes to the triggerbot
+                        // would produce confidently wrong positions.
+                        out.box[i].a      = h.min;
+                        out.box[i].b      = h.max;
+                        out.box[i].radius = h.radius;
+                        out.box[i].group  = h.group;
+                        out.box[i].bone   = -1;
+                    }
+
+                    g_ready.store(true);
+                    g_status = "validated (bone index unresolved)";
+                    out.ready = false;   // deliberately not used yet
+                    return false;
                 }
-
-                g_ready.store(true);
-                g_status = "validated (bone index unresolved)";
-                g_attempts.fetch_add(1);
-                out.ready = false;   // see note in the header: not used yet
-                return false;
             }
         }
     }
 
     g_status = "no validated hitbox set found";
-    g_attempts.fetch_add(1);
     return false;
 }
