@@ -145,17 +145,26 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
     return out[0] != '\0';
 }
 
-// ---------------------------------------------------------------------------
-// DEF-INDEX SELF-CALIBRATION
+// ===========================================================================
+// DEF-INDEX SELF-CALIBRATION, ACROSS WEAPON CLASSES
 //
-// Some weapons render as "#0" and others as lowercase designer names ("ak47",
-// "hegrenade"). The lowercase ones prove the DESIGNER chain works and that the
-// def-index read returns 0. A wrong def index also breaks the bomb carrier and
-// the C4 entity scan, since both match on id 49.
+// Some weapons render as "#0" and others as lowercase designer names ("ak47").
+// The lowercase ones prove the DESIGNER chain works and that the def-index read
+// returns 0.
 //
-// So rather than guess another offset, we find it using the designer name as a
-// reference: if the designer says "ak47", the correct offset must read 7.
-// ---------------------------------------------------------------------------
+// A single global offset was not enough: m_iItemDefinitionIndex does NOT sit at
+// the same place on every weapon class. C_CSWeaponBase subclasses are distinct
+// types, so an offset calibrated from rifles reads 0 for pistols -- which is
+// exactly the "mostly pistols show #0" symptom.
+//
+// So we keep a LIST of candidate offsets, calibrated by agreement with the
+// designer name, and try them all per weapon.
+// ===========================================================================
+
+constexpr int kMaxDefOff = 6;
+
+uintptr_t g_def_offs[kMaxDefOff] = {};
+int       g_def_off_n = 0;
 
 struct DMap { const char* designer; int id; const char* pretty; };
 
@@ -226,10 +235,15 @@ bool plausible_id_val(int id) {
            (id >= 500 && id <= 600);
 }
 
-uintptr_t g_defidx_off = 0;
+bool g_defidx_done = false;
 
 uint16_t item_def_index(const Memory& mem, uintptr_t w) {
-    if (g_defidx_off) return mem.read<uint16_t>(w + g_defidx_off);
+    // Every calibrated candidate is tried, so a pistol offset and a rifle
+    // offset can both work.
+    for (int i = 0; i < g_def_off_n; ++i) {
+        const uint16_t v = mem.read<uint16_t>(w + g_def_offs[i]);
+        if (v >= 1 && v <= 700) return v;
+    }
 
     const uint16_t direct =
         mem.read<uint16_t>(w + offsets::m_iItemDefinitionIndex);
@@ -243,10 +257,10 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
     return direct;
 }
 
-// Collect a weapon sample for every DISTINCT designer name we can find, so the
-// calibration sees more than one weapon class.
 struct DefSample { uintptr_t w; int expect; };
 
+// Sample every DISTINCT designer name we can see, so more than one weapon class
+// is represented.
 int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                     uintptr_t stride, const std::vector<uintptr_t>& pawns,
                     DefSample* out, int max_out) {
@@ -282,9 +296,8 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     return n;
 }
 
-// Calibrate a LIST of offsets, not one. Any offset that agrees with a designer
-// reference anywhere in the sample set is kept, so pistol offsets and rifle
-// offsets can both be learned.
+// Calibrate a LIST of offsets. Any offset whose value agrees with a designer
+// reference is kept, so pistol offsets and rifle offsets can both be learned.
 void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                       uintptr_t stride,
                       const std::vector<uintptr_t>& pawns) {
@@ -294,7 +307,7 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     if (n == 0) return;
 
     struct Best { uintptr_t off; int matches; int score; };
-    Best cands[64];
+    Best cands[128];
     int cand_n = 0;
 
     for (uintptr_t off = 0x1000; off <= 0x1800; off += 2) {
@@ -309,10 +322,13 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                 score += 2;
             }
         }
-        if (matches >= 1 && cand_n < 64)
+        if (matches >= 1 && cand_n < 128)
             cands[cand_n++] = Best{ off, matches, score };
     }
 
+    // Keep the best few, ordered by agreement then plausibility. Several are
+    // needed because different weapon classes hold the field in different
+    // places.
     for (int i = 0; i < cand_n && g_def_off_n < kMaxDefOff; ++i) {
         int best = i;
         for (int j = i + 1; j < cand_n; ++j) {
@@ -325,6 +341,7 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         cands[i] = cands[best];
         cands[best] = tmp;
 
+        // Skip an offset that duplicates a value we already hold.
         bool dup = false;
         for (int k = 0; k < g_def_off_n; ++k) {
             const int a = mem.read<uint16_t>(samples[0].w + g_def_offs[k]);
@@ -515,13 +532,16 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     diag_wsvc_ok = c_.wsvc_ok;
     diag_wsvc = c_.wsvc;
 
-    // ---- def-index offset, calibrated from designer names ----
-    if (!g_defidx_off && c_.wsvc_ok && !pawns.empty() &&
+    // ---- def-index offsets, calibrated from designer names ----
+    if (!g_defidx_done && c_.wsvc_ok && !pawns.empty() &&
         now - c_.defidx_try > 2000.0) {
         c_.defidx_try = now;
-        g_defidx_off = calibrate_defidx(mem, el, c_.chunk_off,
-                                        c_.slot_stride, pawns);
-        diag_defidx = (int)g_defidx_off;
+
+        calibrate_defidx(mem, el, c_.chunk_off, c_.slot_stride, pawns);
+        if (g_def_off_n > 0) {
+            g_defidx_done = true;
+            diag_defidx = (int)g_def_offs[0];
+        }
     }
 
     // ---- bone chain: seeds, then bounded scan ----
@@ -659,6 +679,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     else                                                c_.bone_fail = 0;
 
     // ---- names, weapons, carrier ----
+    static uintptr_t s_carrier = 0;
+
     if (now - info_at > 300.0) {
         info_at = now;
 
@@ -686,17 +708,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             const uintptr_t ws = mem.read<uintptr_t>(t.pawn + c_.wsvc);
             if (!valid_ptr(ws)) continue;
 
-            // *** CARRIED C4 IS NOT THE ACTIVE WEAPON ***
-            // The carrier was only detected once they HELD the bomb, because we
-            // only looked at m_hActiveWeapon. A C4 on someone's back is one of
-            // their carried weapons, not the active one -- hence "only shows
-            // when in hands".
-            //
-            // So we scan the entity list for the C4 entity and read its OWNER
-            // instead. That is state-independent: the bomb entity exists and
-            // points at its owner whether it is held or slung.
-            static uintptr_t s_carrier = 0;
-
             const uint32_t hw =
                 mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
             if (!hw || hw == 0xFFFFFFFFu) continue;
@@ -712,10 +723,10 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 std::snprintf(t.weapon, sizeof(t.weapon), "C4");
                 continue;
             }
-            if (t.pawn == s_carrier) {
-                // Not holding it any more, but may still be carrying it.
-                t.has_bomb = true;
-            }
+
+            // Carried C4 is not the ACTIVE weapon, so once we know who the
+            // carrier is we keep marking them until they are no longer them.
+            if (t.pawn == s_carrier) t.has_bomb = true;
 
             const char* nm = weapon_name(id);
             if (nm) {
@@ -748,7 +759,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         if (looks_like_entity(mem, inner)) c4 = inner;
     }
 
-    if (!c4 && g_defidx_off && !pawns.empty()) {
+    if (!c4 && g_def_off_n > 0 && !pawns.empty()) {
         static std::vector<uintptr_t> c4_slots;
         static double c4_scan_at = -1e9;
 
@@ -922,7 +933,7 @@ std::vector<PlayerESP> ESP::project(const Memory& mem, uintptr_t client_base,
         if (e.box_h < 5.0f) continue;
 
         e.box_w     = e.box_h * 0.45f;
-        e.pawn      = t.pawn;      // needed by the triggerbot's vis check
+        e.pawn      = t.pawn;
         e.health    = t.health;
         e.team      = t.team;
         e.distance  = t.distance;
