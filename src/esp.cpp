@@ -243,14 +243,19 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
     return direct;
 }
 
-uintptr_t calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
-                           uintptr_t stride,
-                           const std::vector<uintptr_t>& pawns) {
-    struct Sample { uintptr_t w; int expect; };
-    std::vector<Sample> samples;
+// Collect a weapon sample for every DISTINCT designer name we can find, so the
+// calibration sees more than one weapon class.
+struct DefSample { uintptr_t w; int expect; };
+
+int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                    uintptr_t stride, const std::vector<uintptr_t>& pawns,
+                    DefSample* out, int max_out) {
+    int n = 0;
+    char seen[16][24] = {};
+    int  seen_n = 0;
 
     for (uintptr_t p : pawns) {
-        if (samples.size() >= 6) break;
+        if (n >= max_out) break;
 
         const uintptr_t ws = mem.read<uintptr_t>(p + offsets::m_pWeaponServices);
         if (!valid_ptr(ws)) continue;
@@ -264,35 +269,72 @@ uintptr_t calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         char dn[24] = {};
         if (!read_designer(mem, w, dn, sizeof(dn))) continue;
 
-        samples.push_back({ w, designer_id(dn) });
+        bool dup = false;
+        for (int i = 0; i < seen_n; ++i)
+            if (std::strcmp(seen[i], dn) == 0) { dup = true; break; }
+        if (dup) continue;
+        if (seen_n < 16) std::snprintf(seen[seen_n++], 24, "%s", dn);
+
+        out[n].w = w;
+        out[n].expect = designer_id(dn);
+        ++n;
     }
+    return n;
+}
 
-    if (samples.empty()) return 0;
+// Calibrate a LIST of offsets, not one. Any offset that agrees with a designer
+// reference anywhere in the sample set is kept, so pistol offsets and rifle
+// offsets can both be learned.
+void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
+                      uintptr_t stride,
+                      const std::vector<uintptr_t>& pawns) {
+    DefSample samples[24];
+    const int n = collect_samples(mem, el, chunk_off, stride, pawns,
+                                  samples, 24);
+    if (n == 0) return;
 
-    uintptr_t best_off = 0;
-    int best_score = 0;
-    int best_matches = 0;
+    struct Best { uintptr_t off; int matches; int score; };
+    Best cands[64];
+    int cand_n = 0;
 
     for (uintptr_t off = 0x1000; off <= 0x1800; off += 2) {
-        int score = 0;
-        int matches = 0;
+        int score = 0, matches = 0;
 
-        for (const Sample& s : samples) {
-            const int id = mem.read<uint16_t>(s.w + off);
+        for (int i = 0; i < n; ++i) {
+            const int id = mem.read<uint16_t>(samples[i].w + off);
             if (!plausible_id_val(id)) continue;
             ++score;
-            if (s.expect && id == s.expect) { ++matches; score += 2; }
+            if (samples[i].expect && id == samples[i].expect) {
+                ++matches;
+                score += 2;
+            }
         }
-
-        if (matches >= 1 && score > best_score) {
-            best_score = score;
-            best_matches = matches;
-            best_off = off;
-        }
+        if (matches >= 1 && cand_n < 64)
+            cands[cand_n++] = Best{ off, matches, score };
     }
 
-    if (best_matches < 1) return 0;
-    return best_off;
+    for (int i = 0; i < cand_n && g_def_off_n < kMaxDefOff; ++i) {
+        int best = i;
+        for (int j = i + 1; j < cand_n; ++j) {
+            if (cands[j].matches > cands[best].matches ||
+                (cands[j].matches == cands[best].matches &&
+                 cands[j].score > cands[best].score))
+                best = j;
+        }
+        const Best tmp = cands[i];
+        cands[i] = cands[best];
+        cands[best] = tmp;
+
+        bool dup = false;
+        for (int k = 0; k < g_def_off_n; ++k) {
+            const int a = mem.read<uint16_t>(samples[0].w + g_def_offs[k]);
+            const int b = mem.read<uint16_t>(samples[0].w + cands[i].off);
+            if (a == b && a != 0) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        g_def_offs[g_def_off_n++] = cands[i].off;
+    }
 }
 
 struct BE { Vec3 pos; float pad[5]; };
@@ -644,6 +686,17 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             const uintptr_t ws = mem.read<uintptr_t>(t.pawn + c_.wsvc);
             if (!valid_ptr(ws)) continue;
 
+            // *** CARRIED C4 IS NOT THE ACTIVE WEAPON ***
+            // The carrier was only detected once they HELD the bomb, because we
+            // only looked at m_hActiveWeapon. A C4 on someone's back is one of
+            // their carried weapons, not the active one -- hence "only shows
+            // when in hands".
+            //
+            // So we scan the entity list for the C4 entity and read its OWNER
+            // instead. That is state-independent: the bomb entity exists and
+            // points at its owner whether it is held or slung.
+            static uintptr_t s_carrier = 0;
+
             const uint32_t hw =
                 mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
             if (!hw || hw == 0xFFFFFFFFu) continue;
@@ -655,8 +708,13 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             const uint16_t id = item_def_index(mem, w);
             if (id == offsets::kItemDefC4) {
                 t.has_bomb = true;
+                s_carrier = t.pawn;
                 std::snprintf(t.weapon, sizeof(t.weapon), "C4");
                 continue;
+            }
+            if (t.pawn == s_carrier) {
+                // Not holding it any more, but may still be carrying it.
+                t.has_bomb = true;
             }
 
             const char* nm = weapon_name(id);
