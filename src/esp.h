@@ -22,6 +22,46 @@ enum BoneId : int {
     BONE_GUN = 24, BONE_EYE_L = 25, BONE_EYE_R = 26, BONE_COUNT = 32,
 };
 
+// ---------------------------------------------------------------------------
+// THE WIREFRAME MESH
+//
+// These segments ARE the hitbox skeleton: CS2 hitboxes are capsules laid out
+// around the bone chain, and each capsule's axis is the segment between two
+// bones. So this table doubles as
+//   * the skeleton we DRAW, and
+//   * the mesh the TRIGGERBOT tests against.
+//
+// Testing distance to a SEGMENT instead of to a joint is the whole point: it
+// covers the limb between two bones, so the crosshair no longer has to land
+// exactly on a joint to count as a hit.
+//
+// inline constexpr gives one definition across translation units, so esp.cpp
+// and aim.cpp share this table rather than each keeping a copy that could drift.
+// ---------------------------------------------------------------------------
+struct BoneLink { int a, b; };
+
+inline constexpr BoneLink kBoneLinks[] = {
+    { BONE_PELVIS,     BONE_SPINE_1    },
+    { BONE_SPINE_1,    BONE_SPINE_2    },
+    { BONE_SPINE_2,    BONE_CHEST      },
+    { BONE_CHEST,      BONE_NECK       },
+    { BONE_NECK,       BONE_HEAD       },
+    { BONE_NECK,       BONE_L_SHOULDER },
+    { BONE_L_SHOULDER, BONE_L_ELBOW    },
+    { BONE_L_ELBOW,    BONE_L_HAND     },
+    { BONE_NECK,       BONE_R_SHOULDER },
+    { BONE_R_SHOULDER, BONE_R_ELBOW    },
+    { BONE_R_ELBOW,    BONE_R_HAND     },
+    { BONE_PELVIS,     BONE_L_HIP      },
+    { BONE_L_HIP,      BONE_L_KNEE     },
+    { BONE_L_KNEE,     BONE_L_FOOT     },
+    { BONE_PELVIS,     BONE_R_HIP      },
+    { BONE_R_HIP,      BONE_R_KNEE     },
+    { BONE_R_KNEE,     BONE_R_FOOT     },
+};
+inline constexpr int kBoneLinkCount =
+    static_cast<int>(sizeof(kBoneLinks) / sizeof(kBoneLinks[0]));
+
 struct Snap {
     double t = 0.0;
     Vec3   origin{}, head{};
@@ -42,16 +82,14 @@ struct Track {
     Snap hist[kHist];
     int  count = 0, head = 0;
     void push(const Snap& s) {
-        hist[head] = s; head = (head + 1) % kHist;
+        hist[head] = s;
+        head = (head + 1) % kHist;
         if (count < kHist) ++count;
     }
 };
 
 struct PlayerESP {
-    // The entity pointer, so a caller can read per-entity fields it needs --
-    // the triggerbot's visibility check reads m_bSpottedByMask from here.
-    uintptr_t pawn = 0;
-
+    uintptr_t pawn = 0;   // needed by the triggerbot's vis check
     Vec2  screen_head{}, screen_top{}, screen_feet{};
     std::array<Vec2, BONE_COUNT> bones{};
     std::array<bool, BONE_COUNT> bone_ok{};
@@ -76,7 +114,6 @@ public:
 
     void update_world(const Memory& mem, uintptr_t client_base);
 
-    // interpolate=false gives the newest sample with no delay (triggerbot).
     std::vector<PlayerESP> project(const Memory& mem, uintptr_t client_base,
                                    int screen_w, int screen_h,
                                    bool interpolate = true);
@@ -85,12 +122,12 @@ public:
 
     int players_alive = 0;
 
-    // Status for the parts still being brought up.
     bool      diag_bones_ok = false;
     uintptr_t diag_bone_node = 0, diag_bone_arr = 0;
     bool      diag_wsvc_ok = false;
     uintptr_t diag_wsvc = 0;
     int       diag_defidx = 0;
+    int       diag_defidx_n = 0;   // how many offsets are known
     uintptr_t diag_c4_ent = 0;
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
@@ -124,3 +161,7 @@ private:
     bool  bomb_active_ = false;
     Vec3  bomb_origin_{};
 };
+
+// Def index of the local player's ACTIVE weapon, 0 if unknown. The triggerbot
+// uses it to pick a hardcoded per-weapon shot interval.
+int ESP_LocalWeaponId(const Memory& mem, uintptr_t client_base);
