@@ -22,22 +22,9 @@ enum BoneId : int {
     BONE_GUN = 24, BONE_EYE_L = 25, BONE_EYE_R = 26, BONE_COUNT = 32,
 };
 
-// ---------------------------------------------------------------------------
-// THE WIREFRAME MESH
-//
-// These segments ARE the hitbox skeleton: CS2 hitboxes are capsules laid out
-// around the bone chain, and each capsule's axis is the segment between two
-// bones. So this table doubles as
-//   * the skeleton we DRAW, and
-//   * the mesh the TRIGGERBOT tests against.
-//
-// Testing distance to a SEGMENT instead of to a joint is the whole point: it
-// covers the limb between two bones, so the crosshair no longer has to land
-// exactly on a joint to count as a hit.
-//
-// inline constexpr gives one definition across translation units, so esp.cpp
-// and aim.cpp share this table rather than each keeping a copy that could drift.
-// ---------------------------------------------------------------------------
+// THE WIREFRAME MESH. CS2 hitboxes are capsules whose axis runs between two
+// bones, so these links double as (a) the skeleton we draw and (b) the mesh the
+// triggerbot tests against. One shared table, so the two cannot disagree.
 struct BoneLink { int a, b; };
 
 inline constexpr BoneLink kBoneLinks[] = {
@@ -122,13 +109,11 @@ public:
 
     int players_alive = 0;
 
-    bool      diag_bones_ok = false;
-    uintptr_t diag_bone_node = 0, diag_bone_arr = 0;
-    bool      diag_wsvc_ok = false;
-    uintptr_t diag_wsvc = 0;
-    int       diag_defidx = 0;
-    int       diag_defidx_n = 0;   // how many offsets are known
-    uintptr_t diag_c4_ent = 0;
+    // Minimal status: only what is needed to tell whether the weapon path ran.
+    bool diag_bones_ok = false;
+    int  diag_weapon_named = 0;
+    int  diag_weapon_total = 0;
+    int  diag_defidx_n = 0;
 
     static bool world_to_screen(const Vec3& world, Vec2& screen,
                                 const Matrix4x4& vm, int screen_w, int screen_h);
@@ -162,6 +147,6 @@ private:
     Vec3  bomb_origin_{};
 };
 
-// Def index of the local player's ACTIVE weapon, 0 if unknown. The triggerbot
-// uses it to pick a hardcoded per-weapon shot interval.
+// Def index of the local player's active weapon, 0 if unknown. Used by the
+// triggerbot to pick a hardcoded per-weapon shot interval.
 int ESP_LocalWeaponId(const Memory& mem, uintptr_t client_base);
