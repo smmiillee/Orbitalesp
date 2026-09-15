@@ -18,12 +18,9 @@
 #include "offsets.h"
 #include "bhop.h"
 #include "aim.h"
-#include "movement.h"
 #include "radar.h"
 
-// NON-STATIC BY REQUIREMENT: aim.cpp declares these extern, so they must have
-// external linkage. `static` at file scope would give internal linkage and the
-// linker would not see them at all.
+// NON-STATIC: aim.cpp declares these extern, so they need external linkage.
 ESP g_esp;
 int g_screen_w = 1920;
 int g_screen_h = 1080;
@@ -39,7 +36,7 @@ static int  g_detected_hz = 0;
 static bool g_limit_fps = true;
 static int  g_fps_override = 0;
 
-// ── logging ──────────────────────────────────────────────────────────────
+// ---- logging: startup only, not per frame ----
 static FILE* g_log = nullptr;
 
 static void open_log() {
@@ -64,7 +61,8 @@ void OrbitalLog(const char* fmt, ...) {
     vfprintf(g_log, fmt, ap);
     va_end(ap);
     fputc('\n', g_log);
-    fflush(g_log);
+    // No fflush here any more: it was called on every line and flushes are not
+    // free. The handle is flushed at close instead.
 }
 
 static void sidecar_path(wchar_t* out, size_t cap, const wchar_t* name) {
@@ -86,7 +84,6 @@ static double now_ms() {
                std::chrono::steady_clock::now() - t0).count();
 }
 
-// ── clipboard ────────────────────────────────────────────────────────────
 static void copy_to_clipboard(const char* text) {
     if (!OpenClipboard(nullptr)) return;
     EmptyClipboard();
@@ -121,35 +118,25 @@ struct Config {
     ImVec4 color_bomb    = { 1.00f, 0.45f, 0.00f, 1.00f };
     ImVec4 color_carrier = { 1.00f, 0.25f, 0.95f, 1.00f };
 
-    // Menu skin. menu_button drives buttons AND sliders together; menu_checkbox
-    // is the box behind the check mark.
     ImVec4 menu_title    = { 0.00f, 0.00f, 0.70f, 1.00f };
     ImVec4 menu_bg       = { 0.78f, 0.78f, 0.78f, 0.97f };
     ImVec4 menu_button   = { 0.88f, 0.80f, 0.55f, 1.00f };
     ImVec4 menu_check    = { 0.00f, 0.00f, 0.00f, 1.00f };
     ImVec4 menu_checkbox = { 1.00f, 1.00f, 1.00f, 1.00f };
 
-    // Bhop -- timing locked in bhop.cpp, so only the toggle here.
-    bool  bh_enabled = false;
+    // Bhop
+    bool bh_enabled = false;
 
-    // Triggerbot. Team check, vis check and firing are hardcoded in aim.cpp,
-    // so only the enable flag, the arm key and the reaction delay are set here.
-    bool  aim_enabled = false;
-    int   aim_key = 0;              // 0 = unbound = off
-    int   aim_delay = 0;            // reaction time before the first shot
+    // Triggerbot
+    bool aim_enabled = false;
+    int  aim_key = 0;
+    int  aim_delay = 0;
 
-    // Jumpbug
-    bool  jb_enabled = false;
-    int   jb_key = 0;               // 0 = unbound = off
-    float jb_crouch_lead = 31.0f;
-    float jb_uncrouch_height = 11.0f;
-
-    // Radar (tab hidden for now, values kept)
-    int   radar_port = 3000;
-    int   radar_sel = 0;
+    // Radar (tab hidden for now; kept wired for later)
+    int radar_port = 3000;
+    int radar_sel = 0;
 } g_cfg;
 
-// ── config file ──────────────────────────────────────────────────────────
 static void save_config() {
     wchar_t path[MAX_PATH]{};
     sidecar_path(path, MAX_PATH, L"orbital.cfg");
@@ -180,11 +167,7 @@ static void save_config() {
     W_C(menu_check); W_C(menu_checkbox);
 
     W_B(bh_enabled);
-
     W_B(aim_enabled); W_I(aim_key); W_I(aim_delay);
-
-    W_B(jb_enabled); W_I(jb_key);
-    W_F(jb_crouch_lead); W_F(jb_uncrouch_height);
 
     W_I(radar_port); W_I(radar_sel);
 
@@ -194,7 +177,6 @@ static void save_config() {
 #undef W_C
 
     fclose(f);
-    OrbitalLog("config saved");
 }
 
 static void load_config() {
@@ -252,15 +234,10 @@ static void load_config() {
         else if (!strcmp(key,"aim_enabled"))       asB(g_cfg.aim_enabled);
         else if (!strcmp(key,"aim_key"))           asI(g_cfg.aim_key);
         else if (!strcmp(key,"aim_delay"))         asI(g_cfg.aim_delay);
-        else if (!strcmp(key,"jb_enabled"))        asB(g_cfg.jb_enabled);
-        else if (!strcmp(key,"jb_key"))            asI(g_cfg.jb_key);
-        else if (!strcmp(key,"jb_crouch_lead"))    asF(g_cfg.jb_crouch_lead);
-        else if (!strcmp(key,"jb_uncrouch_height"))asF(g_cfg.jb_uncrouch_height);
         else if (!strcmp(key,"radar_port"))        asI(g_cfg.radar_port);
         else if (!strcmp(key,"radar_sel"))         asI(g_cfg.radar_sel);
     }
     fclose(f);
-    OrbitalLog("config loaded");
 }
 
 static int query_refresh_rate(HWND game) {
@@ -276,6 +253,8 @@ static int query_refresh_rate(HWND game) {
     return (hz < 30 || hz > 1000) ? 0 : hz;
 }
 
+// Sleep the bulk, spin only the last stretch. Kept as short as possible so the
+// frame loop is not itself burning CPU.
 static void wait_until(std::chrono::steady_clock::time_point deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
@@ -284,14 +263,14 @@ static void wait_until(std::chrono::steady_clock::time_point deadline) {
         if (left > std::chrono::milliseconds(2))
             std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
         else
-            std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
 // ── game window lookup ───────────────────────────────────────────────────
 // FindWindowA("SDL_app") returns the FIRST match in Z-order, and CS2 does not
-// keep the game window in front of its own detached console. Taking the first
-// match landed us on a 192x456 console window, so we enumerate and pick best.
+// keep the game window in front of its own detached console. So we enumerate
+// and pick the largest titled SDL window.
 struct WindowCand { HWND hwnd; int w, h; bool titled; };
 
 static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
@@ -314,8 +293,6 @@ static BOOL CALLBACK enum_windows_proc(HWND h, LPARAM lp) {
     const bool titled = (wcsstr(title, L"Counter-Strike") != nullptr);
 
     list->push_back(WindowCand{ h, w, hh, titled });
-    OrbitalLog("  sdl window 0x%p client %dx%d titled=%d", h, w, hh,
-               titled ? 1 : 0);
     return TRUE;
 }
 
@@ -335,6 +312,8 @@ static HWND locate_game_window() {
     return (h && IsWindow(h)) ? h : nullptr;
 }
 
+// Re-locates the window only when the cached handle is dead, so the expensive
+// EnumWindows path does not run while everything is fine.
 static bool refresh_game_window() {
     if (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) {
         RECT r{};
@@ -344,14 +323,17 @@ static bool refresh_game_window() {
             return true;
         }
     }
+
     const HWND h = locate_game_window();
     if (!h) return false;
+
     RECT r{};
     if (!GetClientRect(h, &r) || r.right <= 0 || r.bottom <= 0) return false;
+
     g_cs2_hwnd = h;
     g_screen_w = r.right;
     g_screen_h = r.bottom;
-    OrbitalLog("game window chosen 0x%p %dx%d", h, g_screen_w, g_screen_h);
+    OrbitalLog("game window: 0x%p %dx%d", h, g_screen_w, g_screen_h);
     return true;
 }
 
@@ -368,23 +350,18 @@ static void apply_feature_config() {
     Aim_SetKey(g_cfg.aim_key);
     Aim_SetDelay(g_cfg.aim_delay);
 
-    Movement_SetJumpbug(g_cfg.jb_enabled);
-    Movement_SetKey(g_cfg.jb_key);
-    Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
-    Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
-
     Radar_SetPort(g_cfg.radar_port);
     Radar_SetSelection(g_cfg.radar_sel);
 }
 
+// Reader thread: world samples. Bhop and the trigger own their own threads.
 void memory_thread() {
     while (g_running && !g_mem.attach(L"cs2.exe"))
         wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(2));
 
-    OrbitalLog("memory attach: %s", g_mem.is_valid() ? "ok" : "FAILED");
+    OrbitalLog("attached");
     Bhop_Init();
     Aim_Init();
-    Movement_Init();
     Radar_Init();
     apply_feature_config();
 
@@ -407,6 +384,7 @@ void render_esp(ImDrawList* dl) {
 
     const std::vector<PlayerESP> players =
         g_esp.project(g_mem, g_mem.client_dll, g_screen_w, g_screen_h);
+
     const float lh = ImGui::GetTextLineHeight();
 
     for (const auto& p : players) {
@@ -433,14 +411,12 @@ void render_esp(ImDrawList* dl) {
             dl->AddRect({ cx - bw / 2.0f, top }, { cx + bw / 2.0f, bot },
                         pick(g_cfg.color_box), 0.0f, 0, g_cfg.box_thickness);
 
-        // The skeleton we draw IS the triggerbot's wireframe mesh. One shared
-        // table (kBoneLinks in esp.h) so the two can never disagree about which
-        // limbs exist.
+        // The skeleton drawn IS the triggerbot's wireframe mesh -- one shared
+        // table (kBoneLinks in esp.h) so they cannot disagree.
         if (g_cfg.esp_skeleton && p.has_bones) {
             const ImU32 sk = pick(g_cfg.color_skel);
             for (int i = 0; i < kBoneLinkCount; ++i) {
-                const int a = kBoneLinks[i].a;
-                const int b = kBoneLinks[i].b;
+                const int a = kBoneLinks[i].a, b = kBoneLinks[i].b;
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
                 dl->AddLine({ p.bones[a].x, p.bones[a].y },
                             { p.bones[b].x, p.bones[b].y },
@@ -514,7 +490,7 @@ void render_esp(ImDrawList* dl) {
 }
 
 // ── keybind capture ──────────────────────────────────────────────────────
-enum { CAPTURE_NONE = -1, CAPTURE_AIM = 0, CAPTURE_JUMPBUG = 1 };
+enum { CAPTURE_NONE = -1, CAPTURE_AIM = 0 };
 
 static int  g_capture = CAPTURE_NONE;
 static bool g_capture_wait_release = false;
@@ -543,8 +519,8 @@ static const char* vk_name(int vk) {
     return buf;
 }
 
-// Returns the newly pressed key, or 0. Everything must be released first, so
-// the click that opened capture cannot be recorded as the bind itself.
+// Returns the newly pressed key, or 0. Everything must be released first so the
+// click that opened capture cannot become the bind.
 static int capture_poll() {
     if (g_capture == CAPTURE_NONE) return 0;
 
@@ -566,8 +542,6 @@ static int capture_poll() {
     return 0;
 }
 
-// label + current bind + a "set" button that captures the next input.
-// UNBOUND MEANS OFF: there is no "always on".
 static void keybind_row(const char* label, int* vk, int target) {
     const bool unbound = (*vk == 0);
 
@@ -600,31 +574,20 @@ static void keybind_row(const char* label, int* vk, int target) {
             *vk = 0;
         }
     }
-
-    if (unbound && g_capture != target) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(off until bound)");
-    }
 }
 
 static void apply_captured(int vk) {
     if (g_capture == CAPTURE_AIM) {
         g_cfg.aim_key = vk;
         Aim_SetKey(vk);
-    } else if (g_capture == CAPTURE_JUMPBUG) {
-        g_cfg.jb_key = vk;
-        Movement_SetKey(vk);
     }
     g_capture = CAPTURE_NONE;
 }
 
 // ── colour rows: right-click copy, middle-click paste ────────────────────
-// The typed hex field is GONE. Text entry did not work in this build and the
-// colour picker itself already accepts direct entry, so this is simpler.
 static char   g_copy_flash[64] = "";
 static double g_copy_flash_at = -1e9;
 
-// Accepts "#RRGGBB", "#RRGGBBAA", "R,G,B" or "R,G,B,A".
 static bool parse_color_text(const char* txt, ImVec4* out) {
     unsigned r = 0, g = 0, b = 0, a = 255;
     int got = 0;
@@ -652,7 +615,6 @@ static bool parse_color_text(const char* txt, ImVec4* out) {
 
 static bool paste_color_from_clipboard(ImVec4* c) {
     if (!OpenClipboard(nullptr)) return false;
-
     bool ok = false;
     if (HANDLE h = GetClipboardData(CF_TEXT)) {
         if (const char* txt = (const char*)GlobalLock(h)) {
@@ -664,7 +626,6 @@ static bool paste_color_from_clipboard(ImVec4* c) {
     return ok;
 }
 
-// One swatch. Right-click copies the hex, middle-click pastes one.
 static void color_row(const char* id, const char* label, ImVec4* c) {
     ImGui::ColorEdit4(id, &c->x,
         ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel |
@@ -737,16 +698,10 @@ static void tab_esp() {
                           "30-45 ms is the sweet spot; 0 disables it.");
 
     ImGui::Columns(1);
-
-    // One line, only to confirm the weapon path ran. 0/N means it did not.
-    if (g_esp.diag_weapon_total > 0)
-        ImGui::TextDisabled("weapons named: %d/%d",
-                            g_esp.diag_weapon_named, g_esp.diag_weapon_total);
 }
 
 static void tab_aim() {
     ImGui::TextDisabled("[ Triggerbot ]");
-    ImGui::TextDisabled("detection: read-only     firing: injects a click");
     ImGui::Separator();
 
     if (ImGui::Checkbox("Triggerbot", &g_cfg.aim_enabled))
@@ -758,70 +713,19 @@ static void tab_aim() {
         Aim_SetDelay(g_cfg.aim_delay);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Reaction time before the FIRST shot after acquiring\n"
-                          "a target. 0 = fire on the next loop iteration (1 ms).\n"
+                          "a target. 0 = fire on the next loop iteration.\n"
                           "Once firing, the weapon's own cycle time paces the\n"
                           "shots, so this does not slow sustained fire.");
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
-
-
 }
 
 static void tab_movement() {
-    ImGui::TextDisabled("[ Jumpbug ]");
-    ImGui::TextDisabled("injects CTRL + SPACE; nothing is written to CS2");
-    ImGui::Separator();
-
-    if (ImGui::Checkbox("Jumpbug", &g_cfg.jb_enabled))
-        Movement_SetJumpbug(g_cfg.jb_enabled);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Crouch during the fall, then uncrouch AND jump\n"
-                          "9-11 units above the ground. The uncrouch-then-jump\n"
-                          "order is what produces the bug.");
-
-    ImGui::Spacing();
-    keybind_row("arm key", &g_cfg.jb_key, CAPTURE_JUMPBUG);
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##jbc", &g_cfg.jb_crouch_lead, 4.0f, 200.0f,
-                           "crouch %.0f ms before landing"))
-        Movement_SetCrouchLead(g_cfg.jb_crouch_lead);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How early to crouch. 31 ms is two ticks, which is\n"
-                          "what the reference jumpbug uses.");
-
-    ImGui::SetNextItemWidth(240.0f);
-    if (ImGui::SliderFloat("##jbh", &g_cfg.jb_uncrouch_height, 2.0f, 30.0f,
-                           "uncrouch at %.0f units above ground"))
-        Movement_SetUncrouchHeight(g_cfg.jb_uncrouch_height);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The real timing control, and it is a HEIGHT rather\n"
-                          "than a delay, because the ms window depends on fall\n"
-                          "speed. The documented window is 9-11 units above\n"
-                          "the ground; 11 triggers on entry.");
-
-    const MovementDebug md = Movement_GetDebug();
-    ImGui::Separator();
-    ImGui::Text("ground: %s   crouching: %s   jumping: %s",
-        md.on_ground ? "YES" : "no", md.crouching ? "yes" : "no",
-        md.jumping ? "yes" : "no");
-
-    // game_ducked is the GAME's own crouch flag. If we are crouching but the
-    // game does not think we are, our CTRL never registered and no timing
-    // change will help.
-    if (md.crouching && !md.game_ducked)
-        ImGui::TextColored({ 1.0f, 0.4f, 0.0f, 1.0f },
-                           "game does NOT see the crouch (CTRL not registering)");
-    else
-        ImGui::TextDisabled("game crouch: %s", md.game_ducked ? "yes" : "no");
-
-    ImGui::TextDisabled("height %.1f units   tti %.1f ms   jumpbugs %d",
-        md.height, md.tti, md.jumpbugs);
-
-    ImGui::Separator();
     ImGui::TextDisabled("[ Bhop ]");
     ImGui::TextDisabled("HOLD SPACE - no auto-jump, no keybind");
+    ImGui::Separator();
+
     if (ImGui::Checkbox("Bhop (space)", &g_cfg.bh_enabled))
         Bhop_SetEnabled(g_cfg.bh_enabled);
 
@@ -837,7 +741,7 @@ static void tab_movement() {
 
 static void tab_colors() {
     ImGui::Checkbox("Use team colours", &g_cfg.team_colors);
-    ImGui::TextDisabled("right-click copy   middle-click paste   or type a hex");
+    ImGui::TextDisabled("right-click copy   middle-click paste");
     ImGui::Separator();
 
     const float col_w = ImGui::GetContentRegionAvail().x * 0.62f;
@@ -877,9 +781,7 @@ static void tab_colors() {
 }
 
 static void tab_misc() {
-    ImGui::TextDisabled("[ Config ]");
-    ImGui::TextDisabled("orbital.cfg next to the exe");
-    ImGui::TextDisabled("saved automatically on exit");
+    ImGui::TextDisabled("orbital.cfg is saved next to the exe on exit.");
     ImGui::Spacing();
     ImGui::Spacing();
 
@@ -897,48 +799,37 @@ static void tab_misc() {
     if (ImGui::Button("[Exit]", { bw, 0 })) g_running = false;
 
     ImGui::Spacing();
-    ImGui::TextDisabled("[ game window ]");
-    ImGui::TextDisabled("found: %s",
-        (g_cs2_hwnd && IsWindow(g_cs2_hwnd)) ? "yes" : "NO");
-    ImGui::TextDisabled("viewport: %dx%d", g_screen_w, g_screen_h);
-    ImGui::TextDisabled("refresh: %d Hz", g_detected_hz);
+    ImGui::TextDisabled("INSERT - menu    F9 - exit");
 }
 
 void render_menu() {
-    // Menu skin, reapplied every frame so the pickers are live.
     {
         ImGuiStyle& st = ImGui::GetStyle();
         st.Colors[ImGuiCol_TitleBg]       = g_cfg.menu_title;
         st.Colors[ImGuiCol_TitleBgActive] = g_cfg.menu_title;
         st.Colors[ImGuiCol_WindowBg]      = g_cfg.menu_bg;
-        // Buttons and sliders share one colour.
         st.Colors[ImGuiCol_Button]        = g_cfg.menu_button;
         st.Colors[ImGuiCol_ButtonHovered] = g_cfg.menu_button;
         st.Colors[ImGuiCol_ButtonActive]  = g_cfg.menu_button;
         st.Colors[ImGuiCol_SliderGrab]    = g_cfg.menu_button;
         st.Colors[ImGuiCol_SliderGrabActive] = g_cfg.menu_button;
         st.Colors[ImGuiCol_CheckMark]     = g_cfg.menu_check;
-        // The box behind the check mark.
         st.Colors[ImGuiCol_FrameBg]        = g_cfg.menu_checkbox;
         st.Colors[ImGuiCol_FrameBgHovered] = g_cfg.menu_checkbox;
         st.Colors[ImGuiCol_FrameBgActive]  = g_cfg.menu_checkbox;
     }
 
-    // Keybind capture runs before any widget is built, so a captured key cannot
-    // also trigger a button in the same frame.
+    // Capture runs before any widget, so a captured key cannot also click.
     {
         const int vk = capture_poll();
         if (vk) {
-            if (vk == VK_ESCAPE) {
-                g_capture = CAPTURE_NONE;
-            } else {
-                apply_captured(vk);
-            }
+            if (vk == VK_ESCAPE) g_capture = CAPTURE_NONE;
+            else                 apply_captured(vk);
         }
     }
 
-    ImGui::SetNextWindowSize({ 640.0f, 560.0f }, ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints({ 540.0f, 320.0f }, { 1040.0f, 900.0f });
+    ImGui::SetNextWindowSize({ 620.0f, 480.0f }, ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints({ 520.0f, 300.0f }, { 1040.0f, 900.0f });
     ImGui::SetNextWindowPos({ 20.0f, 20.0f }, ImGuiCond_Once);
     ImGui::Begin("Orbital - Mars", nullptr);
 
@@ -946,8 +837,7 @@ void render_menu() {
         ImGui::TextColored({ 1.0f, 0.5f, 0.0f, 1.0f }, "[ waiting for CS2 ]");
     else
         ImGui::TextColored({ 0.0f, 0.7f, 0.0f, 1.0f },
-            "[ attached  %dx%d  %d Hz  %d players ]",
-            g_screen_w, g_screen_h, g_detected_hz, g_esp.players_alive);
+            "[ attached  %dx%d  %d Hz ]", g_screen_w, g_screen_h, g_detected_hz);
 
     ImGui::Separator();
 
@@ -967,31 +857,22 @@ void render_menu() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    OrbitalLog("=== orbital start ===");
     Overlay::enable_dpi_awareness();
-    load_config();
 
     bool have = false;
     for (int i = 0; i < 20 && !have; ++i) {
         have = refresh_game_window();
         if (!have) std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
-    if (!have) {
-        OrbitalLog("game window NOT found after 5s - using monitor size");
-        use_monitor_size();
-    }
+    if (!have) use_monitor_size();
+
     g_detected_hz = query_refresh_rate(g_cs2_hwnd);
-    OrbitalLog("refresh %d Hz", g_detected_hz);
+    load_config();
 
     Overlay overlay;
-    if (!overlay.create(g_screen_w, g_screen_h)) {
-        OrbitalLog("overlay.create FAILED");
-        return 1;
-    }
-    OrbitalLog("overlay created %dx%d", g_screen_w, g_screen_h);
+    if (!overlay.create(g_screen_w, g_screen_h)) return 1;
 
     std::thread mem_t(memory_thread);
-    OrbitalLog("entering message loop");
 
     MSG msg{};
     while (g_running) {
@@ -1015,7 +896,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             g_menu_open = !g_menu_open;
         if (GetAsyncKeyState(VK_F9) & 1) g_running = false;
 
-        refresh_game_window();
+        // Only re-locate the window when the cached handle died; the scan is
+        // the expensive part and it does not need to run when all is well.
+        if (!g_cs2_hwnd || !IsWindow(g_cs2_hwnd)) refresh_game_window();
         overlay.sync_to_game();
 
         overlay.begin_frame();
@@ -1024,12 +907,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (g_menu_open) render_menu();
         overlay.end_frame();
 
+        // Refresh rate is only needed to pick a frame cap, so poll it rarely
+        // rather than every frame.
         static auto next_hz = std::chrono::steady_clock::now();
         const auto now_tp = std::chrono::steady_clock::now();
         if (now_tp >= next_hz) {
             const int hz = query_refresh_rate(g_cs2_hwnd);
             if (hz) g_detected_hz = hz;
-            next_hz = now_tp + std::chrono::seconds(2);
+            next_hz = now_tp + std::chrono::seconds(5);
         }
 
         if (!g_vsync) {
@@ -1046,13 +931,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
     }
 
-    OrbitalLog("shutting down");
     save_config();
     g_running = false;
     mem_t.join();
     Bhop_Shutdown();
     Aim_Shutdown();
-    Movement_Shutdown();
     Radar_Shutdown();
     overlay.cleanup();
     g_mem.detach();
