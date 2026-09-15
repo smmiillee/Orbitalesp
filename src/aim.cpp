@@ -23,62 +23,36 @@ extern int g_screen_h;
 namespace {
 
 // ===========================================================================
-// HARDCODED BEHAVIOUR
+// HARDCODED BEHAVIOUR -- no toggles, always on.
 // ===========================================================================
-constexpr bool kTeamCheck = true;
-constexpr bool kFiring    = true;
+constexpr bool kTeamCheck = true;    // never shoot teammates
+constexpr bool kVisCheck  = true;    // soft visibility gate
+constexpr bool kFiring    = true;    // inject clicks
 
-// ===========================================================================
-// VIS CHECK -- READ THIS BEFORE EXPECTING IT TO BE EXACT
-//
-// m_bSpotted / m_bSpottedByMask is RADAR state. It answers "has anyone on my
-// team spotted this enemy recently", NOT "can I see them". Two consequences:
-//
-//   * It PERSISTS. An enemy seen by a teammate then moving behind a wall still
-//     reads spotted, so a hard gate shoots that wall.
-//   * It LAGS for you. An enemy YOU can see but no teammate has spotted reads
-//     zero, so a hard gate refuses to fire -- which is exactly the "holding a
-//     tight angle and it will not shoot" case.
-//
-// So it cannot be made exact externally. What we do instead is use it as a SOFT
-// gate: only block once the mask has read zero CONTINUOUSLY for a while. A brief
-// appearance is never blocked, and sustained occlusion does get blocked.
-//
-// Set kVisCheck to false to disable it entirely; the soft window is the only
-// tuning knob and it is deliberately generous.
-// ===========================================================================
-constexpr bool   kVisCheck = true;
-constexpr double kVisBlockAfterMs = 400.0;  // sustained occlusion before blocking
+// Sustained-occlusion window before the vis check blocks. It only applies when
+// the mask reads ZERO, so it cannot stop wall shots -- the wall case is the mask
+// staying at 1 after sight breaks, which is radar persistence. A short window
+// blocks faster on zeros, which is the same condition as a tight-angle refusal.
+constexpr double kVisBlockAfterMs = 400.0;
 
-// Once the offset has read nonzero at least once we consider it usable. Until
-// then it never blocks, so a wrong offset cannot refuse every shot. This is what
-// makes the first rounds permissive rather than broken.
+// How many nonzero mask reads before the vis check is trusted. Until then it
+// never blocks, so a wrong offset cannot refuse every shot.
 constexpr int kVisTrustSamples = 1;
 
 // ===========================================================================
-// HIT TEST: WIREFRAME MESH AT A WORLD-SPACE RADIUS
+// HIT TEST: WIREFRAME MESH WITH A WORLD-SPACE RADIUS
 //
-// The previous version used a radius fixed in SCREEN PIXELS, which is wrong: a
-// distant player's limbs project tiny, so a fixed pixel radius over-covers them
-// and fires beside the body. Near players get under-covered.
-//
-// The radius is now in WORLD units and converted to pixels per hitbox using the
-// projection scale, so the margin is proportional at every distance.
+// The radius is in WORLD units and converted per target using the projected
+// height, so the margin is proportional at every distance. A fixed pixel radius
+// would over-cover far targets and under-cover near ones.
 // ===========================================================================
-constexpr float kMeshRadiusUnits = 4.5f;   // world-space tube radius
-constexpr float kHeadRadiusUnits = 3.2f;   // head sphere is tighter
+constexpr float kMeshRadiusUnits = 4.5f;
+constexpr float kHeadRadiusUnits = 3.2f;
+constexpr bool  kPreferHead      = true;
 
-// Head-only bonus: the head sphere is tested separately because it is not a
-// link, and it is the most valuable hitbox.
-constexpr bool kPreferHead = true;
-
-// ===========================================================================
-// EXTRA HITBOX POINTS
-//
-// The bone chain alone leaves gaps: the clavicles, spine_0 and the hands/feet
-// are sparse. These links fill in the torso shoulders and the limbs so the mesh
-// covers the whole playermodel rather than just the main joints.
-// ===========================================================================
+// Extra links to fill the gaps the bone chain leaves -- clavicles, spine_0 and
+// the forearms -- so the mesh covers the playermodel rather than just the main
+// joints.
 struct ExtraLink { int a, b; };
 constexpr ExtraLink kExtraLinks[] = {
     { BONE_SPINE_0,    BONE_SPINE_1    },
@@ -93,7 +67,7 @@ constexpr ExtraLink kExtraLinks[] = {
 constexpr int kExtraLinkCount =
     static_cast<int>(sizeof(kExtraLinks) / sizeof(kExtraLinks[0]));
 
-// ---- per-weapon shot interval, ms ----
+// ---- per-weapon shot interval, ms: cycle times, so shots pace to the gun ----
 struct WeaponTiming { int id; int interval_ms; };
 constexpr WeaponTiming kTimings[] = {
     {  1, 267 },  {  2, 120 },  {  3, 150 },  {  4, 150 },
@@ -116,17 +90,9 @@ int weapon_interval(int id) {
 }
 
 std::atomic<bool> g_stop{false}, g_started{false};
-std::atomic<bool> g_on{false};
+std::atomic<bool> g_on{false}, g_firing{false};
 std::atomic<int>  g_key{0};
-
-std::atomic<bool>  g_dbg_firing{false}, g_dbg_on{false};
-std::atomic<bool>  g_dbg_vis_ok{false}, g_dbg_vis_trust{false};
-std::atomic<bool>  g_dbg_vis_blocked{false};
-std::atomic<const char*> g_dbg_hit{"-"};
-std::atomic<float> g_dbg_dist{-1.0f};
-std::atomic<int>   g_dbg_weapon{0};
-std::atomic<float> g_dbg_radius{-1.0f};
-std::atomic<int>   g_vis_samples{0}, g_vis_hits{0};
+std::atomic<int>  g_delay{0};
 
 std::thread g_thread;
 
@@ -178,20 +144,13 @@ float point_segment_dist(const Vec2& p, const Vec2& a, const Vec2& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
-// Convert a world-space radius to a screen-pixel radius at the target's
-// distance. This is the fix for the fixed-pixel-radius bug: the margin now
-// scales with the projection instead of being constant on screen.
-float screen_radius_for(const PlayerESP& p, const Vec2& head, const Vec2& feet,
-                        int sh, float world_units) {
+// World-space radius to screen pixels at this target's distance. A player is
+// ~72 world units tall, so pixels-per-unit follows from the projected height.
+float screen_radius_for(const Vec2& head, const Vec2& feet, float world_units) {
     const float px_height = std::fabs(feet.y - head.y);
     if (px_height < 1.0f) return 1.0f;
 
-    // A player is ~72 world units tall, so pixels-per-unit is derivable from the
-    // projected height. Radius follows directly.
-    const float px_per_unit = px_height / 72.0f;
-    float r = world_units * px_per_unit;
-
-    // Keep it sane at extreme distances.
+    float r = world_units * (px_height / 72.0f);
     if (r < 1.0f)  r = 1.0f;
     if (r > 40.0f) r = 40.0f;
     return r;
@@ -207,8 +166,10 @@ void run_thread() {
     double weapon_at = -1e9;
 
     bool   vis_trusted = false;
-    double vis_zero_since = 0.0;   // when the mask last started reading zero
-    uintptr_t vis_zero_for = 0;    // which pawn that was for
+    double vis_zero_since = 0.0;
+    uintptr_t vis_zero_for = 0;
+
+    double target_since = 0.0;   // when the current target was acquired
 
     while (!g_stop.load()) {
         std::this_thread::yield();
@@ -219,8 +180,8 @@ void run_thread() {
 
         if (!gate) {
             if (held) { mouse_up(); held = false; }
-            g_dbg_firing.store(false);
-            g_dbg_on.store(false);
+            g_firing.store(false);
+            target_since = 0.0;
             continue;
         }
 
@@ -232,7 +193,6 @@ void run_thread() {
         if (now - weapon_at > 250.0) {
             weapon_at = now;
             weapon_id = ESP_LocalWeaponId(g_mem, g_mem.client_dll);
-            g_dbg_weapon.store(weapon_id);
         }
 
         const std::vector<PlayerESP> players =
@@ -240,123 +200,91 @@ void run_thread() {
 
         const Vec2 cross{ sw * 0.5f, sh * 0.5f };
 
-        bool  on_target = false, vis_blocked = false;
-        float best = 1e9f;
-        const char* best_hit = "-";
-        float shown_radius = -1.0f;
+        bool on_target = false;
 
         for (const PlayerESP& p : players) {
             if (p.team == 0) continue;
-
             if (kTeamCheck && g_local_team != 0 && p.team == g_local_team)
                 continue;
-
             if (!p.has_bones) continue;
 
             const Vec2 head = p.bones[BONE_HEAD];
-            const Vec2 feet = p.screen_feet;
-            const float radius = screen_radius_for(p, head, feet, sh,
-                                                   kMeshRadiusUnits);
-            const float head_r = screen_radius_for(p, head, feet, sh,
-                                                   kHeadRadiusUnits);
+            const float radius =
+                screen_radius_for(head, p.screen_feet, kMeshRadiusUnits);
+            const float head_r =
+                screen_radius_for(head, p.screen_feet, kHeadRadiusUnits);
 
-            bool  this_hit = false;
-            float this_d = 1e9f;
-            const char* this_what = "-";
+            bool hit = false;
 
-            // ---- every main wireframe link ----
-            for (int i = 0; i < kBoneLinkCount; ++i) {
+            // every main wireframe link
+            for (int i = 0; i < kBoneLinkCount && !hit; ++i) {
                 const int a = kBoneLinks[i].a, b = kBoneLinks[i].b;
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
-                const float d = point_segment_dist(cross, p.bones[a],
-                                                   p.bones[b]);
-                if (d > radius) continue;
-                if (d < this_d) { this_d = d; this_what = "body"; this_hit = true; }
+                if (point_segment_dist(cross, p.bones[a], p.bones[b]) <= radius)
+                    hit = true;
             }
 
-            // ---- extra links: shoulders, clavicles, spine_0, hands ----
-            for (int i = 0; i < kExtraLinkCount; ++i) {
+            // extra links: shoulders, spine_0, forearms
+            for (int i = 0; i < kExtraLinkCount && !hit; ++i) {
                 const int a = kExtraLinks[i].a, b = kExtraLinks[i].b;
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
-                const float d = point_segment_dist(cross, p.bones[a],
-                                                   p.bones[b]);
-                if (d > radius) continue;
-                if (d < this_d) { this_d = d; this_what = "body"; this_hit = true; }
+                if (point_segment_dist(cross, p.bones[a], p.bones[b]) <= radius)
+                    hit = true;
             }
 
-            // ---- head sphere ----
-            if (p.bone_ok[BONE_HEAD]) {
+            // head sphere
+            if (!hit && p.bone_ok[BONE_HEAD]) {
                 const float dx = head.x - cross.x, dy = head.y - cross.y;
-                const float d = std::sqrt(dx * dx + dy * dy);
-                if (d <= head_r) {
-                    if (kPreferHead || d < this_d) {
-                        this_d = d;
-                        this_what = "head";
-                        this_hit = true;
-                    }
-                }
+                if (std::sqrt(dx * dx + dy * dy) <= head_r) hit = true;
             }
 
-            if (!this_hit) continue;
+            if (!hit) continue;
 
-            // ---- vis check: SOFT gate ----
-            // Only blocks after SUSTAINED zero. A brief appearance is never
-            // blocked, which is what fixes the tight-angle misses.
-            bool blocked_here = false;
+            // ---- vis check: soft gate, only after sustained zeros ----
             if (kVisCheck && p.pawn) {
                 const uint32_t mask = spotted_mask(g_mem, p.pawn);
-                ++g_vis_samples;
                 if (mask != 0) {
-                    ++g_vis_hits;
-                    if (g_vis_hits >= kVisTrustSamples) vis_trusted = true;
-                }
-
-                if (vis_trusted) {
-                    if (mask == 0) {
-                        if (vis_zero_for != p.pawn || vis_zero_since <= 0.0) {
-                            vis_zero_for = p.pawn;
-                            vis_zero_since = now;
-                        } else if ((now - vis_zero_since) >= kVisBlockAfterMs) {
-                            blocked_here = true;
-                        }
-                    } else {
-                        vis_zero_for = 0;
-                        vis_zero_since = 0.0;
+                    if (kVisTrustSamples <= 1) vis_trusted = true;
+                    vis_zero_for = 0;
+                    vis_zero_since = 0.0;
+                } else if (vis_trusted) {
+                    if (vis_zero_for != p.pawn || vis_zero_since <= 0.0) {
+                        vis_zero_for = p.pawn;
+                        vis_zero_since = now;
+                    } else if ((now - vis_zero_since) >= kVisBlockAfterMs) {
+                        continue;   // sustained occlusion: skip this target
                     }
                 }
-            }
-
-            if (blocked_here) {
-                vis_blocked = true;
-                continue;
             }
 
             on_target = true;
-            if (this_d < best) {
-                best = this_d;
-                best_hit = this_what;
-                shown_radius = radius;
-            }
+            break;
         }
 
-        g_dbg_on.store(on_target);
-        g_dbg_vis_ok.store(on_target);
-        g_dbg_vis_trust.store(vis_trusted);
-        g_dbg_vis_blocked.store(vis_blocked);
-        g_dbg_dist.store(on_target ? best : -1.0f);
-        g_dbg_hit.store(on_target ? best_hit : "-");
-        g_dbg_radius.store(shown_radius);
+        // ---- delay: reaction time before the FIRST shot only ----
+        if (!on_target) {
+            target_since = 0.0;
+        } else if (target_since <= 0.0) {
+            target_since = now;
+        }
 
+        const int delay = g_delay.load();
+        const bool ready = (delay <= 0) ||
+                           (target_since > 0.0 &&
+                            (now - target_since) >= (double)delay);
+
+        // ---- fire, paced by the weapon's own cycle time ----
         const int interval = weapon_interval(weapon_id);
         const int clamped  = interval < kMinIntervalMs ? kMinIntervalMs : interval;
 
-        if (kFiring && on_target) {
+        if (kFiring && on_target && ready) {
             if (!held) {
                 mouse_down();
                 held = true;
                 next_shot = now + clamped;
-                g_dbg_firing.store(true);
+                g_firing.store(true);
             } else if (now >= next_shot) {
+                // A shot registers on the released -> pressed transition.
                 mouse_up();
                 mouse_down();
                 next_shot = now + clamped;
@@ -364,7 +292,7 @@ void run_thread() {
         } else if (held) {
             mouse_up();
             held = false;
-            g_dbg_firing.store(false);
+            g_firing.store(false);
         }
     }
 
@@ -391,17 +319,8 @@ void Aim_Shutdown() {
 
 AimDebug Aim_GetDebug() {
     AimDebug d;
-    d.enabled      = g_on.load();
-    d.firing       = g_dbg_firing.load();
-    d.on_target    = g_dbg_on.load();
-    d.vis_usable   = g_dbg_vis_trust.load();
-    d.vis_blocked  = g_dbg_vis_blocked.load();
-    d.vis_samples  = g_vis_samples.load();
-    d.vis_hits     = g_vis_hits.load();
-    d.target_hit   = g_dbg_hit.load();
-    d.target_dist  = g_dbg_dist.load();
-    d.mesh_radius  = g_dbg_radius.load();
-    d.weapon_id    = g_dbg_weapon.load();
+    d.enabled = g_on.load();
+    d.firing  = g_firing.load();
     return d;
 }
 
@@ -409,3 +328,10 @@ void Aim_SetEnabled(bool on) { g_on.store(on); }
 bool Aim_Enabled() { return g_on.load(); }
 void Aim_SetKey(int vk) { g_key.store(vk); }
 int  Aim_Key() { return g_key.load(); }
+
+void Aim_SetDelay(int ms) {
+    if (ms < 0) ms = 0;
+    if (ms > 600) ms = 600;
+    g_delay.store(ms);
+}
+int Aim_Delay() { return g_delay.load(); }
