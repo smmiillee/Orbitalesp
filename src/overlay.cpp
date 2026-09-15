@@ -187,14 +187,9 @@ bool Overlay::resize_buffers(int width, int height) {
 void Overlay::update_visibility_and_input() {
     if (!hwnd) return;
 
-    // *** THIS IS WHAT COULD HIDE THE OVERLAY FOREVER ***
-    // The old logic hid the window whenever the game was not the foreground
-    // window. If g_cs2_hwnd was missing or stale, that condition was ALWAYS
-    // true, so the window was hidden on its very first frame and never came
-    // back -- process alive, nothing drawn, INSERT apparently dead.
-    //
-    // Now we only hide when we actually HAVE a live game window and it is not
-    // focused, and never while the menu is open.
+    // Only hide when we actually HAVE a live game window that is not focused,
+    // and never while the menu is open. Hiding on a missing/stale handle once
+    // hid the window permanently -- process alive, nothing drawn.
     const bool have_game = (g_cs2_hwnd && IsWindow(g_cs2_hwnd));
     if (have_game) {
         const HWND fg = GetForegroundWindow();
@@ -207,19 +202,35 @@ void Overlay::update_visibility_and_input() {
 
     if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
 
-    // The overlay NEVER activates. It keeps WS_EX_NOACTIVATE at all times and
-    // only toggles click-through, so CS2 retains keyboard focus even while the
-    // menu is open. WS_EX_NOACTIVATE still allows mouse clicks, so the menu
-    // stays fully usable.
-    LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-    if (g_menu_open) {
-        ex &= ~WS_EX_TRANSPARENT;
-        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
-    } else {
-        ex |= WS_EX_TRANSPARENT;
+    // *** FPS FIX: SetWindowLongW IS NOT FREE ***
+    // This used to call GetWindowLongW + SetWindowLongW EVERY FRAME -- 144+
+    // times a second -- even though the style only changes when the menu opens
+    // or closes. SetWindowLongW is a relatively heavy call that can trigger
+    // window-manager work, so doing it per frame was pure waste.
+    //
+    // Now the desired style is only applied when the (window, menu-open) pair
+    // actually changes. Same behaviour, a fraction of the calls.
+    static HWND s_hwnd = nullptr;
+    static bool s_menu = false;
+    static bool s_valid = false;
+
+    if (!s_valid || s_hwnd != hwnd || s_menu != g_menu_open) {
+        s_valid = true;
+        s_hwnd  = hwnd;
+        s_menu  = g_menu_open;
+
+        // The overlay NEVER activates: it keeps WS_EX_NOACTIVATE at all times
+        // and only toggles click-through, so CS2 retains keyboard focus even
+        // with the menu open. WS_EX_NOACTIVATE still allows mouse clicks, so
+        // the menu stays usable.
+        LONG ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if (g_menu_open) ex &= ~WS_EX_TRANSPARENT;
+        else             ex |=  WS_EX_TRANSPARENT;
+        ex |= WS_EX_NOACTIVATE;
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
+
+        if (g_menu_open) SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW));
     }
-    ex |= WS_EX_NOACTIVATE;
-    SetWindowLongW(hwnd, GWL_EXSTYLE, ex);
 }
 
 bool Overlay::init_dx11(int width, int height) {
