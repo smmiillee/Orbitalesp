@@ -20,6 +20,7 @@
 #include "aim.h"
 #include "movement.h"
 #include "radar.h"
+#include "hitbox.h"
 
 // NON-STATIC BY REQUIREMENT: aim.cpp declares these extern, so they must have
 // external linkage. `static` at file scope would give internal linkage and the
@@ -383,6 +384,7 @@ void memory_thread() {
     Aim_Init();
     Movement_Init();
     Radar_Init();
+    Hitbox_Init();
     apply_feature_config();
 
     while (g_running) {
@@ -774,10 +776,13 @@ static void tab_aim() {
         Aim_SetEnabled(g_cfg.aim_enabled);
 
     ImGui::TextDisabled("team check: ON (hardcoded)");
-    ImGui::TextDisabled("vis check:  ON (hardcoded)");
+    ImGui::TextDisabled("vis check:  ON, soft (hardcoded)");
     ImGui::TextDisabled("firing:     ON (hardcoded)");
-    ImGui::TextDisabled("hit test:   wireframe mesh (all bone links)");
+    ImGui::TextDisabled("hit test:   wireframe mesh, world-space radius");
     ImGui::TextDisabled("shot pacing: hardcoded per weapon");
+
+    // Model hitboxes are an attempt, not a guarantee -- see hitbox.h.
+    ImGui::TextDisabled("model hitboxes: %s", Hitbox_Status());
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
@@ -786,21 +791,23 @@ static void tab_aim() {
     ImGui::Separator();
     if (ad.on_target)
         ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f },
-                           "on target: %s  (%.0f px)", ad.target_bone,
-                           ad.target_dist);
+                           "on target: %s  (%.0f px, r=%.1f)",
+                           ad.target_hit, ad.target_dist, ad.mesh_radius);
+    else if (ad.vis_blocked)
+        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
+                           "on target but BLOCKED by vis check");
     else
         ImGui::TextDisabled("on target: no");
-    ImGui::TextDisabled("firing: %s   blocked by: %s",
-                        ad.firing ? "yes" : "no", ad.blocked_by);
+    ImGui::TextDisabled("firing: %s", ad.firing ? "yes" : "no");
     ImGui::TextDisabled("weapon id: %d", ad.weapon_id);
 
-    // vis check state, since it can turn itself off
+    // vis state: "usable" just means the offset reads something real.
     if (ad.vis_usable)
-        ImGui::TextDisabled("vis: active (%d/%d masks nonzero)",
+        ImGui::TextDisabled("vis: usable (%d/%d masks nonzero)",
                             ad.vis_hits, ad.vis_samples);
     else
         ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-            "vis: NOT trusted yet - mask always 0 (%d samples)",
+            "vis: offset reads 0 (%d samples) - not blocking",
             ad.vis_samples);
 }
 
