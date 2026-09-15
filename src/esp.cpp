@@ -89,6 +89,23 @@ uintptr_t resolve_handle(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     return mem.read<uintptr_t>(chunk + stride * (idx & 0x1FF));
 }
 
+// Try EVERY known entity-list layout, not just the calibrated one. A layout that
+// resolved badly must not be able to blank every handle lookup.
+uintptr_t resolve_handle_any(const Memory& mem, uintptr_t el, uint32_t h,
+                             uintptr_t prefer_off, uintptr_t prefer_stride) {
+    struct L { uintptr_t off, stride; };
+    const L kLs[] = {
+        { prefer_off, prefer_stride },
+        { 0x10, 120 }, { 0x10, 112 },
+        { 0x08, 120 }, { 0x08, 112 },
+    };
+    for (const L& l : kLs) {
+        const uintptr_t p = resolve_handle(mem, el, l.off, l.stride, h);
+        if (valid_ptr(p)) return p;
+    }
+    return 0;
+}
+
 void sanitize(char* dst, size_t cap, const char* src, size_t len) {
     size_t j = 0;
     for (size_t i = 0; i + 1 < cap && i < len; ++i) {
@@ -146,25 +163,28 @@ bool read_designer(const Memory& mem, uintptr_t ent, char* out, size_t cap) {
 }
 
 // ---------------------------------------------------------------------------
-// DEF-INDEX CALIBRATION
+// DEF-INDEX OFFSETS
 //
 // Some weapons read 0 for the def index and fall back to the designer name. The
-// designer path WORKS (it is what proves the def-index read is wrong), so we use
-// it as ground truth: if the designer says "ak47", the correct offset must read
-// 7.
+// designer path WORKS -- it is what proves the def-index read is wrong -- so it
+// is used as ground truth: if the designer says "ak47", the correct offset must
+// read 7.
 //
-// A single offset is not enough -- m_iItemDefinitionIndex sits at different
+// A single offset is not enough because m_iItemDefinitionIndex sits at different
 // places on different weapon classes, so a rifle-calibrated offset reads 0 for
-// pistols. We keep a LIST and try them all.
+// pistols. A LIST is kept and every entry is tried.
 //
-// The local player is always sampled, so this works from round 1 rather than
-// waiting for enough distinct enemy weapons.
+// PRE-SEEDED so the weapon path and the C4 carrier work from ROUND 1 instead of
+// waiting for calibration to see enough distinct weapons:
+//   0x13B2  what THIS build calibrated to (observed in the ESP panel)
+//   0x1BA   the schema value for m_iItemDefinitionIndex
+// Calibration still runs and can add entries for other weapon classes.
 // ---------------------------------------------------------------------------
 
 constexpr int kMaxDefOff = 8;
 
-uintptr_t g_def_offs[kMaxDefOff] = {};
-int       g_def_off_n = 0;
+uintptr_t g_def_offs[kMaxDefOff] = { 0x13B2, 0x1BA };
+int       g_def_off_n = 2;
 
 struct DMap { const char* designer; int id; const char* pretty; };
 
@@ -255,6 +275,8 @@ uint16_t item_def_index(const Memory& mem, uintptr_t w) {
 
 struct DefSample { uintptr_t w; int expect; };
 
+// Sample every DISTINCT designer name available, local player first so there is
+// always at least one weapon to learn from.
 int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                     uintptr_t stride, uintptr_t local_pawn,
                     const std::vector<uintptr_t>& pawns,
@@ -263,7 +285,6 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     char seen[24][24] = {};
     int  seen_n = 0;
 
-    // Local player FIRST: always present, so calibration can work round 1.
     uintptr_t list[64];
     int list_n = 0;
     if (local_pawn) list[list_n++] = local_pawn;
@@ -282,7 +303,7 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
         if (!h || h == 0xFFFFFFFFu) continue;
 
-        const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
+        const uintptr_t w = resolve_handle_any(mem, el, h, chunk_off, stride);
         if (!valid_ptr(w)) continue;
 
         char dn[24] = {};
@@ -301,8 +322,7 @@ int collect_samples(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     return n;
 }
 
-// Merge newly agreeing offsets into the list, so classes that appear later are
-// still learned.
+// Merge newly agreeing offsets into the list.
 void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
                       uintptr_t stride, uintptr_t local_pawn,
                       const std::vector<uintptr_t>& pawns) {
@@ -344,11 +364,8 @@ void calibrate_defidx(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
         cands[best] = tmp;
 
         bool dup = false;
-        for (int k = 0; k < g_def_off_n; ++k) {
-            const int a = mem.read<uint16_t>(samples[0].w + g_def_offs[k]);
-            const int b = mem.read<uint16_t>(samples[0].w + cands[i].off);
-            if (a == b && a != 0) { dup = true; break; }
-        }
+        for (int k = 0; k < g_def_off_n; ++k)
+            if (g_def_offs[k] == cands[i].off) { dup = true; break; }
         if (dup) continue;
 
         g_def_offs[g_def_off_n++] = cands[i].off;
@@ -396,7 +413,7 @@ bool wsvc_valid(const Memory& mem, uintptr_t el, uintptr_t chunk_off,
     const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
     if (!h || h == 0xFFFFFFFFu) return false;
 
-    const uintptr_t w = resolve_handle(mem, el, chunk_off, stride, h);
+    const uintptr_t w = resolve_handle_any(mem, el, h, chunk_off, stride);
     if (!valid_ptr(w)) return false;
 
     return looks_like_entity(mem, w);
@@ -436,15 +453,12 @@ int ESP_LocalWeaponId(const Memory& mem, uintptr_t client_base) {
     const uint32_t h = mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
     if (!h || h == 0xFFFFFFFFu) return 0;
 
-    // Try both known strides rather than assuming one: a wrong stride makes
-    // resolve_handle return null and the id reads 0.
-    static const uintptr_t kStrides[] = { offsets::kSlotStride, 112 };
-    for (uintptr_t stride : kStrides) {
-        const uintptr_t w = resolve_handle(mem, el, offsets::kChunkOff,
-                                           stride, h);
-        if (valid_ptr(w)) return item_def_index(mem, w);
-    }
-    return 0;
+    const uintptr_t w = resolve_handle_any(mem, el, h,
+                                           offsets::kChunkOff,
+                                           offsets::kSlotStride);
+    if (!valid_ptr(w)) return 0;
+
+    return item_def_index(mem, w);
 }
 
 void ESP::update_world(const Memory& mem, uintptr_t client_base) {
@@ -468,7 +482,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
     static std::vector<uintptr_t> pawns;
     static double slots_at = -1e9;
     static double info_at  = -1e9;
-    static bool   layout_locked = false;
 
     if (now - slots_at > 100.0) {
         slots_at = now;
@@ -481,9 +494,15 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         std::vector<uintptr_t> best;
         int bestn = -1;
 
-        auto try_layout = [&](const L& l, int chunks) {
+        // *** THIS WAS THE ROUND-2/3 BUG ***
+        // The layout used to LOCK itself to whichever combo won. Early in a
+        // round there are very few players, so a WRONG layout can win with a
+        // small score and lock in -- after which every weapon handle fails to
+        // resolve, so weapons AND the C4 carrier disappear until enough players
+        // exist to break the lock. Every layout is now tried every refresh.
+        for (const L& l : kL) {
             std::vector<uintptr_t> all, got;
-            enumerate_slots(mem, el, l.off, l.stride, chunks, all);
+            enumerate_slots(mem, el, l.off, l.stride, offsets::kChunks, all);
             for (uintptr_t e : all) {
                 if (e == local_pawn) continue;
                 const EntHead h = read_ent_head(mem, e);
@@ -497,15 +516,6 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 c_.slot_stride = l.stride;
                 best = std::move(got);
             }
-        };
-
-        if (layout_locked) {
-            try_layout({ c_.chunk_off, c_.slot_stride }, offsets::kChunks);
-            if (bestn <= 0) layout_locked = false;
-        }
-        if (!layout_locked) {
-            for (const L& l : kL) try_layout(l, offsets::kChunks);
-            if (bestn > 0) layout_locked = true;
         }
 
         if (bestn > 0) pawns = std::move(best);
@@ -550,18 +560,16 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
         }
     }
 
-    // ---- def-index offsets ----
-    // Fast retry until something is found, then slow to keep learning as
-    // weapons change between rounds.
+    // ---- def-index offsets: fast retry until found, then slow ----
     {
-        const double retry = (g_def_off_n == 0) ? 250.0 : 20000.0;
+        const double retry = (g_def_off_n <= 2) ? 250.0 : 20000.0;
         if (c_.wsvc_ok && now - c_.defidx_try > retry) {
             c_.defidx_try = now;
             calibrate_defidx(mem, el, c_.chunk_off, c_.slot_stride,
                              local_pawn, pawns);
-            diag_defidx_n = g_def_off_n;
         }
     }
+    diag_defidx_n = g_def_off_n;
 
     // ---- bone chain: seeds, then a bounded scan ----
     if (!c_.bones_ok || c_.bone_fail > 250) {
@@ -708,8 +716,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
             const uint32_t hc =
                 mem.read<uint32_t>(t.pawn + offsets::m_hController);
             if (hc && hc != 0xFFFFFFFFu) {
-                const uintptr_t ctrl = resolve_handle(
-                    mem, el, c_.chunk_off, c_.slot_stride, hc);
+                const uintptr_t ctrl = resolve_handle_any(
+                    mem, el, hc, c_.chunk_off, c_.slot_stride);
                 if (valid_ptr(ctrl)) {
                     char raw[128] = {};
                     if (mem.read_bytes(ctrl + offsets::m_iszPlayerName,
@@ -720,8 +728,8 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 }
             }
 
-            // Use the verified offset even if the detector never validated --
-            // a detector failure must not take out weapons AND the carrier.
+            // Use the verified offset even if the detector never validated: a
+            // detector failure must not take out weapons AND the carrier.
             const uintptr_t wsvc_off =
                 c_.wsvc_ok ? c_.wsvc : offsets::m_pWeaponServices;
 
@@ -732,8 +740,9 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 mem.read<uint32_t>(ws + offsets::m_hActiveWeapon);
             if (!hw || hw == 0xFFFFFFFFu) continue;
 
-            const uintptr_t w = resolve_handle(
-                mem, el, c_.chunk_off, c_.slot_stride, hw);
+            const uintptr_t w = resolve_handle_any(mem, el, hw,
+                                                   c_.chunk_off,
+                                                   c_.slot_stride);
             if (!valid_ptr(w)) continue;
 
             const uint16_t id = item_def_index(mem, w);
@@ -744,7 +753,7 @@ void ESP::update_world(const Memory& mem, uintptr_t client_base) {
                 continue;
             }
 
-            // Carried C4 is not the ACTIVE weapon; once we know the carrier,
+            // Carried C4 is not the ACTIVE weapon; once the carrier is known,
             // keep marking them until they are no longer them.
             if (t.pawn == s_carrier) t.has_bomb = true;
 
