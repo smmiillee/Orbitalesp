@@ -20,7 +20,6 @@
 #include "aim.h"
 #include "movement.h"
 #include "radar.h"
-#include "hitbox.h"
 
 // NON-STATIC BY REQUIREMENT: aim.cpp declares these extern, so they must have
 // external linkage. `static` at file scope would give internal linkage and the
@@ -134,9 +133,10 @@ struct Config {
     bool  bh_enabled = false;
 
     // Triggerbot. Team check, vis check and firing are hardcoded in aim.cpp,
-    // so only the enable flag and the arm key are configured.
+    // so only the enable flag, the arm key and the reaction delay are set here.
     bool  aim_enabled = false;
     int   aim_key = 0;              // 0 = unbound = off
+    int   aim_delay = 0;            // reaction time before the first shot
 
     // Jumpbug
     bool  jb_enabled = false;
@@ -181,7 +181,7 @@ static void save_config() {
 
     W_B(bh_enabled);
 
-    W_B(aim_enabled); W_I(aim_key);
+    W_B(aim_enabled); W_I(aim_key); W_I(aim_delay);
 
     W_B(jb_enabled); W_I(jb_key);
     W_F(jb_crouch_lead); W_F(jb_uncrouch_height);
@@ -251,6 +251,7 @@ static void load_config() {
         else if (!strcmp(key,"bh_enabled"))        asB(g_cfg.bh_enabled);
         else if (!strcmp(key,"aim_enabled"))       asB(g_cfg.aim_enabled);
         else if (!strcmp(key,"aim_key"))           asI(g_cfg.aim_key);
+        else if (!strcmp(key,"aim_delay"))         asI(g_cfg.aim_delay);
         else if (!strcmp(key,"jb_enabled"))        asB(g_cfg.jb_enabled);
         else if (!strcmp(key,"jb_key"))            asI(g_cfg.jb_key);
         else if (!strcmp(key,"jb_crouch_lead"))    asF(g_cfg.jb_crouch_lead);
@@ -365,6 +366,7 @@ static void apply_feature_config() {
 
     Aim_SetEnabled(g_cfg.aim_enabled);
     Aim_SetKey(g_cfg.aim_key);
+    Aim_SetDelay(g_cfg.aim_delay);
 
     Movement_SetJumpbug(g_cfg.jb_enabled);
     Movement_SetKey(g_cfg.jb_key);
@@ -384,7 +386,6 @@ void memory_thread() {
     Aim_Init();
     Movement_Init();
     Radar_Init();
-    Hitbox_Init();
     apply_feature_config();
 
     while (g_running) {
@@ -737,34 +738,10 @@ static void tab_esp() {
 
     ImGui::Columns(1);
 
-    // Status for the parts still being brought up. Bones drive the skeleton AND
-    // the triggerbot, so if this says scanning the trigger cannot work.
-    ImGui::Separator();
-    if (g_esp.diag_bones_ok)
-        ImGui::TextDisabled("bones: ok 0x%llX/0x%llX",
-            (unsigned long long)g_esp.diag_bone_node,
-            (unsigned long long)g_esp.diag_bone_arr);
-    else
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "bones: scanning...");
-
-    if (g_esp.diag_wsvc_ok)
-        ImGui::TextDisabled("weapon svc: 0x%llX (verified)",
-            (unsigned long long)g_esp.diag_wsvc);
-    else
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f }, "weapon svc: not found");
-
-    if (g_esp.diag_defidx)
-        ImGui::TextDisabled("def index off: 0x%X (calibrated)  x%d",
-                            g_esp.diag_defidx, g_esp.diag_defidx_n);
-    else
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-                           "def index: calibrating...");
-
-    if (g_esp.diag_c4_ent)
-        ImGui::TextDisabled("C4 ent: 0x%llX",
-            (unsigned long long)g_esp.diag_c4_ent);
-    else
-        ImGui::TextDisabled("C4 ent: none planted");
+    // One line, only to confirm the weapon path ran. 0/N means it did not.
+    if (g_esp.diag_weapon_total > 0)
+        ImGui::TextDisabled("weapons named: %d/%d",
+                            g_esp.diag_weapon_named, g_esp.diag_weapon_total);
 }
 
 static void tab_aim() {
@@ -775,40 +752,20 @@ static void tab_aim() {
     if (ImGui::Checkbox("Triggerbot", &g_cfg.aim_enabled))
         Aim_SetEnabled(g_cfg.aim_enabled);
 
-    ImGui::TextDisabled("team check: ON (hardcoded)");
-    ImGui::TextDisabled("vis check:  ON, soft (hardcoded)");
-    ImGui::TextDisabled("firing:     ON (hardcoded)");
-    ImGui::TextDisabled("hit test:   wireframe mesh, world-space radius");
-    ImGui::TextDisabled("shot pacing: hardcoded per weapon");
-
-    // Model hitboxes are an attempt, not a guarantee -- see hitbox.h.
-    ImGui::TextDisabled("model hitboxes: %s", Hitbox_Status());
+    ImGui::SetNextItemWidth(240.0f);
+    if (ImGui::SliderInt("##adelay", &g_cfg.aim_delay, 0, 600,
+                         "reaction %d ms"))
+        Aim_SetDelay(g_cfg.aim_delay);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Reaction time before the FIRST shot after acquiring\n"
+                          "a target. 0 = fire on the next loop iteration (1 ms).\n"
+                          "Once firing, the weapon's own cycle time paces the\n"
+                          "shots, so this does not slow sustained fire.");
 
     ImGui::Spacing();
     keybind_row("arm key", &g_cfg.aim_key, CAPTURE_AIM);
 
-    const AimDebug ad = Aim_GetDebug();
-    ImGui::Separator();
-    if (ad.on_target)
-        ImGui::TextColored({ 0.1f, 0.6f, 0.1f, 1.0f },
-                           "on target: %s  (%.0f px, r=%.1f)",
-                           ad.target_hit, ad.target_dist, ad.mesh_radius);
-    else if (ad.vis_blocked)
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-                           "on target but BLOCKED by vis check");
-    else
-        ImGui::TextDisabled("on target: no");
-    ImGui::TextDisabled("firing: %s", ad.firing ? "yes" : "no");
-    ImGui::TextDisabled("weapon id: %d", ad.weapon_id);
 
-    // vis state: "usable" just means the offset reads something real.
-    if (ad.vis_usable)
-        ImGui::TextDisabled("vis: usable (%d/%d masks nonzero)",
-                            ad.vis_hits, ad.vis_samples);
-    else
-        ImGui::TextColored({ 1.0f, 0.6f, 0.1f, 1.0f },
-            "vis: offset reads 0 (%d samples) - not blocking",
-            ad.vis_samples);
 }
 
 static void tab_movement() {
