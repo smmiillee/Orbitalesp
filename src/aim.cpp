@@ -23,16 +23,15 @@ extern int g_screen_h;
 namespace {
 
 // ===========================================================================
-// HARDCODED BEHAVIOUR -- no toggles, always on.
+// HARDCODED BEHAVIOUR
 // ===========================================================================
 constexpr bool kTeamCheck = true;    // never shoot teammates
 constexpr bool kVisCheck  = true;    // soft visibility gate
 constexpr bool kFiring    = true;    // inject clicks
 
 // Sustained-occlusion window before the vis check blocks. It only applies when
-// the mask reads ZERO, so it cannot stop wall shots -- the wall case is the mask
-// staying at 1 after sight breaks, which is radar persistence. A short window
-// blocks faster on zeros, which is the same condition as a tight-angle refusal.
+// the spotted mask reads ZERO, so it cannot stop wall shots -- a wall shot is
+// the mask staying at 1 after line of sight breaks, which is radar persistence.
 constexpr double kVisBlockAfterMs = 400.0;
 
 // How many nonzero mask reads before the vis check is trusted. Until then it
@@ -40,19 +39,15 @@ constexpr double kVisBlockAfterMs = 400.0;
 constexpr int kVisTrustSamples = 1;
 
 // ===========================================================================
-// HIT TEST: WIREFRAME MESH WITH A WORLD-SPACE RADIUS
-//
-// The radius is in WORLD units and converted per target using the projected
-// height, so the margin is proportional at every distance. A fixed pixel radius
-// would over-cover far targets and under-cover near ones.
+// HIT TEST
+// Wireframe mesh with a WORLD-SPACE radius, converted per target from the
+// projected height, so the margin is proportional at every distance.
 // ===========================================================================
 constexpr float kMeshRadiusUnits = 4.5f;
 constexpr float kHeadRadiusUnits = 3.2f;
-constexpr bool  kPreferHead      = true;
 
-// Extra links to fill the gaps the bone chain leaves -- clavicles, spine_0 and
-// the forearms -- so the mesh covers the playermodel rather than just the main
-// joints.
+// Extra links filling the gaps the bone chain leaves: clavicles, spine_0 and the
+// forearms.
 struct ExtraLink { int a, b; };
 constexpr ExtraLink kExtraLinks[] = {
     { BONE_SPINE_0,    BONE_SPINE_1    },
@@ -91,7 +86,7 @@ int weapon_interval(int id) {
 
 std::atomic<bool> g_stop{false}, g_started{false};
 std::atomic<bool> g_on{false}, g_firing{false};
-std::atomic<int>  g_key{0};
+std::atomic<int>  g_key{0};       // 0 == unbound == OFF
 std::atomic<int>  g_delay{0};
 
 std::thread g_thread;
@@ -100,6 +95,25 @@ double now_ms() {
     static const auto t0 = std::chrono::steady_clock::now();
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t0).count();
+}
+
+// Sleep the bulk, spin only the last stretch. Used to throttle the loop, which
+// otherwise ran as an unbounded yield() spin at TIME_CRITICAL priority -- each
+// iteration calling project(), which takes the ESP mutex and does a
+// ReadProcessMemory. That was the single biggest cost this process added to the
+// game's frame time.
+void wait_ms(double ms) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(static_cast<long long>(ms * 1000.0));
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        const auto left = deadline - now;
+        if (left > std::chrono::milliseconds(2))
+            std::this_thread::sleep_for(left - std::chrono::milliseconds(1));
+        else
+            std::this_thread::yield();
+    }
 }
 
 bool cs2_focused() {
@@ -120,11 +134,14 @@ void mouse_up() {
     SendInput(1, &in, sizeof(INPUT));
 }
 
+// Radar-spotted mask. APPROXIMATE visibility -- radar state, not line of sight.
 uint32_t spotted_mask(const Memory& mem, uintptr_t pawn) {
     return mem.read<uint32_t>(
         pawn + offsets::m_entitySpottedState + offsets::m_bSpottedByMask);
 }
 
+// 2D distance from a point to the line between two projected joints, clamped to
+// the endpoints, so the whole limb is covered rather than just the joints.
 float point_segment_dist(const Vec2& p, const Vec2& a, const Vec2& b) {
     const float vx = b.x - a.x, vy = b.y - a.y;
     const float wx = p.x - a.x, wy = p.y - a.y;
@@ -145,7 +162,8 @@ float point_segment_dist(const Vec2& p, const Vec2& a, const Vec2& b) {
 }
 
 // World-space radius to screen pixels at this target's distance. A player is
-// ~72 world units tall, so pixels-per-unit follows from the projected height.
+// about 72 world units tall, so pixels-per-unit follows from the projected
+// height.
 float screen_radius_for(const Vec2& head, const Vec2& feet, float world_units) {
     const float px_height = std::fabs(feet.y - head.y);
     if (px_height < 1.0f) return 1.0f;
@@ -176,17 +194,7 @@ void run_thread() {
         const bool gate = g_on.load() && g_mem.is_valid() && cs2_focused() &&
                           k != 0 && ((GetAsyncKeyState(k) & 0x8000) != 0);
 
-        // *** FPS FIX: THE LOOP USED TO SPIN ***
-        // This was an unbounded `yield()` loop at TIME_CRITICAL priority, and
-        // each iteration called project() -- which takes the ESP mutex and does
-        // a ReadProcessMemory for the view matrix. That is thousands of syscalls
-        // and lock acquisitions per second, competing with the render thread for
-        // the same mutex on the same core. It was the single biggest cost this
-        // process added to the game's frame time.
-        //
-        // Now: idle sleeps 10 ms (essentially free), and while armed it runs at
-        // 2 ms -- 500 Hz, which is far faster than any weapon's cycle time and
-        // well above what a triggerbot needs.
+        // Idle: sleeping here makes a disarmed trigger essentially free.
         if (!gate) {
             if (held) { mouse_up(); held = false; }
             g_firing.store(false);
@@ -196,7 +204,7 @@ void run_thread() {
         }
 
         const int sw = g_screen_w, sh = g_screen_h;
-        if (sw <= 0 || sh <= 0) continue;
+        if (sw <= 0 || sh <= 0) { wait_ms(2.0); continue; }
 
         const double now = now_ms();
 
@@ -205,6 +213,8 @@ void run_thread() {
             weapon_id = ESP_LocalWeaponId(g_mem, g_mem.client_dll);
         }
 
+        // Newest sample, no interpolation: firing on a smoothed position would
+        // aim behind a moving target.
         const std::vector<PlayerESP> players =
             g_esp.project(g_mem, g_mem.client_dll, sw, sh, false);
 
@@ -226,7 +236,6 @@ void run_thread() {
 
             bool hit = false;
 
-            // every main wireframe link
             for (int i = 0; i < kBoneLinkCount && !hit; ++i) {
                 const int a = kBoneLinks[i].a, b = kBoneLinks[i].b;
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
@@ -234,7 +243,6 @@ void run_thread() {
                     hit = true;
             }
 
-            // extra links: shoulders, spine_0, forearms
             for (int i = 0; i < kExtraLinkCount && !hit; ++i) {
                 const int a = kExtraLinks[i].a, b = kExtraLinks[i].b;
                 if (!p.bone_ok[a] || !p.bone_ok[b]) continue;
@@ -242,7 +250,6 @@ void run_thread() {
                     hit = true;
             }
 
-            // head sphere
             if (!hit && p.bone_ok[BONE_HEAD]) {
                 const float dx = head.x - cross.x, dy = head.y - cross.y;
                 if (std::sqrt(dx * dx + dy * dy) <= head_r) hit = true;
@@ -250,7 +257,7 @@ void run_thread() {
 
             if (!hit) continue;
 
-            // ---- vis check: soft gate, only after sustained zeros ----
+            // ---- vis check: soft gate, blocks only after sustained zeros ----
             if (kVisCheck && p.pawn) {
                 const uint32_t mask = spotted_mask(g_mem, p.pawn);
                 if (mask != 0) {
@@ -281,7 +288,7 @@ void run_thread() {
         const int delay = g_delay.load();
         const bool ready = (delay <= 0) ||
                            (target_since > 0.0 &&
-                            (now - target_since) >= (double)delay);
+                            (now - target_since) >= static_cast<double>(delay));
 
         // ---- fire, paced by the weapon's own cycle time ----
         const int interval = weapon_interval(weapon_id);
@@ -294,7 +301,8 @@ void run_thread() {
                 next_shot = now + clamped;
                 g_firing.store(true);
             } else if (now >= next_shot) {
-                // A shot registers on the released -> pressed transition.
+                // A shot registers on the released -> pressed transition, so a
+                // fresh edge is required for each shot.
                 mouse_up();
                 mouse_down();
                 next_shot = now + clamped;
@@ -304,14 +312,10 @@ void run_thread() {
             held = false;
             g_firing.store(false);
         }
-    }
 
-    // Throttle while armed too, so the armed loop cannot become a spin.
-    wait_ms(2.0);
-    }
-
-    // Throttle while armed too, so the armed loop cannot become a spin.
-    wait_ms(2.0);
+        // Throttle while armed: 2 ms is 500 Hz, far above any weapon's cycle
+        // time and well past what a triggerbot needs.
+        wait_ms(2.0);
     }
 
     if (held) mouse_up();
